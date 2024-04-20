@@ -26,9 +26,9 @@ stableNameFor :: a -> StableName a
 stableNameFor !x = unsafePerformIO $ makeStableName x
 
 -- Gear
-data Snapshot e s m a where
-  SnapshotEvents :: Snapshot e s m (Set e)
-  SnapshotUnsafeReadGear :: Typeable b => Gear e b -> Snapshot e s m (b s)
+data Snapshot e bm m a where
+  SnapshotEvents :: Snapshot e bm m e
+  SnapshotUnsafeReadGear :: Typeable b => Gear e b -> Snapshot e bm m (b bm)
 
 data SetUpd a = SetUpd { setUpdAdd :: Set a, setUpdRemove :: Set a }
 instance Ord a => Semigroup (SetUpd a) where
@@ -39,7 +39,7 @@ instance Ord a => Monoid (SetUpd a) where
 data Gear e b where
   UnsafeGear :: Typeable a
     => (a, Set (AnyGear e))
-    -> (forall sig m s. Has (Snapshot e s) sig m => a -> m (a, b s))
+    -> (forall sig m. Has (Snapshot e m) sig m => a -> m (a, b m))
     -> (a -> a -> SetUpd (AnyGear e))
     -> Gear e b
 
@@ -64,40 +64,40 @@ instance Typeable e => Ord (AnyGear e) where
 
 -- | Make an autonomous gear, i. e. the gear that does not depend on anything
 -- probably such a rare case that this function should be removed
-autoGear :: (Typeable a, Typeable e) => a -> (forall sig m s. Has (Snapshot e s) sig m => a -> m (a, b s)) -> Gear e b
+autoGear :: (Typeable a, Typeable e) => a -> (forall sig m. Has (Snapshot e m) sig m => a -> m (a, b m)) -> Gear e b
 autoGear initialCache f = UnsafeGear (initialCache, mempty) f mempty
 
 -- Assembly
 
-data AssemblyF e s m a where
-  AssemblyF :: Typeable a => Gear e a -> AssemblyF e s m (m (a s))
-type Assembly e s m = Ap (AssemblyF e s m)
+data AssemblyF e m a where
+  AssemblyF :: Typeable a => Gear e a -> AssemblyF e m (m (a m))
+type Assembly e m = Ap (AssemblyF e m)
 
-gearToAsm :: Typeable a => Gear e a -> Assembly e s m (m (a s))
+gearToAsm :: Typeable a => Gear e a -> Assembly e m (m (a m))
 gearToAsm gear = liftAp (AssemblyF gear)
 
-withCache :: (Typeable a, Typeable b, Typeable e) => a -> (forall s m. Assembly e s m (a -> m (a, b s))) -> forall s m. Assembly e s m (m (b s))
+withCache :: (Typeable a, Typeable b, Typeable e) => a -> (forall m. Assembly e m (a -> m (a, b m))) -> forall m. Assembly e m (m (b m))
 withCache initialCache f = gearToAsm $ UnsafeGear
   (initialCache, runAp_ (\(AssemblyF gear) -> Set.singleton $ AnyGear gear) f)
   (run (runAp (\(AssemblyF gear) -> pure (send (SnapshotUnsafeReadGear gear))) f))
   mempty
 
--- mToAsm :: (Typeable b, Typeable e) => (forall sig m s. Has (Snapshot e s) sig m => m b) -> forall s m. Functor m => Assembly e s m (m b)
+-- mToAsm :: (Typeable b, Typeable e) => (forall sig m. Has (Snapshot e m) sig m => m b) -> forall m. Functor m => Assembly e m (m b)
 -- mToAsm f = (getConst <$>) <$> gearToAsm (autoGear () (\() -> (\x -> ((), Const x)) <$> f))
 
 
 -- Db
 
-newtype DbC e m a = DbC { runDbC :: AccumC (Set e) (StateC (HashMap (AnyGear e) (Int, Maybe AnyValue)) m) a }
+newtype DbC e m a = DbC { runDbC :: AccumC e (StateC (HashMap (AnyGear e) (Int, Maybe AnyValue)) m) a }
   deriving (Functor, Applicative, Monad)
 
 data Db e (m :: Type -> Type) a where
   DbAddEvent :: e -> Db e m ()
   DbPin :: Typeable b => Gear e b -> Db e m ()
 
-instance (Typeable e, Ord e, Algebra sig m) => Algebra (Db e :+: Snapshot e () :+: sig) (DbC e m) where
+instance (Typeable e, Monoid e, Algebra sig m) => Algebra (Db e :+: Snapshot e (DbC e m) :+: sig) (DbC e m) where
   alg hdl sig ctx = case sig of
-    L (DbAddEvent e) -> DbC (add (Set.singleton e) $> ctx)
+    L (DbAddEvent e) -> DbC (add e $> ctx)
     L (DbPin gear) -> updPins gear (+1) $> ctx
     R (L SnapshotEvents) -> DbC $ (ctx $>) <$> look
     R (L (SnapshotUnsafeReadGear gear@(UnsafeGear @a (initialCache, initialPins) upd calculatePinsUpd))) -> do
@@ -105,7 +105,7 @@ instance (Typeable e, Ord e, Algebra sig m) => Algebra (Db e :+: Snapshot e () :
       let (oldCache, pinsUpdBase) = case HM.lookup (AnyGear gear) store of
             Just (_, x) -> (P.fromJust $ cast x, mempty)
             Nothing -> (initialCache, SetUpd initialPins mempty)
-      (newCache, val) <- upd @_ @_ @() oldCache
+      (newCache, val) <- upd @_ @_ oldCache
       let pinsUpd = pinsUpdBase <> calculatePinsUpd oldCache newCache
       DbC $ modify @(HashMap (AnyGear e) (Int, Maybe AnyValue))
        let
@@ -127,3 +127,6 @@ instance (Typeable e, Ord e, Algebra sig m) => Algebra (Db e :+: Snapshot e () :
       updCacheCell f = Just . f . fromMaybe (0, Nothing)
       updPins :: Typeable b => Gear e b -> (Int -> Int) -> DbC e m ()
       updPins gear f = DbC $ modify @(HashMap (AnyGear e) (Int, Maybe AnyValue)) (HM.alter (updCacheCell $ first f) (AnyGear gear))
+
+snapshotEvents :: forall e sig m. Has (Snapshot e m) sig m => m e
+snapshotEvents = send $ SnapshotEvents @_ @m
