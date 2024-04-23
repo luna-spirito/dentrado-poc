@@ -6,18 +6,32 @@ author:          Gardanta Spirito
 maintainer:      guardspirit@protonmail.com
 build-type:      Simple
 
-common warnings
+common lang
     ghc-options: -Wall
-
-executable example
-    import:           warnings
-    main-is:          Main.hs
-    other-modules:    Coroutine, Db
-    build-depends:    base >= 4, rio >= 0.1, mtl >= 2.3, fused-effects >= 1.1, hashable >= 1.4,
-        free >= 5.2, containers >= 0.6
-    hs-source-dirs:   src
     default-language: Haskell2010
     default-extensions: NoImplicitPrelude, BangPatterns, ExistentialQuantification,
         GADTs, ScopedTypeVariables, TypeApplications, ImpredicativeTypes, BlockArguments,
         TypeOperators, FlexibleInstances, MultiParamTypeClasses, UndecidableInstances,
-        GeneralizedNewtypeDeriving, LambdaCase, KindSignatures, FlexibleContexts
+        GeneralizedNewtypeDeriving, LambdaCase, KindSignatures, FlexibleContexts, OverloadedRecordDot,
+        OverloadedStrings, OverloadedLists, ViewPatterns, TypeFamilies
+    build-depends: base >= 4, rio >= 0.1, mtl >= 2.3, fused-effects >= 1.1, hashable >= 1.4,
+        free >= 5.2, containers >= 0.6
+
+library dentrado-poc-lib
+    import: lang
+    hs-source-dirs: src
+    exposed-modules: Dentrado.POC.Data
+    -- Dentrado.POC.Coroutine, Dentrado.POC.Db, Dentrado.POC.Data
+
+executable dentrado-poc-exe
+    import: lang
+    hs-source-dirs: src
+    main-is: Main.hs
+    build-depends: dentrado-poc-lib
+
+test-suite data
+    import: lang
+    type: exitcode-stdio-1.0
+    hs-source-dirs: tests
+    main-is: Data.hs
+    build-depends: dentrado-poc-lib, QuickCheck >= 2

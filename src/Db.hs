@@ -1,7 +1,8 @@
-module Db where
+module Dentrado.POC.Db where
 
-import RIO
-import Coroutine
+import RIO hiding (Map, Set)
+import Dentrado.POC.Coroutine
+import Dentrado.POC.Data
 import qualified RIO.HashSet as HS
 import Control.Algebra
 import System.Mem.StableName (StableName, makeStableName, hashStableName)
@@ -14,33 +15,40 @@ import Control.Effect.Writer
 import Control.Carrier.State.Strict (StateC)
 import Control.Carrier.Accum.Strict (AccumC)
 import Control.Effect.Accum (add, look)
-import qualified RIO.Set as Set
 import qualified RIO.HashMap as HM
 import Control.Effect.State (modify, get)
 import Data.Kind (Type)
 import qualified RIO.Partial as P
-import qualified Data.Map as Map
-import qualified Data.Map.Merge.Strict as Map
-
-stableNameFor :: a -> StableName a
-stableNameFor !x = unsafePerformIO $ makeStableName x
 
 -- Gear
 data Snapshot e bm m a where
   SnapshotEvents :: Snapshot e bm m e
   SnapshotUnsafeReadGear :: Typeable b => Gear e b -> Snapshot e bm m (b bm)
 
-data SetUpd a = SetUpd { setUpdAdd :: Set a, setUpdRemove :: Set a }
-instance Ord a => Semigroup (SetUpd a) where
-  (SetUpd a1 r1) <> (SetUpd a2 r2) = SetUpd ((a1 `Set.difference` r2) <> a2) ((r1 `Set.difference` a2) <> r2)
-instance Ord a => Monoid (SetUpd a) where
-  mempty = SetUpd mempty mempty
+data MapDiffEntry v = MapDiffAdd v | MapDiffRemove v | MapDiffUpdate v v
+newtype MapDiff k v = MapDiff (MapI k (MapDiffEntry v))
+type SetDiff k = MapDiff k ()
+
+-- instance
+-- Three approaches to modeling diffs: 
+-- 1) Naive: Map k (Diff v)
+-- 2) Two, for added and removed entries.
+-- Should be better for performance, but why would we care
+-- ...
+-- Idea: use 1, but interpret Diff v by specifying "onRemove" and "onAdd" functions.
+-- Much less boilerplate
+
+-- data SetUpd a = SetUpd { setUpdAdd :: Set a, setUpdRemove :: Set a }
+-- instance Ord a => Semigroup (SetUpd a) where
+--   (SetUpd a1 r1) <> (SetUpd a2 r2) = SetUpd ((a1 `Set.difference` r2) <> a2) ((r1 `Set.difference` a2) <> r2)
+-- instance Ord a => Monoid (SetUpd a) where
+--   mempty = SetUpd mempty mempty
 
 data Gear e b where
   UnsafeGear :: Typeable a
-    => (a, Set (AnyGear e))
+    => (a, SetI (AnyGear e))
     -> (forall sig m. Has (Snapshot e m) sig m => a -> m (a, b m))
-    -> (a -> a -> SetUpd (AnyGear e))
+    -> (a -> a -> SetDiff (AnyGear e))
     -> Gear e b
 
 instance Eq (Gear e b) where
@@ -76,9 +84,11 @@ type Assembly e m = Ap (AssemblyF e m)
 gearToAsm :: Typeable a => Gear e a -> Assembly e m (m (a m))
 gearToAsm gear = liftAp (AssemblyF gear)
 
-withCache :: (Typeable a, Typeable b, Typeable e) => a -> (forall m. Assembly e m (a -> m (a, b m))) -> forall m. Assembly e m (m (b m))
+withCache :: forall sig2 m2 a b e. (Typeable a, Typeable b, Typeable e) =>
+  a -> (forall sig m. Has (Snapshot e m) sig m => Assembly e m (a -> m (a, b m)))
+  -> Has (Snapshot e m2) sig2 m2 => Assembly e m2 (m2 (b m2))
 withCache initialCache f = gearToAsm $ UnsafeGear
-  (initialCache, runAp_ (\(AssemblyF gear) -> Set.singleton $ AnyGear gear) f)
+  (initialCache, runAp_ (\(AssemblyF gear) -> Set.singleton $ AnyGear gear) $ f @sig2 @m2)
   (run (runAp (\(AssemblyF gear) -> pure (send (SnapshotUnsafeReadGear gear))) f))
   mempty
 
@@ -104,23 +114,24 @@ instance (Typeable e, Monoid e, Algebra sig m) => Algebra (Db e :+: Snapshot e (
       store <- DbC $ get @(HashMap (AnyGear e) (Int, Maybe AnyValue))
       let (oldCache, pinsUpdBase) = case HM.lookup (AnyGear gear) store of
             Just (_, x) -> (P.fromJust $ cast x, mempty)
-            Nothing -> (initialCache, SetUpd initialPins mempty)
+            Nothing -> (initialCache, MapDiff $ Map.fromSet (const $ MapDiffAdd ()) initialPins)
       (newCache, val) <- upd @_ @_ oldCache
       let pinsUpd = pinsUpdBase <> calculatePinsUpd oldCache newCache
       DbC $ modify @(HashMap (AnyGear e) (Int, Maybe AnyValue))
-       let
-         updateCache = HM.alter (updCacheCell $ fmap \_ -> Just $ AnyValue newCache) (AnyGear gear)
-         updatePinned gears f x = foldl' (flip $ HM.alter f) x gears
-         in
-           updatePinned (setUpdRemove pinsUpd) ((\(pins, cache) -> if pins <= 0
-               then error "Unpinning non-pinned gear"
-               else
-                 if pins == 1
-                   then Nothing
-                   else Just (pins-1, cache)
-             ) . P.fromJust) .
-           updatePinned (setUpdAdd pinsUpd) (updCacheCell $ first (+1)) .
-           updateCache
+        let
+          updateCache = HM.alter (updCacheCell $ fmap \_ -> Just $ AnyValue newCache) (AnyGear gear)
+          -- updatePinned gears f x = foldl' (flip $ HM.alter f) x gears
+          updatePinned = _
+         in _ . updateCache
+      --      updatePinned (setUpdRemove pinsUpd) ((\(pins, cache) -> if pins <= 0
+      --          then error "Unpinning non-pinned gear"
+      --          else
+      --            if pins == 1
+      --              then Nothing
+      --              else Just (pins-1, cache)
+      --        ) . P.fromJust) .
+      --      updatePinned (setUpdAdd pinsUpd) (updCacheCell $ first (+1)) .
+      --      updateCache
       pure $ ctx $>  val
     R (R sig') -> DbC $ alg (runDbC . hdl) (R $ R sig') ctx
     where
