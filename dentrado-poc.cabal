@@ -13,20 +13,27 @@ common lang
         GADTs, ScopedTypeVariables, TypeApplications, ImpredicativeTypes, BlockArguments,
         TypeOperators, FlexibleInstances, MultiParamTypeClasses, UndecidableInstances,
         GeneralizedNewtypeDeriving, LambdaCase, KindSignatures, FlexibleContexts, OverloadedRecordDot,
-        OverloadedStrings, OverloadedLists, ViewPatterns, TypeFamilies, TemplateHaskell
+        OverloadedStrings, OverloadedLists, ViewPatterns, TypeFamilies, TemplateHaskell, DerivingVia, DataKinds
     build-depends: base >= 4, rio >= 0.1, mtl >= 2.3, fused-effects >= 1.1, hashable >= 1.4,
-        free >= 5.2, containers >= 0.6
+        free >= 5.2, containers >= 0.6, template-haskell >= 2.19
 
 library dentrado-poc-lib
     import: lang
     hs-source-dirs: src
-    exposed-modules: Dentrado.POC.Data.Container, Dentrado.POC.Data.RadixTree, Dentrado.POC.Data.RadixZipper
-    -- Dentrado.POC.Coroutine, Dentrado.POC.Db, Dentrado.POC.Data
+    exposed-modules: Dentrado.POC.Data.Container, Dentrado.POC.Data.RadixTree, Dentrado.POC.Data.RadixZipper,
+        Dentrado.POC.TH
 
 executable dentrado-poc-exe
     import: lang
     hs-source-dirs: src
     main-is: Main.hs
+    build-depends: dentrado-poc-lib
+
+test-suite th
+    import: lang
+    type: exitcode-stdio-1.0
+    hs-source-dirs: tests
+    main-is: TH.hs
     build-depends: dentrado-poc-lib
 
 test-suite radix-tree
