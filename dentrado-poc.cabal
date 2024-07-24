@@ -13,7 +13,8 @@ common lang
         GADTs, ScopedTypeVariables, TypeApplications, ImpredicativeTypes, BlockArguments,
         TypeOperators, FlexibleInstances, MultiParamTypeClasses, UndecidableInstances,
         GeneralizedNewtypeDeriving, LambdaCase, KindSignatures, FlexibleContexts, OverloadedRecordDot,
-        OverloadedStrings, OverloadedLists, ViewPatterns, TypeFamilies, TemplateHaskell, DerivingVia, DataKinds
+        OverloadedStrings, OverloadedLists, ViewPatterns, TypeFamilies, TemplateHaskell, DerivingVia, DataKinds,
+        TupleSections
     build-depends: base >= 4, rio >= 0.1, mtl >= 2.3, fused-effects >= 1.1, hashable >= 1.4,
         free >= 5.2, containers >= 0.6, template-haskell >= 2.19
 
@@ -34,7 +35,7 @@ test-suite th
     type: exitcode-stdio-1.0
     hs-source-dirs: tests
     main-is: TH.hs
-    build-depends: dentrado-poc-lib
+    build-depends: dentrado-poc-lib, QuickCheck >= 2
 
 test-suite radix-tree
     import: lang

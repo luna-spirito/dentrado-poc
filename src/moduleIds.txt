@@ -1,0 +1,3 @@
+0: Dentrado.POC.Data.Container
+1: Dentrado.POC.Data.RadixTree
+2: Dentrado.POC.Data.RadixZipper

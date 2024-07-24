@@ -6,6 +6,7 @@ import Dentrado.POC.Data.RadixZipper (RadixZipper)
 import Dentrado.POC.Data.RadixTree (Chunk)
 import qualified Dentrado.POC.Data.RadixZipper as RZ
 import Test.QuickCheck
+import Dentrado.POC.TH (runEvalFresh)
 
 data MapLikeCommand v = Insert !v | Delete | Focus
   deriving Show
@@ -49,12 +50,12 @@ processScriptMap = processScript processCommandMap Map.lookup Map.empty
 
 processCommandRadixZipper :: ([Chunk], MapLikeCommand v) -> RadixZipper Identity v -> RadixZipper Identity v
 processCommandRadixZipper = \case
-  (k, Insert v) -> RZ.insert k v
-  (k, Delete) -> RZ.delete k
-  (k, Focus) -> RZ.focus k
+  (k, Insert v) -> runEvalFresh 0 . RZ.insert k v
+  (k, Delete) -> runEvalFresh 0 . RZ.delete k
+  (k, Focus) -> runEvalFresh 0 . RZ.focus k
 
 processScriptRadixZipper :: MapLikeScript a -> (([Maybe a], [Maybe a]), RadixZipper Identity a)
-processScriptRadixZipper = processScript processCommandRadixZipper RZ.lookup RZ.empty
+processScriptRadixZipper = processScript processCommandRadixZipper (\x -> runEvalFresh 0 . RZ.lookup x) RZ.empty
 
 processScript :: (([Chunk], MapLikeCommand v) -> t -> t) -> ([Chunk] -> t -> c) -> t -> MapLikeScript v -> (([c], [c]), t)
 processScript processCommand processLookup initMap (MapLikeScript keys cmds) =
