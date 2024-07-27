@@ -5,12 +5,11 @@ import System.IO.Unsafe (unsafePerformIO)
 import System.Mem.StableName (StableName, makeStableName, eqStableName)
 import Control.Carrier.Empty.Church (runEmpty)
 import Control.Effect.Empty (empty)
-import Data.Typeable (eqT, type (:~:) (..))
 import Control.Algebra
 import Control.Carrier.Writer.Church (runWriter, WriterC)
 import Data.Monoid (Any(..))
 import GHC.Exts (Symbol)
-import Control.Effect.Fresh (Fresh)
+import Control.Effect.Fresh (Fresh (..))
 import Control.Carrier.Fresh.Church (fresh)
 import Control.Effect.Writer ( Writer, censor, listen, tell )
 import Dentrado.POC.TH (moduleId, sRunEvalFresh)
@@ -28,8 +27,8 @@ type Reduced = Reduced' ""
 -- but false negatives are possible
 class Container t where
   construct :: Has Fresh sig m => a -> m (t a)
-  apl :: Has (Fresh :+: Writer (Reduced' s1) :+: Writer (Reduced' s2)) sig m => Proxy s1 -> Proxy s2 -> t (a -> b) -> t a -> m (t b) -- VERY general interface
-  -- operations on Ptr can cause extraction (and therefore reduction). Also, computed value needs to be placed into a new Ptr.
+  -- app :: Has (Fresh :+: Writer (Reduced' s1) :+: Writer (Reduced' s2)) sig m => Proxy s1 -> Proxy s2 -> t (a -> b) -> t a -> m (t b) -- VERY general interface
+  -- -- operations on Ptr can cause extraction (and therefore reduction). Also, computed value needs to be placed into a new Ptr.
   extract' :: Has (Fresh :+: Writer (Reduced' s)) sig m => Proxy s -> t a -> m a -- extraction uncovers new information, so it can cause reduction,
   -- and this new information sometimes requires registering as well (Delay).
   tryExtract :: t a -> Maybe a
@@ -42,7 +41,7 @@ instance Container Identity where
   construct = pure . Identity
   extract' _ = pure . runIdentity
   tryExtract = Just . runIdentity
-  apl _ _ f a = pure $ f <*> a
+  -- app _ _ f a = pure $ f <*> a
   same a b = stableNameFor (runIdentity a) `eqStableName` stableNameFor (runIdentity b) where
     stableNameFor :: a -> StableName a
     stableNameFor !x = unsafePerformIO $ makeStableName x
@@ -61,48 +60,76 @@ instance Container DPtr where
   construct v = (\i -> DPtr (fromIntegral i) v) <$> fresh
   extract' _ = pure . extractDPtr
   tryExtract = Just . extractDPtr
-  apl _p1 _p2 fM aM = construct $ extractDPtr fM $ extractDPtr aM
+  -- app _p1 _p2 fM aM = construct $ extractDPtr fM $ extractDPtr aM
   same (DPtr i1 _) (DPtr i2 _) = i1 == i2
 
 type Ptr a = DPtr a -- in actual implementation, Ptr could be unloaded
 
+-- to combat impredicativity
+newtype FreshM a = FreshM { unFreshM :: forall sig m. Has Fresh sig m => m a }
+
+instance Functor FreshM where
+  fmap f (FreshM x) = FreshM $ f <$> x
+instance Applicative FreshM where
+  pure x = FreshM $ pure x
+  (FreshM f) <*> (FreshM a) = FreshM $ f <*> a
+instance Monad FreshM where
+  (FreshM a) >>= f = FreshM $ a >>= \a' ->
+    let (FreshM res) = f a' in res 
+instance Algebra Fresh FreshM where
+  alg _ Fresh ctx = FreshM ((ctx $>) <$> send Fresh)
+
+data Extracted c a = Extracted !(c a) !a
+
+-- TODO: Question about optimal evaluation. While the result of evaluation should be shared, "extraction" for
+-- each individual copy should happen separately, with each copy causing parent to reduce.
+-- I believe this approach requires stronger work about linearity & explicit duplication.
+-- IDEA: currently, memoization is done at the level of Application.
+-- however, most of the time, what's problematic for performance is DB operations.
+-- So probably we create a new constructor to support executing DB operations and tie memoization to it.
 data Delay a where
-  DelayAp :: !(Delay (a -> b)) -> !(Delay a) -> !(IORef (Maybe (DPtr b))) -> Delay b
-  DelayConst :: (Typeable a, Eq a) => !a -> Delay a
+  DelayFresh :: !(Delay (FreshM a)) -> !(IORef (Maybe (DPtr a))) -> Delay a
+  DelayApp :: !(Delay (Extracted Delay a -> b)) -> !(Delay a) -> Delay b
+  -- DelayConst :: (Typeable a, Eq a) => !a -> Delay a -- probably needs to be moved to DPtr
   DelayPin :: DPtr a -> Delay a
 
--- Containers:
--- 1) Identity — debug
--- 2) Ind — immutable value
--- 3) Delay — builds on top of Ind and introduces quick comparison
+delayFresh :: Delay (FreshM a) -> Delay a
+delayFresh x = DelayFresh x $ unsafePerformIO $ newIORef Nothing
+
 instance Container Delay where
   construct val = DelayPin <$> construct val
-  apl _p1 _p2 a b = pure $ DelayAp a b $ unsafePerformIO $ newIORef Nothing
+  -- app _p1 _p2 a b = pure $ DelayApp a b $ unsafePerformIO $ newIORef Nothing
   extract' (Proxy @s) = \case
     DelayPin x -> extract' (Proxy @s) x
-    DelayConst x -> pure x
-    DelayAp df da mv -> do
-      case unsafePerformIO $ readIORef mv of
-        Just v -> pure $ extractDPtr v
+    -- DelayConst x -> pure x
+    DelayFresh actM memo ->
+      case unsafePerformIO $ readIORef memo of
+        Just res -> pure $ extractDPtr res
         Nothing -> do
           tell (Reduced' @s True)
-          v <- extract' (Proxy @s) df <*> extract' (Proxy @s) da
-          v' <- construct v
+          FreshM act <- extract' (Proxy @s) actM
+          res <- act
+          res' <- construct res
           unsafePerformIO $
-            writeIORef mv (Just v') $> pure v
+            writeIORef memo (Just res') $> pure res
+    DelayApp df da -> -- TODO: does not emit Reduced', since it's unlikely to need being cached? disallows to make tryExtract on DelayApp.
+      censor @(Reduced' s) (const mempty) $ extract' (Proxy @s) df <*> (Extracted da <$> extract' (Proxy @s) da)
   tryExtract = \case
     DelayPin x -> tryExtract x
-    DelayConst x -> Just x
-    DelayAp _ _ mv -> extractDPtr <$> unsafePerformIO (readIORef mv)
+    -- DelayConst x -> Just x
+    DelayFresh _actM memo -> extractDPtr <$> unsafePerformIO (readIORef memo)
+    DelayApp _ _  -> Nothing
   same = curry \case
     (DelayPin a, DelayPin b) -> a `same` b
-    (DelayConst @x x, DelayConst @y y) -> maybe False (\Refl -> x == y) $ eqT @x @y
-    (DelayAp @a1 df1 da1 mv1, DelayAp @a2 df2 da2 mv2) ->
+    -- (DelayConst @x x, DelayConst @y y) -> maybe False (\Refl -> x == y) $ eqT @x @y
+    (DelayFresh valM1 memo1, DelayFresh valM2 memo2) ->
       unsafePerformIO (runEmpty (pure False) pure do
-       v1 <- maybe empty pure =<< readIORef mv1
-       v2 <- maybe empty pure =<< readIORef mv2
-       pure $ v1 `same` v2)
-      || (df1 `same` df2 && da1 `same` da2)
+       m1 <- maybe empty pure =<< readIORef memo1
+       m2 <- maybe empty pure =<< readIORef memo2
+       pure $ m1 `same` m2)
+      || (valM1 `same` valM2)
+    (DelayApp df1 da1, DelayApp df2 da2) ->
+      df1 `same` df2 && da1 `same` da2
     _nonMatching -> False
 
 -- | Presence of Delay fields in some types interferes with construction of the most optimal spine.
@@ -140,12 +167,15 @@ reducible' (Proxy @s) reductor (Reducible red) f =
 reducible :: Has (Writer Reduced) sig m => (a -> m a) -> Reducible a -> (a -> m b) -> m b
 reducible = reducible' (Proxy @"")
 
+nonRe' :: forall s m a. Applicative m => WriterC (Reduced' s) m a -> m a
+nonRe' = runWriter (\_ -> pure)
+
 -- Perform operation that can't really cause reduction of anything
 -- TODO: implement custom Identity-like monad? Although this alters the behaviour.
 --  UPD: no, absolutely don't do that. Like e.g. `merge`, it places nonRe at the top level, yet still uses `catch`. Identity breaks `catch`.
 --  monad laws are violated as well. Stupid, stupid gard
 nonRe :: Applicative m => WriterC Reduced m a -> m a
-nonRe = runWriter @Reduced (\_ -> pure)
+nonRe = nonRe'
 
 sNothing :: Container c => c (Maybe a)
 sNothing = $sRunEvalFresh $ construct Nothing

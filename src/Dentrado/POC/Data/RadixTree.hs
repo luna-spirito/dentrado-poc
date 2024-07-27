@@ -1,3 +1,4 @@
+{-# LANGUAGE RecursiveDo #-}
 module Dentrado.POC.Data.RadixTree where
 import RIO hiding (mask, toList, catch)
 import Data.Bits
@@ -7,6 +8,8 @@ import Dentrado.POC.Data.Container
 import Control.Effect.Fresh (Fresh)
 import Data.Foldable (foldrM)
 import Dentrado.POC.TH (moduleId, sRunEvalFresh)
+import Control.Carrier.Writer.Church (WriterC)
+import Control.Monad.Fix (MonadFix)
 
 $(moduleId 1)
 
@@ -37,7 +40,7 @@ data RadixTree c a = RadixTree !(c (Maybe a)) !(c (RadixChunk c a)) -- both elem
 type RadixChunk c a = Reducible (RadixChunk' c a)
 data RadixChunk' c a
   = Nil
-  | Tip !Chunk !(RadixTree c a) -- There's no way you access Tip and don't want to know what's coming next, so no containerization
+  | Tip !Chunk !(RadixTree c a) -- RadixTree is the only possible branch. Still could be containerized, but I'm not sure it's worth it
   | Bin !Chunk !(c (RadixChunk c a)) !(c (RadixChunk c a)) -- Either branch can be accessed, so containerization
 
 -- -- TODO: Don't know how effective is this
@@ -110,15 +113,15 @@ mkBinNonRe :: Container c => Bool -> Chunk -> c (RadixChunk c a) -> c (RadixChun
 mkBinNonRe right mask a b = Bin mask (if right then a else b) (if right then b else a)
 {-# INLINE mkBinNonRe #-}
 
-mkBin :: (Container c, Has (Writer Reduced) sig m) => Bool -> Chunk -> c (RadixChunk c a) -> c (RadixChunk c a) -> m (RadixChunk' c a)
-mkBin a b c d = reduceChunk $ mkBinNonRe a b c d
+mkBin :: (Container c, Algebra sig m)  => Bool -> Chunk -> c (RadixChunk c a) -> c (RadixChunk c a) -> m (RadixChunk' c a)
+mkBin a b c d = nonRe $ reduceChunk $ mkBinNonRe a b c d
 {-# INLINE mkBin #-}
 
 mkTipNonRe :: Chunk -> RadixTree c a -> RadixChunk' c a
 mkTipNonRe = Tip
 
-mkTip :: (Container c, Has (Writer Reduced) sig m) => Chunk -> RadixTree c a -> m (RadixChunk' c a)
-mkTip k v = reduceChunk $ mkTipNonRe k v
+mkTip :: (Container c, Algebra sig m) => Chunk -> RadixTree c a -> m (RadixChunk' c a)
+mkTip k v = nonRe $ reduceChunk $ mkTipNonRe k v
 {-# INLINE mkTip #-}
 
 internalLookup :: (Container c, Has (Fresh :+: Writer Reduced) sig m) => (Chunk -> [Chunk] -> c (RadixChunk c a) -> m (m (Maybe a)), [Chunk] -> RadixTree c a -> m (m (Maybe a)))
@@ -152,6 +155,7 @@ internalInsert val = accessRadix
   (\k r a b -> construct . mkReducible . mkBinNonRe k r a =<< b)
 {-# INLINE internalInsert #-}
 
+-- short-circuit
 insert :: (Container c, Has Fresh sig m) => [Chunk] -> p -> RadixTree c p -> m (RadixTree c p)
 insert k v tr = nonRe $ join $ snd (internalInsert v) k tr
 
@@ -164,6 +168,7 @@ internalDelete = accessRadix
   (\k r a b -> construct . mkReducible =<< mkBin k r a =<< b) -- on branch, chunk
 {-# INLINE internalDelete #-}
 
+-- short-circuit
 delete :: (Container c, Has Fresh sig m) => [Chunk] -> RadixTree c p -> m (RadixTree c p)
 delete k tr = nonRe $ join $ snd internalDelete k tr
 
@@ -175,12 +180,83 @@ sEmpty = $sRunEvalFresh $ construct empty
 
 -- TODO: monadical extract, separate RadixTree and RadixZipper into different modules, `merge`, `adjust`
 
-data OnOne f other fin = OnOne
-  { onOneVal :: [Chunk] -> other -> f (Maybe fin) -- other must be unwrapped for this conclusion
-  , onOneSubtree :: forall c. Container c => [Chunk] -> c (RadixChunk c other) -> f (c (RadixChunk c fin)) }
-data OnBoth f one two fin = OnBoth
-  { onBothVal :: [Chunk] -> one -> two -> f (Maybe fin) }
+data OnOne other fin = OnOne
+  { onOneVal :: !(other -> Maybe fin) -- other must be unwrapped for this conclusion
+  , onOneSubtree :: !(forall c. Container c => RadixChunk' c other -> RadixChunk' c fin) }
+newtype OnBoth one two fin = OnBoth
+  { onBothVal :: one -> two -> Maybe fin }
+newtype MergeStrategy c = MergeStrategy
+  { _apply :: forall x y z. DPtr (Extracted c x -> Extracted c y -> WriterC (Reduced' "1") (WriterC (Reduced' "2") FreshM) z) -> c x -> c y -> WriterC (Reduced' "1") (WriterC (Reduced' "2") FreshM) (c z) }
 
+merge :: forall one two fin c. forall sig1 m1. (Container c, Has Fresh sig1 m1, MonadFix m1)
+  => MergeStrategy c
+  -> OnOne one fin
+  -> OnOne two fin
+  -> OnBoth one two fin
+  -> m1 (RadixTree c one
+    -> RadixTree c two
+    -> FreshM (RadixTree c fin))
+merge {-(MergeStrategy doMerge)-} (MergeStrategy apply) one1 one2 both = mdo
+  mergeVal <- construct \(Extracted _ val1) (Extracted _ val2) ->
+    pure $ case (val1, val2) of
+      (Just a , Just b ) -> onBothVal both a b
+      (Just a , Nothing) -> onOneVal one1 a
+      (Nothing, Just b ) -> onOneVal one2 b
+      (Nothing, Nothing) -> Nothing
+  let unsafeMask = \case
+        Nil -> error "impossible"
+        Tip mask _ -> mask
+        Bin mask _ _ -> mask
+  mergeChunk <- construct \(Extracted c1 c1v) (Extracted c2 c2v) ->
+    reducible' (Proxy @"1") (reduceChunk' (Proxy @"1")) c1v \c1' ->
+      reducible' (Proxy @"2") (reduceChunk' (Proxy @"2")) c2v \c2' ->
+        mkReducible <$> case (c1', c2') of
+          (a, Nil) -> pure $ onOneSubtree one1 a 
+          (Nil, b) -> pure $ onOneSubtree one2 b
+          (Bin mask1 l1 r1, Bin mask2 l2 r2)
+            | mask1 == mask2 -> do
+              a <- apply mergeChunk l1 l2
+              b <- apply mergeChunk r1 r2
+              mkBin True mask1 a b
+          (Bin mask1 l1 r1, unsafeMask -> mask2)
+            | Just pickRight <- tryMask mask1 mask2
+              -> if pickRight
+                  then do
+                    a <- apply mergeChunk l1 sNil
+                    b <- apply mergeChunk r1 c2 -- TODO: WRONG, COULD CAUSE DOUBLE EXTRACTION!!!
+                    mkBin True mask1 a b
+                  else do
+                    a <- apply mergeChunk l1 c2
+                    b <- apply mergeChunk r1 sNil
+                    mkBin True mask1 a b
+          (unsafeMask -> mask1, Bin mask2 l2 r2)
+            | Just pickRight <- tryMask mask2 mask1
+              -> if pickRight
+                  then do
+                    a <- apply mergeChunk sNil l2
+                    b <- apply mergeChunk c1 r2
+                    mkBin True mask1 a b
+                  else do
+                    a <- apply mergeChunk c1 l2
+                    b <- apply mergeChunk sNil r2
+                    mkBin True mask1 a b
+          (Tip mask1 v1, Tip mask2 v2)
+            | mask1 == mask2 -> Tip mask1 <$> mergeTree v1 v2
+          (unsafeMask -> mask1, unsafeMask -> mask2) -> do
+            let (mask, pickRight) = makeMask mask1 mask2
+            a <- apply mergeChunk c1 sNil
+            b <- apply mergeChunk sNil c2
+            mkBin pickRight mask a b
+  let mergeTree (RadixTree k1 s1) (RadixTree k2 s2) =
+        RadixTree
+          <$> apply mergeVal k1 k2
+          <*> apply mergeChunk s1 s2
+  pure \a b -> nonRe' @"2" $ nonRe' @"1" $ mergeTree a b
+
+
+-- merge = runWriter @(Reduced' "one") (\_ -> pure) $ runWriter @(Reduced' "two") (\_ -> pure) $ getCompose $ mergeTree [] a b where
+--   merger = _
+--   mergeTree p (RadixTree v1 s1) (RadixTree v2 s2) = _
 -- valid, but non-streaming
 -- merge :: forall f c one two fin. (Applicative f, Container c)
 --   => OnOne f one fin
@@ -222,7 +298,7 @@ data OnBoth f one two fin = OnBoth
 --   mergeTree p (RadixTree v1 s1) (RadixTree v2 s2) = RadixTree (mergeVal <*> p <*> v1 <*> v2) _
 
 -- TODO: monadic... monadic
-  
+
 
 -- debug
 
