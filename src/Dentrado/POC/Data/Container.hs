@@ -2,7 +2,6 @@ module Dentrado.POC.Data.Container where
 
 import RIO hiding (mask, toList, catch)
 import System.IO.Unsafe (unsafePerformIO)
-import System.Mem.StableName (StableName, makeStableName, eqStableName)
 import Control.Carrier.Empty.Church (runEmpty)
 import Control.Effect.Empty (empty)
 import Control.Algebra
@@ -16,56 +15,51 @@ import Dentrado.POC.TH (moduleId, sRunEvalFresh)
 
 $(moduleId 0)
 
+class Cast a b where -- better to use lib function
+  cast :: a -> b
+
+data Res a = Res !Word64 !a -- identified resource
+
+alloc :: Has Fresh sig m => a -> m (Res a)
+alloc v = (\i -> Res (fromIntegral i) v) <$> fresh
+
+fetch :: Has Fresh sig m => Res a -> m a
+fetch (Res _ x) = pure x -- temp
+
+tryFetch :: Res a -> Maybe a
+tryFetch (Res _ a) = Just a
+
 newtype Reduced' (s :: Symbol) = Reduced' Bool
   deriving (Semigroup, Monoid) via Any
 type Reduced = Reduced' ""
 
--- | `Contains t` means that:
--- 1) It's possible to construct `t a` from `a`
--- 2) It's possible to `extract` `a` from `t a`
--- 3) It's possible to quickly check if two containers hold the same value,
--- but false negatives are possible
 class Container t where
-  construct :: Has Fresh sig m => a -> m (t a)
-  -- app :: Has (Fresh :+: Writer (Reduced' s1) :+: Writer (Reduced' s2)) sig m => Proxy s1 -> Proxy s2 -> t (a -> b) -> t a -> m (t b) -- VERY general interface
-  -- -- operations on Ptr can cause extraction (and therefore reduction). Also, computed value needs to be placed into a new Ptr.
-  extract' :: Has (Fresh :+: Writer (Reduced' s)) sig m => Proxy s -> t a -> m a -- extraction uncovers new information, so it can cause reduction,
-  -- and this new information sometimes requires registering as well (Delay).
-  tryExtract :: t a -> Maybe a
+  wrap :: Res a -> t a
+  unwrap' :: Has (Fresh :+: Writer (Reduced' s)) sig m => Proxy s -> t a -> m (Res a)
+  tryUnwrap :: t a -> Maybe (Res a)
   same :: t a -> t b -> Bool
 
-extract :: (Container c, Has (Fresh :+: Writer Reduced) sig m) => c a -> m a
-extract = extract' $ Proxy @""
+allocC :: (Container t, Has Fresh sig m) => p -> m (t p)
+allocC x = wrap <$> alloc x
 
-instance Container Identity where
-  construct = pure . Identity
-  extract' _ = pure . runIdentity
-  tryExtract = Just . runIdentity
-  -- app _ _ f a = pure $ f <*> a
-  same a b = stableNameFor (runIdentity a) `eqStableName` stableNameFor (runIdentity b) where
-    stableNameFor :: a -> StableName a
-    stableNameFor !x = unsafePerformIO $ makeStableName x
+unwrap :: (Container c, Has (Fresh :+: Writer Reduced) sig m) => c a -> m (Res a)
+unwrap = unwrap' $ Proxy @""
 
--- ptr, delay
+tryFetchC :: Container c => c a -> Maybe a
+tryFetchC c = tryUnwrap c >>= \(Res _ x) -> Just x -- temp
 
-data DPtr a = DPtr !Word64 !a -- dereferenced pointer
+fetchC' :: (Container c, Has (Fresh :+: Writer (Reduced' s)) sig m) => Proxy s -> c a -> m a
+fetchC' proxy x = fetch =<< unwrap' proxy x
 
-extractDPtr :: DPtr a -> a
-extractDPtr (DPtr _i a) = a
+fetchC :: (Container c, Has (Fresh :+: Writer Reduced) sig m) => c a -> m a
+fetchC = fetchC' (Proxy @"")
 
-sameDPtr :: DPtr a -> DPtr b -> Bool
-sameDPtr (DPtr i1 _a) (DPtr i2 _b) = i1 == i2
+instance Container Res where
+  wrap = id
+  unwrap' _ = pure
+  tryUnwrap = Just
+  same (Res aId _) (Res bId _) = aId == bId
 
-instance Container DPtr where
-  construct v = (\i -> DPtr (fromIntegral i) v) <$> fresh
-  extract' _ = pure . extractDPtr
-  tryExtract = Just . extractDPtr
-  -- app _p1 _p2 fM aM = construct $ extractDPtr fM $ extractDPtr aM
-  same (DPtr i1 _) (DPtr i2 _) = i1 == i2
-
-type Ptr a = DPtr a -- in actual implementation, Ptr could be unloaded
-
--- to combat impredicativity
 newtype FreshM a = FreshM { unFreshM :: forall sig m. Has Fresh sig m => m a }
 
 instance Functor FreshM where
@@ -79,45 +73,40 @@ instance Monad FreshM where
 instance Algebra Fresh FreshM where
   alg _ Fresh ctx = FreshM ((ctx $>) <$> send Fresh)
 
-data Extracted c a = Extracted !(c a) !a
-
--- TODO: Question about optimal evaluation. While the result of evaluation should be shared, "extraction" for
--- each individual copy should happen separately, with each copy causing parent to reduce.
--- I believe this approach requires stronger work about linearity & explicit duplication.
--- IDEA: currently, memoization is done at the level of Application.
--- however, most of the time, what's problematic for performance is DB operations.
--- So probably we create a new constructor to support executing DB operations and tie memoization to it.
 data Delay a where
-  DelayFresh :: !(Delay (FreshM a)) -> !(IORef (Maybe (DPtr a))) -> Delay a
-  DelayApp :: !(Delay (Extracted Delay a -> b)) -> !(Delay a) -> Delay b
-  -- DelayConst :: (Typeable a, Eq a) => !a -> Delay a -- probably needs to be moved to DPtr
-  DelayPin :: DPtr a -> Delay a
+  DelayFresh :: !(Delay (FreshM (Res a))) -> !(IORef (Maybe (Res a))) -> Delay a
+  DelayApp :: !(Delay (Res a -> b)) -> !(Delay a) -> Delay b
+  DelayPin :: !(Res a) -> Delay a
 
-delayFresh :: Delay (FreshM a) -> Delay a
-delayFresh x = DelayFresh x $ unsafePerformIO $ newIORef Nothing
+delayFresh :: Has (Fresh :+: Writer (Reduced' s)) sig m => Proxy s -> Delay (FreshM (Res a)) -> IORef (Maybe (Res a)) -> m (Res a)
+delayFresh (Proxy @s) actM memo = 
+  case unsafePerformIO $ readIORef memo of
+    Just res -> pure res
+    Nothing -> do
+      tell (Reduced' @s True)
+      FreshM act <- delayVal (Proxy @s) actM
+      res <- act
+      unsafePerformIO $
+        writeIORef memo (Just res) $> pure res
+
+delayApp :: (Container t, Has (Fresh :+: Writer (Reduced' s)) sig m) => Proxy s -> Delay (Res a -> b) -> t a -> m b
+delayApp proxy df da = delayVal proxy df <*> unwrap' proxy da
+
+delayVal :: Has (Fresh :+: Writer (Reduced' s)) sig m => Proxy s -> Delay a -> m a
+delayVal proxy = \case
+  DelayFresh a b -> fetch =<< delayFresh proxy a b
+  DelayApp df da -> delayApp proxy df da
+  DelayPin x -> fetch x
 
 instance Container Delay where
-  construct val = DelayPin <$> construct val
-  -- app _p1 _p2 a b = pure $ DelayApp a b $ unsafePerformIO $ newIORef Nothing
-  extract' (Proxy @s) = \case
-    DelayPin x -> extract' (Proxy @s) x
-    -- DelayConst x -> pure x
-    DelayFresh actM memo ->
-      case unsafePerformIO $ readIORef memo of
-        Just res -> pure $ extractDPtr res
-        Nothing -> do
-          tell (Reduced' @s True)
-          FreshM act <- extract' (Proxy @s) actM
-          res <- act
-          res' <- construct res
-          unsafePerformIO $
-            writeIORef memo (Just res') $> pure res
-    DelayApp df da -> -- TODO: does not emit Reduced', since it's unlikely to need being cached? disallows to make tryExtract on DelayApp.
-      censor @(Reduced' s) (const mempty) $ extract' (Proxy @s) df <*> (Extracted da <$> extract' (Proxy @s) da)
-  tryExtract = \case
-    DelayPin x -> tryExtract x
-    -- DelayConst x -> Just x
-    DelayFresh _actM memo -> extractDPtr <$> unsafePerformIO (readIORef memo)
+  wrap = DelayPin
+  unwrap' proxy = \case
+    DelayPin x -> pure x
+    DelayFresh actM memo -> delayFresh proxy actM memo
+    DelayApp df da -> alloc =<< delayApp proxy df da
+  tryUnwrap = \case
+    DelayPin x -> Just x
+    DelayFresh _actM memo -> unsafePerformIO (readIORef memo)
     DelayApp _ _  -> Nothing
   same = curry \case
     (DelayPin a, DelayPin b) -> a `same` b
@@ -131,7 +120,7 @@ instance Container Delay where
     (DelayApp df1 da1, DelayApp df2 da2) ->
       df1 `same` df2 && da1 `same` da2
     _nonMatching -> False
-
+  
 -- | Presence of Delay fields in some types interferes with construction of the most optimal spine.
 -- Reducible is a potential fix that allows to "reduce" the spine as more Delayed computations
 -- are resolved.
@@ -178,4 +167,4 @@ nonRe :: Applicative m => WriterC Reduced m a -> m a
 nonRe = nonRe'
 
 sNothing :: Container c => c (Maybe a)
-sNothing = $sRunEvalFresh $ construct Nothing
+sNothing = wrap $ $sRunEvalFresh $ alloc Nothing
