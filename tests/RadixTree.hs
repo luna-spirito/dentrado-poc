@@ -8,7 +8,7 @@ import qualified Dentrado.POC.Data.RadixZipper as RZ
 import Test.QuickCheck
 import Dentrado.POC.TH (runEvalFresh)
 
-data MapLikeCommand v = Insert !v | Delete | Focus
+data MapLikeCommand v = Insert !v | Delete | Focus -- todo: Pop
   deriving Show
 data MapLikeScript v = MapLikeScript !(Set [Chunk]) [([Chunk], MapLikeCommand v)]
   deriving Show

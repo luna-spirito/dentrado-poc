@@ -1,8 +1,7 @@
 module Dentrado.POC.Db where
 
 import RIO hiding (Map, Set)
-import Dentrado.POC.Coroutine
-import Dentrado.POC.Data
+-- import Dentrado.POC.Data
 import qualified RIO.HashSet as HS
 import Control.Algebra
 import System.Mem.StableName (StableName, makeStableName, hashStableName)
@@ -20,14 +19,37 @@ import Control.Effect.State (modify, get)
 import Data.Kind (Type)
 import qualified RIO.Partial as P
 
+{-
+
+-- Желательно всё уместить в StateGraph, чтобы он был монолитным объектом.
+-- Это позволит сохранить чистую семантику
+-- Так что...
+-- 1) Мы или делаем его полностью монолитным, включая в StateGraph информацию о самих данных и зависимостях
+-- 2) Мы храним данные о сателлитах всё же отдельно
+-- Временное решение: две структры, полная и расширенная
+type DepId = Word32
+data StateEntry s v = StateEntry !s !(RadixSet (DepId, _)) !v -- signal, dependencies and the final value
+data StateGraph k s v = StateGraph !v !(RadixTree k (RadixZipper EventId StateEntry)) -- initial value and updates for each object
+newtype StateGraphDeps k = StateGraphDeps (RadixTree DepId (RadixTree EventId (RadixSet k))
+
+stateGraph do
+  dep1 <- _
+  dep2 <- _
+  pure
+    (_functionGetsSamplerReturnsV
+    , )
+  
+
+t-}
+
 -- Gear
 data Snapshot e bm m a where
   SnapshotEvents :: Snapshot e bm m e
   SnapshotUnsafeReadGear :: Typeable b => Gear e b -> Snapshot e bm m (b bm)
 
-data MapDiffEntry v = MapDiffAdd v | MapDiffRemove v | MapDiffUpdate v v
-newtype MapDiff k v = MapDiff (MapI k (MapDiffEntry v))
-type SetDiff k = MapDiff k ()
+data DiffEntry v = DiffAdd v | DiffRemove v | DiffUpdate v v
+-- newtype MapDiff k v = MapDiff (MapI k (MapDiffEntry v))
+-- type SetDiff k = MapDiff k ()
 
 -- instance
 -- Three approaches to modeling diffs: 
