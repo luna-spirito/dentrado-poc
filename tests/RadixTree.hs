@@ -1,16 +1,18 @@
 import RIO
+import Control.Algebra
+import Test.QuickCheck
 import qualified RIO.Set as Set
 import qualified RIO.Map as Map
 import Control.Monad.State (StateT, get, put, execStateT)
+import Dentrado.POC.Data.Container ( Res, runFreshIO, FreshIOC, FreshIO )
 import Dentrado.POC.Data.RadixZipper (RadixZipper)
 import Dentrado.POC.Data.RadixTree (Chunk)
 import qualified Dentrado.POC.Data.RadixZipper as RZ
-import Test.QuickCheck
-import Dentrado.POC.TH (runEvalFresh)
+import System.IO.Unsafe (unsafePerformIO)
 
 data MapLikeCommand v = Insert !v | Delete | Focus -- todo: Pop
   deriving Show
-data MapLikeScript v = MapLikeScript !(Set [Chunk]) [([Chunk], MapLikeCommand v)]
+data MapLikeScript v = MapLikeScript !(Set [Chunk]) ![([Chunk], MapLikeCommand v)]
   deriving Show
 
 instance Arbitrary v => Arbitrary (MapLikeCommand v) where
@@ -39,34 +41,38 @@ instance (Arbitrary v) => Arbitrary (MapLikeScript v) where
     cmds' <- shrink cmds
     pure $ MapLikeScript (Set.fromList $ fst <$> cmds') cmds'
 
-processCommandMap :: ([Chunk], MapLikeCommand v) -> Map [Chunk] v -> Map [Chunk] v
-processCommandMap = \case
-  (k, Insert v) -> Map.insert k v
-  (k, Delete) -> Map.delete k
-  (_, Focus) -> id
-
-processScriptMap :: MapLikeScript a -> (([Maybe a], [Maybe a]), Map [Chunk] a)
-processScriptMap = processScript processCommandMap Map.lookup Map.empty
-
-processCommandRadixZipper :: ([Chunk], MapLikeCommand v) -> RadixZipper Identity v -> RadixZipper Identity v
-processCommandRadixZipper = \case
-  (k, Insert v) -> runEvalFresh 0 . RZ.insert k v
-  (k, Delete) -> runEvalFresh 0 . RZ.delete k
-  (k, Focus) -> runEvalFresh 0 . RZ.focus k
-
-processScriptRadixZipper :: MapLikeScript a -> (([Maybe a], [Maybe a]), RadixZipper Identity a)
-processScriptRadixZipper = processScript processCommandRadixZipper (\x -> runEvalFresh 0 . RZ.lookup x) RZ.empty
-
-processScript :: (([Chunk], MapLikeCommand v) -> t -> t) -> ([Chunk] -> t -> c) -> t -> MapLikeScript v -> (([c], [c]), t)
-processScript processCommand processLookup initMap (MapLikeScript keys cmds) =
-  let (finResp, finMap) = foldl'
-        (\(accResps, accMap) (k, v) -> (processLookup k accMap:accResps, processCommand (k, v) accMap))
+processScript :: Monad m=> (([Chunk], MapLikeCommand v) -> dt -> m dt) -> ([Chunk] -> dt -> m out) -> dt -> MapLikeScript v -> m (([out], [out]), dt)
+processScript processCommand processLookup initMap (MapLikeScript keys cmds) = do
+  (finResp, finMap) <- foldM
+        (\(accResps, accMap) (k, v) -> (,) <$> ((:accResps) <$> processLookup k accMap) <*> processCommand (k, v) accMap)
         ([], initMap)
         cmds
-  in ((finResp, (`processLookup` finMap) <$> Set.toList keys), finMap)
+  finValues <- for (Set.toList keys) (`processLookup` finMap)
+  pure ((finResp, finValues), finMap)
+
+processCommandMap :: ([Chunk], MapLikeCommand v) -> Map [Chunk] v -> Identity (Map [Chunk] v)
+processCommandMap = \case
+  (k, Insert v) -> pure . Map.insert k v
+  (k, Delete) -> pure . Map.delete k
+  (_, Focus) -> pure
+
+processScriptMap :: MapLikeScript a -> Identity (([Maybe a], [Maybe a]), Map [Chunk] a)
+processScriptMap = processScript processCommandMap (\a -> pure . Map.lookup a) Map.empty
+
+processCommandRadixZipper :: Has FreshIO sig m => ([Chunk], MapLikeCommand v) -> RadixZipper Res [Chunk] v -> m (RadixZipper Res [Chunk] v)
+processCommandRadixZipper = \case
+  (k, Insert v) -> RZ.insert (RZ.selEq k) v
+  (k, Delete) -> RZ.delete (RZ.selEq k)
+  (k, Focus) -> RZ.focus (RZ.selEq k)
+
+unsafeRunFreshIO :: FreshIOC a -> a
+unsafeRunFreshIO = unsafePerformIO . runFreshIO
+
+processScriptRadixZipper :: Has FreshIO sig m => MapLikeScript a -> m (([Maybe a], [Maybe a]), RadixZipper Res [Chunk] a)
+processScriptRadixZipper = processScript processCommandRadixZipper (RZ.lookup . RZ.selEq) RZ.empty
 
 prop_script_same :: MapLikeScript Int -> Bool
-prop_script_same cmds = fst (processScriptMap @Int cmds) == fst (processScriptRadixZipper @Int cmds)
+prop_script_same cmds = fst (runIdentity $ processScriptMap @Int cmds) == fst (unsafeRunFreshIO $ processScriptRadixZipper @_ @_ @Int cmds)
 
 return []
 main :: IO ()

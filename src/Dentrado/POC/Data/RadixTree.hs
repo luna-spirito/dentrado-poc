@@ -5,18 +5,30 @@ import Data.Bits
 import Control.Algebra
 import Control.Effect.Writer
 import Dentrado.POC.Data.Container
-import Control.Effect.Fresh (Fresh)
 import Data.Foldable (foldrM)
 import Dentrado.POC.TH (moduleId, sRunEvalFresh)
 import Control.Carrier.Writer.Church (WriterC, runWriter)
 import Control.Monad.Fix (MonadFix)
 import Data.Monoid (First(..))
+import Control.Effect.NonDet (NonDet)
+import Control.Effect.Choose (Choose(..))
+import qualified Control.Effect.Empty as E
+import GHC.Exts (IsList(..))
+import Control.Carrier.NonDet.Church (runNonDet, NonDetC)
+import RIO.List (uncons)
 
 $(moduleId 1)
 
--- TODO: mkTip!!
+-- TODO: here, many type annotations reference WriterC Reduced. Probably this could be avoided, if it even should be?
 
 type Chunk = Word32
+
+class IsRadixKey key where
+  toRadixKey :: key -> [Chunk]
+  -- fromRadixKey :: [Chunk] -> key
+
+instance IsRadixKey [Chunk] where
+  toRadixKey = id
 
 tryMask :: Chunk -> Chunk -> Maybe Bool
 tryMask mask key =
@@ -34,13 +46,6 @@ makeMask l r =
 -- task: better key support
 -- build "key" marker into the RadixTree datatype, allow different keys to be used, implement min/max view.
 
-class IsRadixKey key where
-  toRadixKey :: key -> [Chunk]
-  -- fromRadixKey :: [Chunk] -> key
-
-instance IsRadixKey [Chunk] where
-  toRadixKey = id
-
 -- TODO: Implement Zebra simply by adding metadata field to Nil
 -- Justification: RadixTree stores discrete and continuous data,
 -- with discrete data being saved in Tip and continuous data being
@@ -54,119 +59,133 @@ data RadixChunk' c k a
   | Tip !Chunk !(RadixTree c k a) -- RadixTree is the only possible branch. Still could be containerized, but I'm not sure it's worth it
   | Bin !Chunk !(c (RadixChunk c k a)) !(c (RadixChunk c k a)) -- Either branch can be accessed, so containerization
 
+sNil :: Container c => c (RadixChunk c k a)
+sNil = $sRunEvalFresh $ allocC $ mkReducible Nil
+
 -- -- TODO: Don't know how effective is this
-reduceChunk'' :: (Container c, Has (Writer (Reduced' s)) sig m) => Proxy s -> RadixChunk' c k a -> m (RadixChunk' c k a, Maybe (c (RadixChunk c k a)))
+reduceChunk'' :: (Container c, Has (FreshIO :+: Reduce' s) sig m) => Proxy s -> RadixChunk' c k a -> m (RadixChunk' c k a, Maybe (c (RadixChunk c k a)))
 reduceChunk'' (Proxy @s) = \case
-  Tip _ (RadixTree (tryFetchC -> Just Nothing) (tryFetchC -> Just (readReducible -> Nil))) -> tell (Reduced' @s True) $> (Nil, Just sNil)
+  Tip _ (RadixTree (tryFetchC -> Just Nothing) (tryFetchC -> Just (readReducible -> Nil))) -> reduce' (Proxy @s) $> (Nil, Just sNil)
   Bin _ left'@(tryFetchC -> Just (readReducible -> left)) right'@(tryFetchC -> Just (readReducible -> right))
-    | Nil <- left -> tell (Reduced' @s True) $> (right, Just left') -- hopefully no need to reduceChunk left/right
-    | Nil <- right -> tell (Reduced' @s True) $> (left, Just right')
+    | Nil <- left -> reduce' (Proxy @s) $> (right, Just right') -- hopefully no need to reduceChunk left/right
+    | Nil <- right -> reduce' (Proxy @s) $> (left, Just left')
   nonReducible -> pure (nonReducible, Nothing)
 {-# INLINE reduceChunk'' #-}
 
-reduceChunk' :: (Container c, Has (Writer (Reduced' s)) sig m) => Proxy s -> RadixChunk' c k a -> m (RadixChunk' c k a)
+reduceChunk' :: (Container c, Has (FreshIO :+: Reduce' s) sig m) => Proxy s -> RadixChunk' c k a -> m (RadixChunk' c k a)
 reduceChunk' p v = fst <$> reduceChunk'' p v
 {-# INLINE reduceChunk' #-}
 
-reduceChunk :: (Container c, Has (Writer Reduced) sig m) => RadixChunk' c k a -> m (RadixChunk' c k a)
-reduceChunk x = reduceChunk' (Proxy @"") x
+reduceChunk :: (Container c, Has (FreshIO :+: Reduce) sig m) => RadixChunk' c k a -> m (RadixChunk' c k a)
+reduceChunk = reduceChunk' (Proxy @"")
 {-# INLINE reduceChunk #-}
 
-allocReducedChunk :: (Container c1, Container c2, Has Fresh sig m) => (forall b. c2 b -> WriterC Reduced m (c1 b)) -> RadixChunk' c2 k a -> m (c1 (RadixChunk c2 k a))
-allocReducedChunk f c = nonRe $ reduceChunk'' (Proxy @"") c >>= \case
+allocReducedChunk :: (Container c1, Container c2, Has FreshIO sig m) => (forall b. c2 b -> ReduceC m (c1 b)) -> RadixChunk' c2 k a -> m (c1 (RadixChunk c2 k a))
+allocReducedChunk f c = runReduce $ reduceChunk'' (Proxy @"") c >>= \case
   (v, Nothing) -> allocC $ mkReducible v
   (_, Just v) -> f v
 {-# INLINE allocReducedChunk #-}
 
--- -- Let's make accessRadix and accessRadix1?
-accessRadix1 :: forall c k a tree chunk sig m. (Container c, Has (Fresh :+: Writer Reduced) sig m)
-  => (c (Maybe a) -> chunk -> tree) -- ^ on sub, tree
-  -> (RadixTree c k a -> tree) -- ^ on found, tree
-  -> (Chunk -> [Chunk] -> chunk) -- ^ on missing, chunk
-  -> (Chunk -> tree -> chunk) -- ^ on Tip, chunk
-  -> (Bool -> Chunk -> c (RadixChunk c k a) -> chunk -> chunk) -- ^ on branch, chunk
-  -> Chunk
-  -> [Chunk]
-  -> c (RadixChunk c k a)
-  -> m chunk
-accessRadix1 onSubT onFoundT onMissingC onTipC onBranchC =
-  let
-    goChunk :: Chunk -> [Chunk] -> c (RadixChunk c k a) -> m chunk
-    goChunk key keys chunkM =
-      let
-        newBranch :: Chunk -> chunk
-        newBranch exKey =
-          let (mask, placeRight) = makeMask exKey key
-          in onBranchC placeRight mask chunkM $ onMissingC key keys
-      in fetchC chunkM >>= \chunk -> reducible reduceChunk chunk \case
-        Nil -> pure $ onMissingC key keys
-        (Tip key2 subtree)
-          | key == key2 -> onTipC key <$> goTree keys subtree
-          | otherwise -> pure $ newBranch key2
-        (Bin mask l r)
-          | Just pickRight <- tryMask mask key
-            -> onBranchC pickRight mask (if pickRight then l else r) <$> goChunk key keys (if pickRight then r else l)
-          | otherwise -> pure $ newBranch mask
-    goTree :: [Chunk] -> RadixTree c k a -> m tree
-    goTree [] = pure . onFoundT
-    goTree (key:keys) = \(RadixTree val chunk) -> onSubT val <$> goChunk key keys chunk
-  in goChunk
-{-# INLINE accessRadix1 #-}
+-- This is hilarious, but probably should be rewritten as
+-- class Selector m chunk tree where
+--   ...
+-- --
+-- newtype sel k "tree" = SelTree (m (Maybe (sel k "chunk")))
+-- data sel k "chunk" = SelChunk
+--   { selTip :: !(Chunk -> m (Maybe (sel k "tree")))
+--   , selBin :: !(Chunk -> m (Maybe (Bool, sel k "chunk")))
+--   , selNil :: !(m (Chunk, [Chunk]))
+--   }
 
--- TODO: use same m everywhere
--- Constructs both accessRadix1 and accessRadix versions
-accessRadix :: forall c k a tree chunk sig m. (Container c, Has (Fresh :+: Writer Reduced) sig m)
+-- selEq :: Applicative m => IsRadixKey k => k -> sel k "tree"
+-- selEq =
+--   let
+--     t keys = SelTree $ pure case keys of
+--       [] -> Nothing
+--       k:ks -> Just $ c k ks
+--     c key keys = SelChunk
+--       (\key2 -> pure $ if key == key2 then Just (t keys) else Nothing)
+--       (\mask -> pure $ (, c key keys) <$> tryMask mask key)
+--       (pure (key, keys))
+--   in t . toRadixKey
+
+data SChunk
+data STree
+
+-- in SelBin, returning new seelector is superfluous, we could just use previous one
+newtype FinalPath = FinalPath [Chunk]
+class Selector s m where
+  selTree :: s k STree -> m (Either FinalPath (s k SChunk))
+  selBin :: s k SChunk -> Chunk -> m (Maybe (Bool, s k SChunk))
+  selTip :: s k SChunk -> Chunk -> m (Maybe (s k STree))
+  selNil :: s k SChunk -> m (Chunk, [Chunk], FinalPath)
+
+accessRadix :: forall sel c k a tree chunk sig m. (Selector sel m, Container c, Has (FreshIO :+: Reduce) sig m)
   => (c (Maybe a) -> chunk -> tree) -- ^ on sub, tree
-  -> (RadixTree c k a -> tree) -- ^ on found, tree
-  -> (Chunk -> [Chunk] -> chunk) -- ^ on missing, chunk
+  -> (FinalPath -> RadixTree c k a -> tree) -- ^ on found, tree
+  -> (Chunk -> [Chunk] -> FinalPath -> chunk) -- ^ on missing, chunk
   -> (Chunk -> tree -> chunk) -- ^ on Tip, chunk
   -> (Bool -> Chunk -> c (RadixChunk c k a) -> chunk -> chunk) -- ^ on branch, chunk
-  -> (Chunk -> [Chunk] -> c (RadixChunk c k a) -> m chunk, [Chunk] -> RadixTree c k a -> m tree)
+  -> (sel k SChunk -> c (RadixChunk c k a) -> m chunk, sel k STree -> RadixTree c k a -> m tree)
 accessRadix onSubT onFoundT onMissingC onTipC onBranchC =
   let
-    var1 :: Chunk -> [Chunk] -> c (RadixChunk c k a) -> m chunk
-    var1 = accessRadix1 onSubT onFoundT onMissingC onTipC onBranchC
-  in (var1, \case
-    [] -> pure . onFoundT
-    (key:keys) -> \(RadixTree val chunk) -> onSubT val <$> var1 key keys chunk
-  )
+    goChunk :: sel k SChunk -> c (RadixChunk c k a) -> m chunk
+    goChunk sel1 chunkM =
+      let
+        newBranch :: Chunk -> m chunk
+        newBranch exKey = do
+          (key, keys, final) <- selNil sel1
+          let (mask, placeRight) = makeMask exKey key
+          pure $ onBranchC placeRight mask chunkM $ onMissingC key keys final
+      in fetchC chunkM >>= \chunk -> reducible reduceChunk chunk \case
+        Nil -> do
+          (a, b, c) <- selNil sel1
+          pure $ onMissingC a b c
+        (Tip key subtree) -> selTip sel1 key >>= \case
+          Nothing -> newBranch key
+          Just sel2 -> onTipC key <$> goTree sel2 subtree
+        (Bin mask l r) -> selBin sel1 mask >>= \case
+          Nothing -> newBranch mask
+          Just (pickRight, sel2) -> onBranchC pickRight mask (if pickRight then l else r) <$> goChunk sel2 (if pickRight then r else l)
+    goTree :: sel k STree -> RadixTree c k a -> m tree
+    goTree sel1 rt@(RadixTree val chunk) = selTree sel1 >>= \case
+      Left final -> pure $ onFoundT final rt
+      Right sel2 -> onSubT val <$> goChunk sel2 chunk
+  in (goChunk, goTree)
 {-# INLINE accessRadix #-}
 
 mkBinNonRe :: Container c => Bool -> Chunk -> c (RadixChunk c k a) -> c (RadixChunk c k a) -> RadixChunk' c k a
 mkBinNonRe right mask a b = Bin mask (if right then a else b) (if right then b else a)
 {-# INLINE mkBinNonRe #-}
 
-mkBin :: (Container c1, Container c2, Has Fresh sig m)  => (forall b. c2 b -> WriterC Reduced m (c1 b)) -> Bool -> Chunk -> c2 (RadixChunk c2 k a) -> c2 (RadixChunk c2 k a) -> m (c1 (RadixChunk c2 k a))
+mkBin :: (Container c1, Container c2, Has FreshIO sig m)  => (forall b. c2 b -> ReduceC m (c1 b)) -> Bool -> Chunk -> c2 (RadixChunk c2 k a) -> c2 (RadixChunk c2 k a) -> m (c1 (RadixChunk c2 k a))
 mkBin f a b c d = allocReducedChunk f $ mkBinNonRe a b c d
 {-# INLINE mkBin #-}
 
 mkTipNonRe :: Chunk -> RadixTree c k a -> RadixChunk' c k a
 mkTipNonRe = Tip
 
-mkTip :: (Container c1, Container c2, Has Fresh sig m) => (forall b. c2 b -> WriterC Reduced m (c1 b)) -> Chunk -> RadixTree c2 k a -> m (c1 (RadixChunk c2 k a))
+mkTip :: (Container c1, Container c2, Has FreshIO sig m) => (forall b. c2 b -> ReduceC m (c1 b)) -> Chunk -> RadixTree c2 k a -> m (c1 (RadixChunk c2 k a))
 mkTip f k v = allocReducedChunk f $ mkTipNonRe k v
 {-# INLINE mkTip #-}
 
-internalLookup :: (Container c, Has (Fresh :+: Writer Reduced) sig m) => (Chunk -> [Chunk] -> c (RadixChunk c k a) -> m (m (Maybe a)), [Chunk] -> RadixTree c k a -> m (m (Maybe a)))
+internalLookup :: (Selector sel m, Container c, Has (FreshIO :+: Reduce) sig m) => (sel k SChunk -> c (RadixChunk c k a) -> m (m (Maybe a)), sel k STree -> RadixTree c k a -> m (m (Maybe a)))
 internalLookup = accessRadix
   (\_ -> id)
-  (\(RadixTree a _) -> fetchC a)
-  (\_ _ -> pure Nothing)
+  (\_ (RadixTree a _) -> fetchC a)
+  (\_ _ _ -> pure Nothing)
   (\_ -> id)
   (\_ _ _ -> id)
 {-# INLINE internalLookup #-}
 
-lookup :: Has Fresh sig m => Container c => [Chunk] -> RadixTree c k a -> m (Maybe a)
-lookup k tr = nonRe $ join $ snd internalLookup k tr
+lookup :: (Selector sel (ReduceC m), Has FreshIO sig m) => Container c => sel k STree -> RadixTree c k a -> m (Maybe a)
+lookup k tr = runReduce $ join $ snd internalLookup k tr
 
-sNil :: Container c => c (RadixChunk c k a)
-sNil = $sRunEvalFresh $ allocC $ mkReducible Nil
-
-internalInsert :: forall c k sig m a. (Container c, Has (Fresh :+: Writer Reduced) sig m) => a -> (Chunk -> [Chunk] -> c (RadixChunk c k a) -> m (m (c (RadixChunk c k a))), [Chunk] -> RadixTree c k a -> m (m (RadixTree c k a)))
+internalInsert :: forall sel c k sig m a. (Selector sel m, Container c, Has (FreshIO :+: Reduce) sig m) => a -> (sel k SChunk -> c (RadixChunk c k a) -> m (m (c (RadixChunk c k a))), sel k STree -> RadixTree c k a -> m (m (RadixTree c k a)))
 internalInsert val = accessRadix
   (\a b -> RadixTree a <$> b)
-  (\(RadixTree _oldVal b) -> (`RadixTree` b) <$> allocC (Just val))
-  (\key1 keys2 -> do
+  (\_ (RadixTree _oldVal b) -> (`RadixTree` b) <$> allocC (Just val))
+  (\key1 keys2 _ -> do
     finalVal <- allocC $ Just val
     (_state, res) <- foldrM
       (\key (subval, subchunk) ->
@@ -179,41 +198,29 @@ internalInsert val = accessRadix
 {-# INLINE internalInsert #-}
 
 -- short-circuit
-insert :: (Container c, Has Fresh sig m) => [Chunk] -> p -> RadixTree c k p -> m (RadixTree c k p)
-insert k v tr = nonRe $ join $ snd (internalInsert v) k tr
-
--- internalDelete :: (Container c, Has (Fresh :+: Writer Reduced) sig m) => (Chunk -> [Chunk] -> c (RadixChunk c k a) -> m (m (c (RadixChunk c k a))), [Chunk] -> RadixTree c k a -> m (m (RadixTree c k a)))
--- internalDelete = accessRadix
---   (\a b -> RadixTree a <$> b) -- on sub, tree
---   (\(RadixTree _deleted sub) -> pure $ RadixTree sNothing sub) -- on found, tree
---   (\_key1 _keys2 -> pure sNil) -- on missing, chunk
---   (\key tree -> mkTip pure key =<< tree) -- on Tip, chunk
---   (\k r a b -> mkBin pure k r a =<< b) -- on branch, chunk
--- {-# INLINE internalDelete #-}
-
--- delete :: (Container c, Has Fresh sig m) => [Chunk] -> RadixTree c k p -> m (RadixTree c k p)
--- delete k tr = nonRe $ join $ snd internalDelete k tr
+insert :: (Selector sel (ReduceC m), Container c, Has FreshIO sig m) => sel k STree -> p -> RadixTree c k p -> m (RadixTree c k p)
+insert k v tr = runReduce $ join $ snd (internalInsert v) k tr
 
 -- could be m (f (...)), but I don't think it's worth it
-internalUpdate :: (Container c, Has (Fresh :+: Writer Reduced) sig m)
-  => (c (Maybe a) -> m (c (Maybe a))) -> (Chunk -> [Chunk] -> c (RadixChunk c k a) -> m (m (c (RadixChunk c k a))), [Chunk] -> RadixTree c k a -> m (m (RadixTree c k a)))
+internalUpdate :: (Selector sel m, Container c, Has (FreshIO :+: Reduce) sig m)
+  => (c (Maybe a) -> m (c (Maybe a))) -> (sel k SChunk -> c (RadixChunk c k a) -> m (m (c (RadixChunk c k a))), sel k STree -> RadixTree c k a -> m (m (RadixTree c k a)))
 internalUpdate f = accessRadix
   (\a b -> RadixTree a <$> b) -- on sub, tree
-  (\(RadixTree updated sub) -> (`RadixTree` sub) <$> f updated) -- on found, tree
-  (\_key1 _keys2 -> pure sNil) -- on missing, chunk
+  (\_ (RadixTree updated sub) -> (`RadixTree` sub) <$> f updated) -- on found, tree
+  (\_ _ _ -> pure sNil) -- on missing, chunk
   (\key tree -> mkTip pure key =<< tree) -- on Tip, chunk
   (\k r a b -> mkBin pure k r a =<< b) -- on branch, chunk
 {-# INLINE internalUpdate #-}
 
 -- short-circuit?
-update :: (Container c, Has Fresh sig m) => (c (Maybe a) -> WriterC Reduced m (c (Maybe a))) -> [Chunk] -> RadixTree c k a -> m (RadixTree c k a)
-update f k tr = nonRe $ join $ snd (internalUpdate f) k tr
+update :: (Selector sel (ReduceC m), Container c, Has FreshIO sig m) => (c (Maybe a) -> ReduceC m (c (Maybe a))) -> sel k STree -> RadixTree c k a -> m (RadixTree c k a)
+update f k tr = runReduce $ join $ snd (internalUpdate f) k tr
 
 -- short-circuit
-delete :: (Container c, Has Fresh sig m) => [Chunk] -> RadixTree c k a -> m (RadixTree c k a)
+delete :: (Selector sel (ReduceC m), Container c, Has FreshIO sig m) => sel k STree -> RadixTree c k a -> m (RadixTree c k a)
 delete = update (\_ -> pure sNothing)
 
-pop :: (Container c, Has Fresh sig m) => [Chunk] -> RadixTree c k a -> m (Maybe a, RadixTree c k a)
+pop :: (Selector sel (ReduceC (WriterC (First a) m)), Container c, Has FreshIO sig m) => sel k STree -> RadixTree c k a -> m (Maybe a, RadixTree c k a)
 pop k rt = runWriter (\(First a) b -> pure (a, b)) $ update
   (\v -> do
     v' <- fetchC v
@@ -231,21 +238,21 @@ sEmpty = $sRunEvalFresh $ allocC empty
 -- TODO: monadical extract, separate RadixTree and RadixZipper into different modules, `merge`, `adjust`
 
 data OnOne c other fin = OnOne
-  { onOneVal :: !(Res (Maybe other) -> other -> FreshM (Res (Maybe fin))) -- other must be unwrapped for this conclusion
-  , onOneSubtree :: !(forall k. Res (RadixChunk c k other) -> FreshM (Res (RadixChunk c k fin))) }
+  { onOneVal :: !(Res (Maybe other) -> other -> FreshIOC (Res (Maybe fin))) -- other must be unwrapped for this conclusion
+  , onOneSubtree :: !(forall k. Res (RadixChunk c k other) -> FreshIOC (Res (RadixChunk c k fin))) }
 newtype OnBoth one two fin = OnBoth
-  { onBothVal :: Res (Maybe one) -> one -> Res (Maybe two) -> two -> FreshM (Res (Maybe fin)) }
+  { onBothVal :: Res (Maybe one) -> one -> Res (Maybe two) -> two -> FreshIOC (Res (Maybe fin)) }
 newtype MergeStrategy c = MergeStrategy
-  { _apply :: forall x y z. Res (Res x -> Res y -> WriterC (Reduced' "1") (WriterC (Reduced' "2") FreshM) (Res z)) -> c x -> c y -> WriterC (Reduced' "1") (WriterC (Reduced' "2") FreshM) (c z) }
+  { _apply :: forall x y z. Res (Res x -> Res y -> Reduce'C "1" (Reduce'C "2" FreshIOC) (Res z)) -> c x -> c y -> Reduce'C "1" (Reduce'C "2" FreshIOC) (c z) }
 
-merge :: forall one two fin c k. forall sig1 m1. (Container c, Has Fresh sig1 m1, MonadFix m1)
+merge :: forall one two fin c k. forall sig1 m1. (Container c, Has FreshIO sig1 m1, MonadFix m1)
   => MergeStrategy c
   -> OnOne c one fin
   -> OnOne c two fin
   -> OnBoth one two fin
   -> m1 (RadixTree c k one
     -> RadixTree c k two
-    -> FreshM (RadixTree c k fin))
+    -> FreshIOC (RadixTree c k fin))
 merge (MergeStrategy apply) one1 one2 both = mdo
   mergeVal <- alloc \r1 r2 -> do
     v1 <- fetch r1
@@ -305,7 +312,7 @@ merge (MergeStrategy apply) one1 one2 both = mdo
         RadixTree
           <$> apply mergeVal k1 k2
           <*> apply mergeChunk s1 s2
-  pure \a b -> nonRe' @"2" $ nonRe' @"1" $ mergeTree a b
+  pure \a b -> runReduce' @"2" $ runReduce' @"1" $ mergeTree a b
 
 
 -- merge = runWriter @(Reduced' "one") (\_ -> pure) $ runWriter @(Reduced' "two") (\_ -> pure) $ getCompose $ mergeTree [] a b where
@@ -353,6 +360,78 @@ merge (MergeStrategy apply) one1 one2 both = mdo
 
 -- TODO: monadic... monadic
 
+-- selectors
+
+data family SelEq k t -- access equal to key
+
+data instance SelEq k STree = SelEqT !FinalPath ![Chunk]
+data instance SelEq k SChunk = SelEqC !FinalPath !Chunk ![Chunk]
+
+instance Applicative m => Selector SelEq m where
+  selTree (SelEqT final keys) = pure case keys of
+    [] -> Left final
+    k:ks-> Right $ SelEqC final k ks
+  selBin (SelEqC final key keys) mask = pure $ (, SelEqC final key keys) <$> tryMask mask key
+  selTip (SelEqC final key keys) key2 = pure $ if key == key2 then Just (SelEqT final keys) else Nothing
+  selNil (SelEqC final key keys) = pure (key, keys, final)
+
+selEq :: IsRadixKey k => k -> SelEq k STree
+selEq k =
+  let k' = toRadixKey k
+  in SelEqT (FinalPath k') k'
+
+-- I'm writing this for the forth time or something.
+-- Me, please, DO NOT DELETE THIS.
+newtype RevList a = UnsafeRevList [a]
+
+revSnoc :: RevList a -> a -> RevList a
+revSnoc (UnsafeRevList ls) x = UnsafeRevList $ x:ls
+
+revUnsnoc :: RevList a -> Maybe (RevList a, a)
+revUnsnoc (UnsafeRevList x) = (\(v, l) -> (UnsafeRevList l, v)) <$> uncons x
+
+instance IsList (RevList a) where
+  type Item (RevList a) = a
+  fromList ls = UnsafeRevList $ reverse ls
+  {-# INLINE fromList #-}
+  toList (UnsafeRevList ls) = reverse ls
+  {-# INLINE toList #-}
+
+data family SelChoose k t -- access existing value by choosing
+
+newtype instance SelChoose k STree = SelChooseT (RevList Chunk) -- stores current path
+newtype instance SelChoose k SChunk = SelChooseC (RevList Chunk)
+
+instance Has NonDet sig m => Selector SelChoose m where
+  selTree (SelChooseT curr) = do
+    deeper <- send Choose
+    pure $ if deeper
+      then Right (SelChooseC curr)
+      else Left (FinalPath $ toList curr)
+  selBin self _ = do
+    right <- send Choose
+    pure $ Just (right, self)
+  selTip (SelChooseC curr) chunk = pure $ Just $ SelChooseT (curr `revSnoc` chunk)
+  selNil _ = E.empty
+
+selChoose :: SelChoose k STree
+selChoose = SelChooseT []
+
+min :: Monad m => NonDetC m a -> m (Maybe a)
+min = runNonDet
+  (\l r -> l >>= \case
+    Nothing -> r
+    l' -> pure l')
+  (pure . Just)
+  (pure Nothing)
+
+-- max :: Monad m => NonDetC m a -> m (Maybe a)
+-- max = runNonDet
+--   (\l r -> r >>= \case
+--     Nothing -> l
+--     r' -> pure r')
+--   (pure . Just)
+--   (pure Nothing)
 
 -- debug
 

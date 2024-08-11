@@ -21,7 +21,10 @@ common lang
 library dentrado-poc-lib
     import: lang
     hs-source-dirs: src
-    exposed-modules: Dentrado.POC.Data.Container, Dentrado.POC.Data.RadixTree, Dentrado.POC.Data.RadixZipper,
+    exposed-modules:
+        Dentrado.POC.Data.Container,
+        Dentrado.POC.Data.RadixTree,
+        Dentrado.POC.Data.RadixZipper,
         Dentrado.POC.TH
 
 executable dentrado-poc-exe
