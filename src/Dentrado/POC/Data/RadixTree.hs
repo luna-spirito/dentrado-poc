@@ -115,10 +115,10 @@ data STree
 -- in SelBin, returning new seelector is superfluous, we could just use previous one
 newtype FinalPath = FinalPath [Chunk]
 class Selector s m where
-  selTree :: s k STree -> m (Either FinalPath (s k SChunk))
+  selTree :: s k STree -> m (Maybe  (s k SChunk))
   selBin :: s k SChunk -> Chunk -> m (Maybe (Bool, s k SChunk))
   selTip :: s k SChunk -> Chunk -> m (Maybe (s k STree))
-  selNil :: s k SChunk -> m (Chunk, [Chunk], FinalPath)
+  selNil :: s k SChunk -> m (Chunk, [Chunk])
 
 accessRadix :: forall sel c k a tree chunk sig m. (Selector sel m, Container c, Has (FreshIO :+: Reduce) sig m)
   => (c (Maybe a) -> chunk -> tree) -- ^ on sub, tree
@@ -126,31 +126,32 @@ accessRadix :: forall sel c k a tree chunk sig m. (Selector sel m, Container c, 
   -> (Chunk -> [Chunk] -> FinalPath -> chunk) -- ^ on missing, chunk
   -> (Chunk -> tree -> chunk) -- ^ on Tip, chunk
   -> (Bool -> Chunk -> c (RadixChunk c k a) -> chunk -> chunk) -- ^ on branch, chunk
-  -> (sel k SChunk -> c (RadixChunk c k a) -> m chunk, sel k STree -> RadixTree c k a -> m tree)
+  -> (RevList Chunk -> sel k SChunk -> c (RadixChunk c k a) -> m chunk, RevList Chunk -> sel k STree -> RadixTree c k a -> m tree)
 accessRadix onSubT onFoundT onMissingC onTipC onBranchC =
   let
-    goChunk :: sel k SChunk -> c (RadixChunk c k a) -> m chunk
-    goChunk sel1 chunkM =
+    goChunk :: RevList Chunk -> sel k SChunk -> c (RadixChunk c k a) -> m chunk
+    goChunk path sel1 chunkM =
       let
+        selNil' = do
+          (k, ks) <- selNil sel1
+          pure (k, onMissingC k ks (FinalPath $ toList path <> [k] <> ks))
         newBranch :: Chunk -> m chunk
         newBranch exKey = do
-          (key, keys, final) <- selNil sel1
+          (key, missing) <- selNil'
           let (mask, placeRight) = makeMask exKey key
-          pure $ onBranchC placeRight mask chunkM $ onMissingC key keys final
+          pure $ onBranchC placeRight mask chunkM missing
       in fetchC chunkM >>= \chunk -> reducible reduceChunk chunk \case
-        Nil -> do
-          (a, b, c) <- selNil sel1
-          pure $ onMissingC a b c
+        Nil -> snd <$> selNil'
         (Tip key subtree) -> selTip sel1 key >>= \case
           Nothing -> newBranch key
-          Just sel2 -> onTipC key <$> goTree sel2 subtree
+          Just sel2 -> onTipC key <$> goTree (path `revSnoc` key) sel2 subtree
         (Bin mask l r) -> selBin sel1 mask >>= \case
           Nothing -> newBranch mask
-          Just (pickRight, sel2) -> onBranchC pickRight mask (if pickRight then l else r) <$> goChunk sel2 (if pickRight then r else l)
-    goTree :: sel k STree -> RadixTree c k a -> m tree
-    goTree sel1 rt@(RadixTree val chunk) = selTree sel1 >>= \case
-      Left final -> pure $ onFoundT final rt
-      Right sel2 -> onSubT val <$> goChunk sel2 chunk
+          Just (pickRight, sel2) -> onBranchC pickRight mask (if pickRight then l else r) <$> goChunk path sel2 (if pickRight then r else l)
+    goTree :: RevList Chunk -> sel k STree -> RadixTree c k a -> m tree
+    goTree path sel1 rt@(RadixTree val chunk) = selTree sel1 >>= \case
+      Nothing -> pure $ onFoundT (FinalPath $ toList path) rt
+      Just sel2 -> onSubT val <$> goChunk path sel2 chunk
   in (goChunk, goTree)
 {-# INLINE accessRadix #-}
 
@@ -169,7 +170,7 @@ mkTip :: (Container c1, Container c2, Has FreshIO sig m) => (forall b. c2 b -> R
 mkTip f k v = allocReducedChunk f $ mkTipNonRe k v
 {-# INLINE mkTip #-}
 
-internalLookup :: (Selector sel m, Container c, Has (FreshIO :+: Reduce) sig m) => (sel k SChunk -> c (RadixChunk c k a) -> m (m (Maybe a)), sel k STree -> RadixTree c k a -> m (m (Maybe a)))
+internalLookup :: (Selector sel m, Container c, Has (FreshIO :+: Reduce) sig m) => (RevList Chunk -> sel k SChunk -> c (RadixChunk c k a) -> m (m (Maybe a)), RevList Chunk -> sel k STree -> RadixTree c k a -> m (m (Maybe a)))
 internalLookup = accessRadix
   (\_ -> id)
   (\_ (RadixTree a _) -> fetchC a)
@@ -179,9 +180,9 @@ internalLookup = accessRadix
 {-# INLINE internalLookup #-}
 
 lookup :: (Selector sel (ReduceC m), Has FreshIO sig m) => Container c => sel k STree -> RadixTree c k a -> m (Maybe a)
-lookup k tr = runReduce $ join $ snd internalLookup k tr
+lookup k tr = runReduce $ join $ snd internalLookup [] k tr
 
-internalInsert :: forall sel c k sig m a. (Selector sel m, Container c, Has (FreshIO :+: Reduce) sig m) => a -> (sel k SChunk -> c (RadixChunk c k a) -> m (m (c (RadixChunk c k a))), sel k STree -> RadixTree c k a -> m (m (RadixTree c k a)))
+internalInsert :: forall sel c k sig m a. (Selector sel m, Container c, Has (FreshIO :+: Reduce) sig m) => a -> (RevList Chunk -> sel k SChunk -> c (RadixChunk c k a) -> m (m (c (RadixChunk c k a))), RevList Chunk -> sel k STree -> RadixTree c k a -> m (m (RadixTree c k a)))
 internalInsert val = accessRadix
   (\a b -> RadixTree a <$> b)
   (\_ (RadixTree _oldVal b) -> (`RadixTree` b) <$> allocC (Just val))
@@ -199,11 +200,11 @@ internalInsert val = accessRadix
 
 -- short-circuit
 insert :: (Selector sel (ReduceC m), Container c, Has FreshIO sig m) => sel k STree -> p -> RadixTree c k p -> m (RadixTree c k p)
-insert k v tr = runReduce $ join $ snd (internalInsert v) k tr
+insert k v tr = runReduce $ join $ snd (internalInsert v) [] k tr
 
 -- could be m (f (...)), but I don't think it's worth it
 internalUpdate :: (Selector sel m, Container c, Has (FreshIO :+: Reduce) sig m)
-  => (c (Maybe a) -> m (c (Maybe a))) -> (sel k SChunk -> c (RadixChunk c k a) -> m (m (c (RadixChunk c k a))), sel k STree -> RadixTree c k a -> m (m (RadixTree c k a)))
+  => (c (Maybe a) -> m (c (Maybe a))) -> (RevList Chunk -> sel k SChunk -> c (RadixChunk c k a) -> m (m (c (RadixChunk c k a))), RevList Chunk -> sel k STree -> RadixTree c k a -> m (m (RadixTree c k a)))
 internalUpdate f = accessRadix
   (\a b -> RadixTree a <$> b) -- on sub, tree
   (\_ (RadixTree updated sub) -> (`RadixTree` sub) <$> f updated) -- on found, tree
@@ -214,7 +215,7 @@ internalUpdate f = accessRadix
 
 -- short-circuit?
 update :: (Selector sel (ReduceC m), Container c, Has FreshIO sig m) => (c (Maybe a) -> ReduceC m (c (Maybe a))) -> sel k STree -> RadixTree c k a -> m (RadixTree c k a)
-update f k tr = runReduce $ join $ snd (internalUpdate f) k tr
+update f k tr = runReduce $ join $ snd (internalUpdate f) [] k tr
 
 -- short-circuit
 delete :: (Selector sel (ReduceC m), Container c, Has FreshIO sig m) => sel k STree -> RadixTree c k a -> m (RadixTree c k a)
@@ -364,21 +365,21 @@ merge (MergeStrategy apply) one1 one2 both = mdo
 
 data family SelEq k t -- access equal to key
 
-data instance SelEq k STree = SelEqT !FinalPath ![Chunk]
-data instance SelEq k SChunk = SelEqC !FinalPath !Chunk ![Chunk]
+newtype instance SelEq k STree = SelEqT [Chunk]
+data instance SelEq k SChunk = SelEqC !Chunk ![Chunk]
 
 instance Applicative m => Selector SelEq m where
-  selTree (SelEqT final keys) = pure case keys of
-    [] -> Left final
-    k:ks-> Right $ SelEqC final k ks
-  selBin (SelEqC final key keys) mask = pure $ (, SelEqC final key keys) <$> tryMask mask key
-  selTip (SelEqC final key keys) key2 = pure $ if key == key2 then Just (SelEqT final keys) else Nothing
-  selNil (SelEqC final key keys) = pure (key, keys, final)
+  selTree (SelEqT keys) = pure case keys of
+    [] -> Nothing
+    k:ks-> Just $ SelEqC k ks
+  selBin (SelEqC key keys) mask = pure $ (, SelEqC key keys) <$> tryMask mask key
+  selTip (SelEqC key keys) key2 = pure $ if key == key2 then Just (SelEqT keys) else Nothing
+  selNil (SelEqC key keys) = pure (key, keys)
 
 selEq :: IsRadixKey k => k -> SelEq k STree
 selEq k =
   let k' = toRadixKey k
-  in SelEqT (FinalPath k') k'
+  in SelEqT k'
 
 -- I'm writing this for the forth time or something.
 -- Me, please, DO NOT DELETE THIS.
@@ -399,23 +400,23 @@ instance IsList (RevList a) where
 
 data family SelChoose k t -- access existing value by choosing
 
-newtype instance SelChoose k STree = SelChooseT (RevList Chunk) -- stores current path
-newtype instance SelChoose k SChunk = SelChooseC (RevList Chunk)
+data instance SelChoose k STree = SelChooseT
+data instance SelChoose k SChunk = SelChooseC
 
 instance Has NonDet sig m => Selector SelChoose m where
-  selTree (SelChooseT curr) = do
+  selTree SelChooseT = do
     deeper <- send Choose
     pure $ if deeper
-      then Right (SelChooseC curr)
-      else Left (FinalPath $ toList curr)
+      then Just SelChooseC
+      else Nothing
   selBin self _ = do
     right <- send Choose
     pure $ Just (right, self)
-  selTip (SelChooseC curr) chunk = pure $ Just $ SelChooseT (curr `revSnoc` chunk)
+  selTip SelChooseC _chunk = pure $ Just SelChooseT
   selNil _ = E.empty
 
 selChoose :: SelChoose k STree
-selChoose = SelChooseT []
+selChoose = SelChooseT
 
 min :: Monad m => NonDetC m a -> m (Maybe a)
 min = runNonDet

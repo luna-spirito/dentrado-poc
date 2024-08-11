@@ -24,7 +24,7 @@ import GHC.Base (Type)
 import Data.Coerce (coerce)
 import Control.Effect.Sum (inj)
 import GHC.IsList (fromList, toList)
-import Control.Carrier.NonDet.Church (NonDetC, runNonDet)
+import Control.Carrier.NonDet.Church (NonDetC)
 import qualified RIO.Seq as Seq
 import qualified RIO.Partial as P
 
@@ -63,28 +63,29 @@ data SZipper
 
 class RT.Selector s m => SelectorZipper s m where
   selZipper :: s k SZipper -> [Chunk] -> m (Either (s k SInvtree) (s k RT.STree))
-  selInvTree :: s k SInvtree -> m (Either (Either RT.FinalPath (s k SInvchunk)) (s k SInvtree))
+  selInvtreeNil :: s k SInvtree -> m Void
+  selInvtreeCons :: s k SInvtree -> m (Either (Maybe (s k SInvchunk)) (s k SInvtree))
   selIBin :: s k SInvchunk -> Chunk -> Bool -> m (Either (Maybe (s k RT.SChunk)) (s k SInvchunk))
   selINil :: s k SInvchunk -> m (s k RT.SChunk) -- welp, this is awkward
 
-accessInvTree :: forall sel c k a invtree sig m. (SelectorZipper sel m, Container c, Has (FreshIO :+: Reduce) sig m)
-  => invtree -- ^ impossible, on missing super invtree
-  -> (Chunk -> c (Maybe a) -> c (InvRadixChunk c k a) -> invtree -> invtree) -- ^ on skip invchunk
-  -> (Either RT.FinalPath (sel k SInvchunk) -> Chunk -> c (Maybe a) -> c (InvRadixChunk c k a) -> c (InvRadixTree c k a) -> invtree) -- ^ on invchunk
-  -> [Chunk]
+accessInvtree :: forall sel c k a invtree sig m. (SelectorZipper sel m, Container c, Has (FreshIO :+: Reduce) sig m)
+  => (Chunk -> c (Maybe a) -> c (InvRadixChunk c k a) -> invtree -> invtree) -- ^ on skip invchunk
+  -> (RT.RevList Chunk -> Chunk -> Maybe (sel k SInvchunk) -> c (Maybe a) -> c (InvRadixChunk c k a) -> c (InvRadixTree c k a) -> invtree) -- ^ on invchunk
+  -> RT.RevList Chunk
   -> sel k SInvtree
   -> InvRadixTree c k a
   -> m invtree
-accessInvTree onMissingInvTree onSkip onInvChunk =
+accessInvtree onSkip onInvChunk =
   let
-    goTree :: [Chunk] -> sel k SInvtree -> InvRadixTree c k a -> m invtree
-    goTree _ _ InvRadixNil = pure onMissingInvTree
-    goTree [] _ _ = pure onMissingInvTree
-    goTree (x:xs) sel1 (InvRadixCons el invchunk superInvChunks) = selInvTree sel1 >>= \case
-      Left sel2  -> pure $ onInvChunk sel2 x el invchunk superInvChunks
-      Right sel2 -> onSkip x el invchunk <$> (goTree xs sel2 =<< fetchC superInvChunks)
+    goTree :: RT.RevList Chunk -> sel k SInvtree -> InvRadixTree c k a -> m invtree
+    goTree _ sel1 InvRadixNil = absurd <$>  selInvtreeNil sel1
+    goTree (RT.revUnsnoc -> Nothing) sel1 _ = absurd <$> selInvtreeNil sel1
+    goTree (RT.revUnsnoc -> Just (xs, x)) sel1 (InvRadixCons el invchunk superInvChunks) =
+      selInvtreeCons sel1 >>= \case
+        Left sel2  -> pure $ onInvChunk xs x sel2 el invchunk superInvChunks
+        Right sel2 -> onSkip x el invchunk <$> (goTree xs sel2 =<< fetchC superInvChunks)
   in goTree
-{-# INLINE accessInvTree #-}
+{-# INLINE accessInvtree #-}
 
 accessInvChunk :: forall sel c k invchunk a sig m. (SelectorZipper sel m, Container c, Has (FreshIO :+: Reduce) sig m)
   => (Bool -> Chunk -> c (RadixChunk c k a)    -> invchunk -> invchunk) -- ^ on super
@@ -101,7 +102,7 @@ accessInvChunk onSuper onSub exKey =
         newBranch :: m invchunk
         newBranch = do
           sel2 <- selINil sel1
-          (key, _, _) <- RT.selNil sel2 -- well, this is awkward
+          (key, _) <- RT.selNil sel2 -- well, this is awkward
           let (mask, placeRight) = RT.makeMask exKey key
           pure $ onSub sel2 (not placeRight) mask chunkM RT.sNil
       in fetchC chunkM >>= \chunk -> reducible reduceInvChunk chunk \case
@@ -115,11 +116,11 @@ accessInvChunk onSuper onSub exKey =
 
 accessRadixZipper :: forall sel c k a chunk invchunk invtree tree zipper sig m. (SelectorZipper sel (ReduceC m), Container c, Has (FreshIO :+: Fresh) sig m)
   => ([Chunk] -> c (InvRadixTree c k a) -> tree -> zipper) -- ^ on sub, zipper
-  -> (sel k RT.SChunk -> c (RadixChunk c k a) -> chunk)
-  -> (sel k RT.STree -> RadixTree c k a -> tree)
+  -> (RT.RevList Chunk -> sel k RT.SChunk -> c (RadixChunk c k a) -> chunk)
+  -> (RT.RevList Chunk -> sel k RT.STree -> RadixTree c k a -> tree)
   -> ([Chunk] -> c (RadixTree c k a) -> invtree -> zipper) -- ^ on super, zipper
   -> (Chunk -> c (Maybe a) -> c (InvRadixChunk c k a) -> invtree -> invtree) -- ^ on super skip, invtree
-  -> (Chunk -> RT.FinalPath -> c (Maybe a) -> c (InvRadixChunk c k a) -> c (InvRadixTree c k a) -> invtree) -- ^ on found value, invtree
+  -> (RT.FinalPath -> Chunk -> c (Maybe a) -> c (InvRadixChunk c k a) -> c (InvRadixTree c k a) -> invtree) -- ^ on found value, invtree
   -> (Chunk -> c (Maybe a) -> c (InvRadixTree c k a) -> invchunk -> invtree) -- ^ on found invchunk, invtree
   -> (Bool -> Chunk -> c (RadixChunk c k a)    -> invchunk -> invchunk) -- ^ on super, invchunk
   -> (Bool -> Chunk -> c (InvRadixChunk c k a) -> chunk    -> invchunk) -- ^ on sub, invchunk
@@ -129,19 +130,18 @@ accessRadixZipper :: forall sel c k a chunk invchunk invtree tree zipper sig m. 
   -> m zipper
 accessRadixZipper onSub onChunk onTree onSuper onSkip onFoundValue onFoundInvChunk onSuperInvChunk onSubInvChunk sel1 zipper = runReduce $
   selZipper sel1 zipper.radixPathToChunk >>= \case
-    Right sel2 -> onSub zipper.radixPathToChunk zipper.radixSuper . onTree sel2 <$> fetchC zipper.radixSub
+    Right sel2 -> onSub zipper.radixPathToChunk zipper.radixSuper . onTree (fromList zipper.radixPathToChunk) sel2 <$> fetchC zipper.radixSub
     Left sel2 -> do
       radixSuper' <- fetchC zipper.radixSuper
-      invRadix' <- join $ accessInvTree
-        (error "impossible")
+      invRadix' <- join $ accessInvtree
         (\a b c d -> onSkip a b c <$> d)
-        (\sel3 exKey val chunk super -> case sel3 of
-          Left fp -> pure $ onFoundValue exKey fp val chunk super
-          Right sel4 -> onFoundInvChunk exKey val super <$> accessInvChunk
+        (\keys exKey sel3 val chunk super -> case sel3 of
+          Nothing -> pure $ onFoundValue (RT.FinalPath $ toList keys) exKey val chunk super
+          Just sel4 -> onFoundInvChunk exKey val super <$> accessInvChunk
             onSuperInvChunk
-            (\sel5 a b c d -> onSubInvChunk a b c $ onChunk sel5 d)
+            (\sel5 a b c d -> onSubInvChunk a b c $ onChunk keys sel5 d)
             exKey sel4 chunk)
-        zipper.radixPathToChunk
+        (fromList zipper.radixPathToChunk)
         sel2
         radixSuper'
       pure $ onSuper zipper.radixPathToChunk zipper.radixSub invRadix'
@@ -157,8 +157,8 @@ mkIBin f a b c d = allocReducedInvChunk f $ mkIBinNonRe a b c d
 lookup :: (SelectorZipper sel (ReduceC m), Container c, Has FreshIO sig m) => sel k SZipper -> RadixZipper c k a -> m (Maybe a)
 lookup sel zipper = runReduce =<< accessRadixZipper
   (\_ _ -> id)
-  (\a b -> join $ fst RT.internalLookup a b)
-  (\a b -> join $ snd RT.internalLookup a b)
+  (\p a b -> join $ fst RT.internalLookup p a b)
+  (\p a b -> join $ snd RT.internalLookup p a b)
   (\_ _ -> id)
   (\_ _ _ -> id)
   (\_ _ val _ _ -> fetchC val)
@@ -170,8 +170,8 @@ lookup sel zipper = runReduce =<< accessRadixZipper
 insert :: (SelectorZipper sel (ReduceC m), Container c, Has FreshIO sig m) => sel k SZipper -> a -> RadixZipper c k a -> m (RadixZipper c k a)
 insert path val zipper = runReduce =<< accessRadixZipper
   (\a b c -> RadixZipper a b <$> (allocC =<< c))
-  (\a b -> join $ fst (RT.internalInsert val) a b)
-  (\a b -> join $ snd (RT.internalInsert val) a b)
+  (\p a b -> join $ fst (RT.internalInsert val) p a b)
+  (\p a b -> join $ snd (RT.internalInsert val) p a b)
   (\a b c -> (\c' -> RadixZipper a c' b) <$> (allocC =<< c))
   (\_tipOfSkipped a b c -> InvRadixCons a b <$> (allocC =<< c))
   (\_tipOfSkipped _ _ b c -> (\val' -> InvRadixCons val' b c) <$> allocC (Just val))
@@ -185,8 +185,8 @@ insert path val zipper = runReduce =<< accessRadixZipper
 update :: (SelectorZipper sel (ReduceC m), Container c, Has FreshIO sig m) => (c (Maybe a) -> ReduceC m (c (Maybe a))) -> sel k SZipper -> RadixZipper c k a -> m (RadixZipper c k a)
 update f sel zipper = runReduce =<< accessRadixZipper
   (\a b c -> RadixZipper a b <$> (allocC =<< c))
-  (\a b -> join $ fst (RT.internalUpdate f) a b)
-  (\a b -> join $ snd (RT.internalUpdate f) a b)
+  (\p a b -> join $ fst (RT.internalUpdate f) p a b)
+  (\p a b -> join $ snd (RT.internalUpdate f) p a b)
   (\a b c -> (\c' -> RadixZipper a c' b) <$> (allocC =<< c))
   (\_tipOfSkipped a b c -> InvRadixCons a b <$> (allocC =<< c))
   (\_tipOfSkipped _ _deleted b c -> pure $ InvRadixCons sNothing b c)
@@ -249,15 +249,15 @@ focus =
       in (`revInvChunk'` oldInvChunk) =<< RT.mkTip pure chunkName oldTree
   in \selOr -> runReduce <=< accessRadixZipper
     (\_ initialInvT tree -> tree initialInvT) -- on sub, zipper
-    (\sel chunk topval invchunk invtree ->
-      fst focusRadix sel chunk >>= \f -> f topval invchunk invtree)
-    (\sel tree invtree ->
-      snd focusRadix sel tree >>= \f -> f invtree)
+    (\p sel chunk topval invchunk invtree ->
+      fst focusRadix p sel chunk >>= \f -> f topval invchunk invtree)
+    (\p sel tree invtree ->
+      snd focusRadix p sel tree >>= \f -> f invtree)
     (\_ initialT invtree -> invtree =<< fetchC initialT) -- on super, zipper
     --   -- when we go up, we save the initial tree in a Tip. So eventually it needs to be fetchCed, unfortunately
     --   -- alternatively, we could save pointer on Tip, but the problem doesn't sound to worth it
     (\key topval invchunk invtree tree -> invtree =<< revInvChunk key tree topval invchunk) -- on skip
-    (\key (RT.FinalPath fp) topval invchunk invtreeM oldTree -> -- on found value, invtree
+    (\(RT.FinalPath fp) key topval invchunk invtreeM oldTree -> -- on found value, invtree
       RadixZipper fp invtreeM <$> (allocC =<< revInvChunk key oldTree topval invchunk))
     (\key topval invtree invchunk rt -> invchunk topval invtree =<< RT.mkTip pure key rt)
     (\pickRight mask other super topval invtree chunk -> super topval invtree =<< RT.mkBin pure pickRight mask other chunk) -- on super, invchunk
@@ -270,8 +270,8 @@ empty = RadixZipper [] ($sRunEvalFresh $ allocC InvRadixNil) RT.sEmpty
 -- selectors
 
 data instance RT.SelEq k SZipper = SelEqZ ![Chunk]
-data instance RT.SelEq k SInvtree = SelEqIT !RT.FinalPath !Int ![Chunk]
-data instance RT.SelEq k SInvchunk = SelEqIC !RT.FinalPath !Chunk ![Chunk]
+data instance RT.SelEq k SInvtree = SelEqIT !Int ![Chunk]
+data instance RT.SelEq k SInvchunk = SelEqIC !Chunk ![Chunk]
 
 instance Applicative m => SelectorZipper RT.SelEq m where
   selZipper (SelEqZ targetPath) currPath =
@@ -280,27 +280,27 @@ instance Applicative m => SelectorZipper RT.SelEq m where
         | x == y = diffFor xs ys
       diffFor p1 p2 = (p1, p2)
       (backSteps, relPath) = diffFor currPath targetPath
-      fp = RT.FinalPath targetPath
     in pure $ case backSteps of
-      [] -> Right $ RT.SelEqT fp relPath
-      _nonEmptyFindBranch -> Left $ SelEqIT fp (length backSteps - 1) relPath
-  selInvTree (SelEqIT fp skip relPath) = pure case skip of
+      [] -> Right $ RT.SelEqT relPath
+      _nonEmptyFindBranch -> Left $ SelEqIT (length backSteps - 1) relPath
+  selInvtreeNil _ = error "impossible, hopefully"
+  selInvtreeCons (SelEqIT skip relPath) = pure case skip of
     0 -> Left case relPath of
-      [] -> Left fp
-      (x:xs) -> Right $ SelEqIC fp x xs
-    _ -> Right $ SelEqIT fp (skip - 1) relPath
-  selIBin s@(SelEqIC fp k ks) mask pickRight = pure case RT.tryMask mask k of
+      [] -> Nothing
+      (x:xs) -> Just $ SelEqIC x xs
+    _ -> Right $ SelEqIT (skip - 1) relPath
+  selIBin s@(SelEqIC k ks) mask pickRight = pure case RT.tryMask mask k of
     Just guidesRight-> Left $
       if pickRight == guidesRight -- we're guided the same way we came from
         then Nothing
-        else Just $ RT.SelEqC fp k ks
+        else Just $ RT.SelEqC k ks
     Nothing -> Right s
-  selINil (SelEqIC fp k ks) = pure $ RT.SelEqC fp k ks
+  selINil (SelEqIC k ks) = pure $ RT.SelEqC k ks
 
 selEq :: RT.IsRadixKey k => k -> RT.SelEq k SZipper
 selEq k = SelEqZ $ RT.toRadixKey k
 
--- We use two nondets, one to capture turns to the left in InvTree and one to capture turn to the right in InvTree (as well as to search in RT)
+-- We use two nondets, one to capture turns to the left in Invtree and one to capture turn to the right in Invtree (as well as to search in RT)
 
 data ChooseL (m :: Type -> Type) a where -- newtype over Choose
   ChooseL :: ChooseL m Bool
@@ -360,34 +360,33 @@ runNonDetLRInvA act = pack $ runNonDetLR
 
 -- TODO: tests for NonDetLRC
 data instance RT.SelChoose k SZipper = SelChooseZ
-newtype instance RT.SelChoose k SInvtree = SelChooseIT (RT.RevList Chunk)
-newtype instance RT.SelChoose k SInvchunk = SelChooseIC (RT.RevList Chunk)
+data instance RT.SelChoose k SInvtree = SelChooseIT
+data instance RT.SelChoose k SInvchunk = SelChooseIC
 
 instance (HasLabelled "stray" NonDet sig m, HasLabelled "invtree" NonDetLR sig m, Has NonDet sig m) => SelectorZipper RT.SelChoose m where
-  selZipper SelChooseZ currPath = do
+  selZipper SelChooseZ _currPath = do
     goSub <- sendLabelled @"invtree" $ inj ChooseL
     pure case goSub of
-      False -> Left $ SelChooseIT $ fromList currPath
-      True -> Right $ RT.SelChooseT $ fromList currPath
-  selInvTree (SelChooseIT oldPath) = case RT.revUnsnoc oldPath of
-    Nothing -> sendLabelled @"invtree" $ inj Empty
-    Just (newPath, _) -> do
-      continue <- sendLabelled @"stray" $ inj Choose
-      case continue of
-        False -> pure $ Left $ Right $ SelChooseIC newPath
-        True -> do
-          found <- sendLabelled @"invtree" $ inj ChooseL
-          pure case found of
-            False -> Right $ SelChooseIT newPath
-            True -> Left $ Left $ RT.FinalPath $ toList newPath
-  selIBin self@(SelChooseIC currPath) _mask pickRight = do
+      False -> Left SelChooseIT
+      True -> Right RT.SelChooseT
+  selInvtreeNil SelChooseIT = sendLabelled @"invtree" $ inj Empty
+  selInvtreeCons SelChooseIT = do
+    continue <- sendLabelled @"stray" $ inj Choose
+    case continue of
+      False -> pure $ Left $ Just SelChooseIC
+      True -> do
+        found <- sendLabelled @"invtree" $ inj ChooseL
+        pure case found of
+          False -> Right SelChooseIT
+          True -> Left Nothing
+  selIBin SelChooseIC _mask pickRight = do
     goBranch <- sendLabelled @"invtree" $
       if pickRight
         then inj ChooseL -- if we're right, the other one is left
         else inj ChooseR -- if we're left, the other one is right
     pure case goBranch of
-      False -> Right self
-      True -> Left $ Just $ RT.SelChooseC currPath
+      False -> Right SelChooseIC
+      True -> Left $ Just $ RT.SelChooseC
   selINil _sel = sendLabelled @"stray" $ inj Empty
 
 min :: Monad m => NonDetC (Labelled "stray" NonDetC (Labelled "invtree" NonDetLRC m)) a -> m (Maybe a)
