@@ -9,14 +9,17 @@ import Dentrado.POC.Data.RadixZipper (RadixZipper)
 import Dentrado.POC.Data.RadixTree (Chunk)
 import qualified Dentrado.POC.Data.RadixZipper as RZ
 import System.IO.Unsafe (unsafePerformIO)
+import Dentrado.POC.Data.Container (ReduceC)
 
 data MapLikeCommand v = Insert !v | Delete | Focus -- todo: Pop
   deriving Show
-data MapLikeScript v = MapLikeScript !(Set [Chunk]) ![([Chunk], MapLikeCommand v)]
+data MapLikeSel = SelEq ![Chunk] | SelMin
+  deriving Show
+data MapLikeScript v = MapLikeScript !(Set [Chunk]) ![(MapLikeSel, MapLikeCommand v)]
   deriving Show
 
 instance Arbitrary v => Arbitrary (MapLikeCommand v) where
-  arbitrary = oneof [ Insert <$> arbitrary, pure Delete, pure Focus ]
+  arbitrary = frequency [ (2, Insert <$> arbitrary), (2, pure Delete), (1, pure Focus) ]
   shrink _ = []
 
 instance (Arbitrary v) => Arbitrary (MapLikeScript v) where
@@ -25,9 +28,10 @@ instance (Arbitrary v) => Arbitrary (MapLikeScript v) where
     keys <- execStateT
       (replicateM_ ((size `div` 5) `max` 5) genNewChunkKey)
       Set.empty
-    values <- vectorOf size $ (,) <$> elements (Set.toList keys) <*> arbitrary
+    values <- vectorOf size $ (,) <$> sel keys <*> arbitrary
     pure $ MapLikeScript keys values
     where
+      sel keys = frequency [(8, SelEq <$> elements (Set.toList keys)), (3, pure SelMin)]
       genNewChunkKey :: StateT (Set [Chunk]) Gen ()
       genNewChunkKey = do
         existing <- get
@@ -38,38 +42,56 @@ instance (Arbitrary v) => Arbitrary (MapLikeScript v) where
           Right () -> (++ [newChunk]) <$> lift (elements $ Set.toList existing)
         put $ Set.insert newKey existing
   shrink (MapLikeScript _keys cmds) = do
-    cmds' <- shrink cmds
-    pure $ MapLikeScript (Set.fromList $ fst <$> cmds') cmds'
+    cmds' <- shrinkList (const []) cmds
+    pure $ MapLikeScript (Set.fromList $ cmds' >>= \cmd -> case fst cmd of
+      SelEq k -> [k]
+      _nonSpecific -> []) cmds'
 
-processScript :: Monad m=> (([Chunk], MapLikeCommand v) -> dt -> m dt) -> ([Chunk] -> dt -> m out) -> dt -> MapLikeScript v -> m (([out], [out]), dt)
+processScript :: Monad m => ((MapLikeSel, MapLikeCommand v) -> dt -> m dt) -> (MapLikeSel -> dt -> m out) -> dt -> MapLikeScript v -> m (([out], [out]), dt)
 processScript processCommand processLookup initMap (MapLikeScript keys cmds) = do
   (finResp, finMap) <- foldM
         (\(accResps, accMap) (k, v) -> (,) <$> ((:accResps) <$> processLookup k accMap) <*> processCommand (k, v) accMap)
         ([], initMap)
         cmds
-  finValues <- for (Set.toList keys) (`processLookup` finMap)
+  finValues <- for (Set.toList keys) \k -> SelEq k `processLookup` finMap
   pure ((finResp, finValues), finMap)
 
-processCommandMap :: ([Chunk], MapLikeCommand v) -> Map [Chunk] v -> Identity (Map [Chunk] v)
-processCommandMap = \case
-  (k, Insert v) -> pure . Map.insert k v
-  (k, Delete) -> pure . Map.delete k
-  (_, Focus) -> pure
+processCommandMap :: (MapLikeSel, MapLikeCommand v) -> Map [Chunk] v -> Identity (Map [Chunk] v)
+processCommandMap (k1, v1) m =
+  let k2M = case k1 of
+        SelEq k -> Just k
+        SelMin -> fst <$> Map.lookupMin m
+  in case k2M of
+    Nothing -> pure m
+    Just k2 -> case v1 of
+      Insert v -> pure $ Map.insert k2 v m
+      Delete -> pure $ Map.delete k2 m
+      Focus -> pure m
 
 processScriptMap :: MapLikeScript a -> Identity (([Maybe a], [Maybe a]), Map [Chunk] a)
-processScriptMap = processScript processCommandMap (\a -> pure . Map.lookup a) Map.empty
+processScriptMap = processScript processCommandMap (\case
+  SelEq k -> pure . Map.lookup k
+  SelMin -> pure . fmap snd . Map.lookupMin) Map.empty
 
-processCommandRadixZipper :: Has FreshIO sig m => ([Chunk], MapLikeCommand v) -> RadixZipper Res [Chunk] v -> m (RadixZipper Res [Chunk] v)
-processCommandRadixZipper = \case
-  (k, Insert v) -> RZ.insert (RZ.selEq k) v
-  (k, Delete) -> RZ.delete (RZ.selEq k)
-  (k, Focus) -> RZ.focus (RZ.selEq k)
+processCommandRadixZipper :: forall sig m v. Has FreshIO sig m => (MapLikeSel, MapLikeCommand v) -> RadixZipper Res [Chunk] v -> m (RadixZipper Res [Chunk] v)
+processCommandRadixZipper (k, v) m = 
+    case k of
+      SelEq k2 -> hdl $ RZ.selEq k2
+      SelMin -> fmap (fromMaybe m) $ RZ.min $ hdl RZ.selChoose
+  where
+    hdl :: (Has FreshIO sig2 m2, RZ.SelectorZipper sel (ReduceC m2)) => sel [Chunk] RZ.SZipper -> m2 (RadixZipper Res [Chunk] v)
+    hdl sel = case v of
+      Insert v2 -> RZ.insert sel v2 m
+      Delete -> RZ.delete sel m
+      Focus -> RZ.focus sel m
 
 unsafeRunFreshIO :: FreshIOC a -> a
 unsafeRunFreshIO = unsafePerformIO . runFreshIO
 
 processScriptRadixZipper :: Has FreshIO sig m => MapLikeScript a -> m (([Maybe a], [Maybe a]), RadixZipper Res [Chunk] a)
-processScriptRadixZipper = processScript processCommandRadixZipper (RZ.lookup . RZ.selEq) RZ.empty
+processScriptRadixZipper = processScript processCommandRadixZipper (\case
+  SelEq k -> RZ.lookup (RZ.selEq k)
+  SelMin -> fmap join . RZ.min . RZ.lookup RZ.selChoose) RZ.empty
 
 prop_script_same :: MapLikeScript Int -> Bool
 prop_script_same cmds = fst (runIdentity $ processScriptMap @Int cmds) == fst (unsafeRunFreshIO $ processScriptRadixZipper @_ @_ @Int cmds)

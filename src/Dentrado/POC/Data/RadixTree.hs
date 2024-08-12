@@ -115,7 +115,7 @@ data STree
 -- in SelBin, returning new seelector is superfluous, we could just use previous one
 newtype FinalPath = FinalPath [Chunk]
 class Selector s m where
-  selTree :: s k STree -> m (Maybe  (s k SChunk))
+  selTree :: Container c => s k STree -> c (Maybe a) -> m (Maybe (s k SChunk))
   selBin :: s k SChunk -> Chunk -> m (Maybe (Bool, s k SChunk))
   selTip :: s k SChunk -> Chunk -> m (Maybe (s k STree))
   selNil :: s k SChunk -> m (Chunk, [Chunk])
@@ -149,7 +149,7 @@ accessRadix onSubT onFoundT onMissingC onTipC onBranchC =
           Nothing -> newBranch mask
           Just (pickRight, sel2) -> onBranchC pickRight mask (if pickRight then l else r) <$> goChunk path sel2 (if pickRight then r else l)
     goTree :: RevList Chunk -> sel k STree -> RadixTree c k a -> m tree
-    goTree path sel1 rt@(RadixTree val chunk) = selTree sel1 >>= \case
+    goTree path sel1 rt@(RadixTree val chunk) = selTree sel1 val >>= \case
       Nothing -> pure $ onFoundT (FinalPath $ toList path) rt
       Just sel2 -> onSubT val <$> goChunk path sel2 chunk
   in (goChunk, goTree)
@@ -369,7 +369,7 @@ newtype instance SelEq k STree = SelEqT [Chunk]
 data instance SelEq k SChunk = SelEqC !Chunk ![Chunk]
 
 instance Applicative m => Selector SelEq m where
-  selTree (SelEqT keys) = pure case keys of
+  selTree (SelEqT keys) _val = pure case keys of
     [] -> Nothing
     k:ks-> Just $ SelEqC k ks
   selBin (SelEqC key keys) mask = pure $ (, SelEqC key keys) <$> tryMask mask key
@@ -403,15 +403,21 @@ data family SelChoose k t -- access existing value by choosing
 data instance SelChoose k STree = SelChooseT
 data instance SelChoose k SChunk = SelChooseC
 
-instance Has NonDet sig m => Selector SelChoose m where
-  selTree SelChooseT = do
-    deeper <- send Choose
-    pure $ if deeper
-      then Just SelChooseC
-      else Nothing
+-- I don't agree with how it is, but True refers to the left option
+-- and False refers to the right option of Choose.
+-- Why? I don't know.
+instance Has (FreshIO :+: Reduce :+: NonDet) sig m => Selector SelChoose m where
+  selTree SelChooseT valM = do
+    now <- send Choose
+    if now
+      then do
+        exists <- isJust <$> fetchC valM
+        unless exists E.empty
+        pure Nothing
+      else pure $ Just SelChooseC
   selBin self _ = do
-    right <- send Choose
-    pure $ Just (right, self)
+    left <- send Choose
+    pure $ Just (not left, self)
   selTip SelChooseC _chunk = pure $ Just SelChooseT
   selNil _ = E.empty
 

@@ -64,7 +64,7 @@ data SZipper
 class RT.Selector s m => SelectorZipper s m where
   selZipper :: s k SZipper -> [Chunk] -> m (Either (s k SInvtree) (s k RT.STree))
   selInvtreeNil :: s k SInvtree -> m Void
-  selInvtreeCons :: s k SInvtree -> m (Either (Maybe (s k SInvchunk)) (s k SInvtree))
+  selInvtreeCons :: Container c => s k SInvtree -> c (Maybe a) -> m (Either (Maybe (s k SInvchunk)) (s k SInvtree))
   selIBin :: s k SInvchunk -> Chunk -> Bool -> m (Either (Maybe (s k RT.SChunk)) (s k SInvchunk))
   selINil :: s k SInvchunk -> m (s k RT.SChunk) -- welp, this is awkward
 
@@ -78,10 +78,10 @@ accessInvtree :: forall sel c k a invtree sig m. (SelectorZipper sel m, Containe
 accessInvtree onSkip onInvChunk =
   let
     goTree :: RT.RevList Chunk -> sel k SInvtree -> InvRadixTree c k a -> m invtree
-    goTree _ sel1 InvRadixNil = absurd <$>  selInvtreeNil sel1
+    goTree _ sel1 InvRadixNil = absurd <$> selInvtreeNil sel1
     goTree (RT.revUnsnoc -> Nothing) sel1 _ = absurd <$> selInvtreeNil sel1
     goTree (RT.revUnsnoc -> Just (xs, x)) sel1 (InvRadixCons el invchunk superInvChunks) =
-      selInvtreeCons sel1 >>= \case
+      selInvtreeCons sel1 el >>= \case
         Left sel2  -> pure $ onInvChunk xs x sel2 el invchunk superInvChunks
         Right sel2 -> onSkip x el invchunk <$> (goTree xs sel2 =<< fetchC superInvChunks)
   in goTree
@@ -284,7 +284,7 @@ instance Applicative m => SelectorZipper RT.SelEq m where
       [] -> Right $ RT.SelEqT relPath
       _nonEmptyFindBranch -> Left $ SelEqIT (length backSteps - 1) relPath
   selInvtreeNil _ = error "impossible, hopefully"
-  selInvtreeCons (SelEqIT skip relPath) = pure case skip of
+  selInvtreeCons (SelEqIT skip relPath) _el = pure case skip of
     0 -> Left case relPath of
       [] -> Nothing
       (x:xs) -> Just $ SelEqIC x xs
@@ -328,8 +328,9 @@ instance Monad (NonDetLRC m) where
 
 instance Algebra sig m => Algebra (NonDetLR :+: sig) (NonDetLRC m) where
   alg hdl sig ctx = NonDetLRC \l r p n -> case sig of
-    L (L ChooseL) -> p (True <$ ctx) `l` p (False <$ ctx)
-    L (R (L ChooseR)) -> p (False <$ ctx) `r` p (True <$ ctx)
+    -- Again, I don't like this, but to conform to how NonDet works...
+    L (L ChooseL) -> p (False <$ ctx) `l` p (True <$ ctx)
+    L (R (L ChooseR)) -> p (True <$ ctx) `r` p (False <$ ctx)
     L (R (R Empty)) -> n
     -- my brain went out of the chat somewhere here, *I hope* this is correct
     -- maybe I should patent brainless programming?
@@ -363,31 +364,37 @@ data instance RT.SelChoose k SZipper = SelChooseZ
 data instance RT.SelChoose k SInvtree = SelChooseIT
 data instance RT.SelChoose k SInvchunk = SelChooseIC
 
-instance (HasLabelled "stray" NonDet sig m, HasLabelled "invtree" NonDetLR sig m, Has NonDet sig m) => SelectorZipper RT.SelChoose m where
+instance (HasLabelled "stray" NonDet sig m, HasLabelled "invtree" NonDetLR sig m, Has (NonDet :+: FreshIO :+: Reduce) sig m) => SelectorZipper RT.SelChoose m where
   selZipper SelChooseZ _currPath = do
-    goSub <- sendLabelled @"invtree" $ inj ChooseL
-    pure case goSub of
-      False -> Left SelChooseIT
-      True -> Right RT.SelChooseT
+    goUp <- sendLabelled @"invtree" $ inj ChooseL
+    pure if goUp
+      then Left SelChooseIT
+      else Right RT.SelChooseT
   selInvtreeNil SelChooseIT = sendLabelled @"invtree" $ inj Empty
-  selInvtreeCons SelChooseIT = do
-    continue <- sendLabelled @"stray" $ inj Choose
-    case continue of
-      False -> pure $ Left $ Just SelChooseIC
-      True -> do
-        found <- sendLabelled @"invtree" $ inj ChooseL
-        pure case found of
-          False -> Right SelChooseIT
-          True -> Left Nothing
+  selInvtreeCons SelChooseIT valM = do
+    stray <- sendLabelled @"stray" $ inj Choose
+    if stray
+      then pure $ Left $ Just SelChooseIC
+      else do
+        goUp <- sendLabelled @"invtree" $ inj ChooseL
+        if goUp
+          then pure $ Right SelChooseIT
+          else do
+            exists <- isJust <$> fetchC valM
+            unless exists $ sendLabelled @"invtree" $ inj Empty
+            pure $ Left Nothing
   selIBin SelChooseIC _mask pickRight = do
-    goBranch <- sendLabelled @"invtree" $
+    goUp <- sendLabelled @"invtree" $
       if pickRight
         then inj ChooseL -- if we're right, the other one is left
         else inj ChooseR -- if we're left, the other one is right
-    pure case goBranch of
-      False -> Right SelChooseIC
-      True -> Left $ Just $ RT.SelChooseC
+    pure if goUp
+      then Right SelChooseIC
+      else Left $ Just $ RT.SelChooseC
   selINil _sel = sendLabelled @"stray" $ inj Empty
+
+selChoose :: RT.SelChoose k SZipper
+selChoose = SelChooseZ
 
 min :: Monad m => NonDetC (Labelled "stray" NonDetC (Labelled "invtree" NonDetLRC m)) a -> m (Maybe a)
 min act = extract $ runNonDetLRInvA $ runLabelled @"invtree" $ fmap P.fromJust $ RT.min $ runLabelled @"stray" $ RT.min act
@@ -397,9 +404,9 @@ min act = extract $ runNonDetLRInvA $ runLabelled @"invtree" $ fmap P.fromJust $
       Pure a -> pure a
       Free (Compose act2) ->
         act2 >>= fix
-          (\rec oldS -> case Seq.viewr oldS of
-            Seq.EmptyR -> pure Nothing
-            newS Seq.:> x -> extract x >>= \case
+          (\rec oldS -> case Seq.viewl oldS of
+            Seq.EmptyL -> pure Nothing
+            x Seq.:< newS -> extract x >>= \case
               Nothing -> rec newS
               r -> pure r)
 
