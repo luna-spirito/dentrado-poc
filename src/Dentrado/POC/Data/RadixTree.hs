@@ -432,13 +432,13 @@ min = runNonDet
   (pure . Just)
   (pure Nothing)
 
--- max :: Monad m => NonDetC m a -> m (Maybe a)
--- max = runNonDet
---   (\l r -> r >>= \case
---     Nothing -> l
---     r' -> pure r')
---   (pure . Just)
---   (pure Nothing)
+max :: Monad m => NonDetC m a -> m (Maybe a)
+max = runNonDet
+  (\l r -> r >>= \case
+    Nothing -> l
+    r' -> pure r')
+  (pure . Just)
+  (pure Nothing)
 
 -- debug
 

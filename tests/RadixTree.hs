@@ -10,10 +10,11 @@ import Dentrado.POC.Data.RadixTree (Chunk)
 import qualified Dentrado.POC.Data.RadixZipper as RZ
 import System.IO.Unsafe (unsafePerformIO)
 import Dentrado.POC.Data.Container (ReduceC)
+import Language.Haskell.TH (newDeclarationGroup)
 
 data MapLikeCommand v = Insert !v | Delete | Focus -- todo: Pop
   deriving Show
-data MapLikeSel = SelEq ![Chunk] | SelMin
+data MapLikeSel = SelEq ![Chunk] | SelMin | SelMax
   deriving Show
 data MapLikeScript v = MapLikeScript !(Set [Chunk]) ![(MapLikeSel, MapLikeCommand v)]
   deriving Show
@@ -31,7 +32,7 @@ instance (Arbitrary v) => Arbitrary (MapLikeScript v) where
     values <- vectorOf size $ (,) <$> sel keys <*> arbitrary
     pure $ MapLikeScript keys values
     where
-      sel keys = frequency [(8, SelEq <$> elements (Set.toList keys)), (3, pure SelMin)]
+      sel keys = frequency [(8, SelEq <$> elements (Set.toList keys)), (1, pure SelMin), (1, pure SelMax)]
       genNewChunkKey :: StateT (Set [Chunk]) Gen ()
       genNewChunkKey = do
         existing <- get
@@ -61,6 +62,7 @@ processCommandMap (k1, v1) m =
   let k2M = case k1 of
         SelEq k -> Just k
         SelMin -> fst <$> Map.lookupMin m
+        SelMax -> fst <$> Map.lookupMax m
   in case k2M of
     Nothing -> pure m
     Just k2 -> case v1 of
@@ -71,13 +73,15 @@ processCommandMap (k1, v1) m =
 processScriptMap :: MapLikeScript a -> Identity (([Maybe a], [Maybe a]), Map [Chunk] a)
 processScriptMap = processScript processCommandMap (\case
   SelEq k -> pure . Map.lookup k
-  SelMin -> pure . fmap snd . Map.lookupMin) Map.empty
+  SelMin -> pure . fmap snd . Map.lookupMin
+  SelMax -> pure . fmap snd . Map.lookupMax) Map.empty
 
 processCommandRadixZipper :: forall sig m v. Has FreshIO sig m => (MapLikeSel, MapLikeCommand v) -> RadixZipper Res [Chunk] v -> m (RadixZipper Res [Chunk] v)
 processCommandRadixZipper (k, v) m = 
     case k of
       SelEq k2 -> hdl $ RZ.selEq k2
       SelMin -> fmap (fromMaybe m) $ RZ.min $ hdl RZ.selChoose
+      SelMax -> fmap (fromMaybe m) $ RZ.max $ hdl RZ.selChoose
   where
     hdl :: (Has FreshIO sig2 m2, RZ.SelectorZipper sel (ReduceC m2)) => sel [Chunk] RZ.SZipper -> m2 (RadixZipper Res [Chunk] v)
     hdl sel = case v of
@@ -91,12 +95,13 @@ unsafeRunFreshIO = unsafePerformIO . runFreshIO
 processScriptRadixZipper :: Has FreshIO sig m => MapLikeScript a -> m (([Maybe a], [Maybe a]), RadixZipper Res [Chunk] a)
 processScriptRadixZipper = processScript processCommandRadixZipper (\case
   SelEq k -> RZ.lookup (RZ.selEq k)
-  SelMin -> fmap join . RZ.min . RZ.lookup RZ.selChoose) RZ.empty
+  SelMin -> fmap join . RZ.min . RZ.lookup RZ.selChoose
+  SelMax -> fmap join . RZ.max . RZ.lookup RZ.selChoose) RZ.empty
 
 prop_script_same :: MapLikeScript Int -> Bool
 prop_script_same cmds = fst (runIdentity $ processScriptMap @Int cmds) == fst (unsafeRunFreshIO $ processScriptRadixZipper @_ @_ @Int cmds)
 
-return []
+$(newDeclarationGroup)
 main :: IO ()
 main = do
   ok <- $quickCheckAll

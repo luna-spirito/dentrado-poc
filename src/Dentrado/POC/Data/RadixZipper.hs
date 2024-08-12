@@ -396,19 +396,31 @@ instance (HasLabelled "stray" NonDet sig m, HasLabelled "invtree" NonDetLR sig m
 selChoose :: RT.SelChoose k SZipper
 selChoose = SelChooseZ
 
-min :: Monad m => NonDetC (Labelled "stray" NonDetC (Labelled "invtree" NonDetLRC m)) a -> m (Maybe a)
-min act = extract $ runNonDetLRInvA $ runLabelled @"invtree" $ fmap P.fromJust $ RT.min $ runLabelled @"stray" $ RT.min act
+selCtxMinMax :: Monad m => (t -> Labelled "stray" NonDetC (Labelled "invtree" NonDetLRC m) (Maybe a)) -> (forall b. Seq b -> Maybe (b, Seq b)) -> t -> m (Maybe a)
+selCtxMinMax rtCtx seqPop act =  
+    extract $ runNonDetLRInvA $ runLabelled @"invtree" $ fmap P.fromJust $ RT.min $ runLabelled @"stray" $ rtCtx act
   where
     extract :: Monad m => Free (Compose m Seq) (Maybe a) -> m (Maybe a)
     extract = \case
       Pure a -> pure a
       Free (Compose act2) ->
         act2 >>= fix
-          (\rec oldS -> case Seq.viewl oldS of
-            Seq.EmptyL -> pure Nothing
-            x Seq.:< newS -> extract x >>= \case
+          (\rec oldS -> case seqPop oldS of
+            Nothing -> pure Nothing
+            Just (x, newS) -> extract x >>= \case
               Nothing -> rec newS
               r -> pure r)
+{-# INLINE selCtxMinMax #-}
+
+min :: Monad m => NonDetC (Labelled "stray" NonDetC (Labelled "invtree" NonDetLRC m)) a -> m (Maybe a)
+min = selCtxMinMax RT.min \oldS -> case Seq.viewl oldS of
+  Seq.EmptyL -> Nothing
+  x Seq.:< newS -> Just (x, newS)
+
+max :: Monad m => NonDetC (Labelled "stray" NonDetC (Labelled "invtree" NonDetLRC m)) a -> m (Maybe a)
+max = selCtxMinMax RT.max \oldS -> case Seq.viewr oldS of
+  Seq.EmptyR -> Nothing
+  newS Seq.:> x -> Just (x, newS)
 
 -- debug
 
