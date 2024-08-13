@@ -1,7 +1,7 @@
 {-# LANGUAGE RecursiveDo, PatternSynonyms #-}
 module Dentrado.POC.Data.RadixTree where
-import RIO hiding (mask, toList, catch)
-import Data.Bits
+import RIO hiding (lookup, Set, Map, mask, toList, catch)
+import Data.Bits (countTrailingZeros, (.&.), unsafeShiftR, complement, xor, finiteBitSize, unsafeShiftL, (.|.), countLeadingZeros)
 import Control.Algebra
 import Control.Effect.Writer
 import Dentrado.POC.Data.Container
@@ -14,8 +14,9 @@ import Control.Effect.NonDet (NonDet)
 import Control.Effect.Choose (Choose(..))
 import qualified Control.Effect.Empty as E
 import GHC.Exts (IsList(..))
-import Control.Carrier.NonDet.Church (runNonDet, NonDetC)
+import Control.Carrier.NonDet.Church (runNonDet, NonDetC, runNonDetA)
 import RIO.List (uncons)
+import Control.Effect.Fresh (Fresh)
 
 $(moduleId 1)
 
@@ -25,10 +26,17 @@ type Chunk = Word32
 
 class IsRadixKey key where
   toRadixKey :: key -> [Chunk]
-  -- fromRadixKey :: [Chunk] -> key
+  fromRadixKey :: [Chunk] -> key
 
 instance IsRadixKey [Chunk] where
   toRadixKey = id
+  fromRadixKey = id
+instance IsRadixKey (ResPOC a) where
+  toRadixKey (ResPOC i) = [fromIntegral $ i `div` 4294967296, fromIntegral $ i `mod` 4294967296]
+  fromRadixKey = \case
+    [a, b] -> ResPOC $ fromIntegral a * 4294967296 + fromIntegral b
+    _nonTwo -> error "key corrupted" -- this is okay. But, the problem is, `fromRadixKey` is exposed.
+    -- So it's better to tie this to some newtype'd [Chunk]?
 
 tryMask :: Chunk -> Chunk -> Maybe Bool
 tryMask mask key =
@@ -59,7 +67,7 @@ data RadixChunk' c k a
   | Tip !Chunk !(RadixTree c k a) -- RadixTree is the only possible branch. Still could be containerized, but I'm not sure it's worth it
   | Bin !Chunk !(c (RadixChunk c k a)) !(c (RadixChunk c k a)) -- Either branch can be accessed, so containerization
 
-sNil :: Container c => c (RadixChunk c k a)
+sNil :: Container c => c (RadixChunk c2 k a)
 sNil = $sRunEvalFresh $ allocC $ mkReducible Nil
 
 -- -- TODO: Don't know how effective is this
@@ -170,17 +178,20 @@ mkTip :: (Container c1, Container c2, Has FreshIO sig m) => (forall b. c2 b -> R
 mkTip f k v = allocReducedChunk f $ mkTipNonRe k v
 {-# INLINE mkTip #-}
 
-internalLookup :: (Selector sel m, Container c, Has (FreshIO :+: Reduce) sig m) => (RevList Chunk -> sel k SChunk -> c (RadixChunk c k a) -> m (m (Maybe a)), RevList Chunk -> sel k STree -> RadixTree c k a -> m (m (Maybe a)))
+internalLookup :: (Has (FreshIO :+: Reduce) sig m, Selector sel m, Container c, IsRadixKey k) => (RevList Chunk -> sel k SChunk -> c (RadixChunk c k a) -> m (m (Maybe (k, a))), RevList Chunk -> sel k STree -> RadixTree c k a -> m (m (Maybe (k, a))))
 internalLookup = accessRadix
   (\_ -> id)
-  (\_ (RadixTree a _) -> fetchC a)
+  (\(FinalPath k) (RadixTree a _) -> ((fromRadixKey k,) <$>) <$> fetchC a)
   (\_ _ _ -> pure Nothing)
   (\_ -> id)
   (\_ _ _ -> id)
 {-# INLINE internalLookup #-}
 
-lookup :: (Selector sel (ReduceC m), Has FreshIO sig m) => Container c => sel k STree -> RadixTree c k a -> m (Maybe a)
-lookup k tr = runReduce $ join $ snd internalLookup [] k tr
+lookupKV :: (Has FreshIO sig m, Selector sel (ReduceC m), Container c, IsRadixKey k) => sel k STree -> RadixTree c k a -> m (Maybe (k, a))
+lookupKV k tr = runReduce $ join $ snd internalLookup [] k tr
+
+lookup :: (Has FreshIO sig m, Selector sel (ReduceC m), Container c, IsRadixKey k) => sel k STree -> RadixTree c k a -> m (Maybe a)
+lookup k tr = fmap snd <$> lookupKV k tr
 
 internalInsert :: forall sel c k sig m a. (Selector sel m, Container c, Has (FreshIO :+: Reduce) sig m) => a -> (RevList Chunk -> sel k SChunk -> c (RadixChunk c k a) -> m (m (c (RadixChunk c k a))), RevList Chunk -> sel k STree -> RadixTree c k a -> m (m (RadixTree c k a)))
 internalInsert val = accessRadix
@@ -230,31 +241,86 @@ pop k rt = runWriter (\(First a) b -> pure (a, b)) $ update
   )
   k rt
 
-empty :: Container c => RadixTree c k a
-empty = RadixTree sNothing sNil
-
 sEmpty :: Container c => c (RadixTree c k a)
 sEmpty = $sRunEvalFresh $ allocC empty
 
 -- TODO: monadical extract, separate RadixTree and RadixZipper into different modules, `merge`, `adjust`
 
-data OnOne c other fin = OnOne
-  { onOneVal :: !(Res (Maybe other) -> other -> FreshIOC (Res (Maybe fin))) -- other must be unwrapped for this conclusion
-  , onOneSubtree :: !(forall k. Res (RadixChunk c k other) -> FreshIOC (Res (RadixChunk c k fin))) }
+-- misc
+
+-- TODO: prepF hurts performance, we should get rid of it if possible.
+class Container c => AppWither strat c where
+  stratWither :: strat -> Res (Res a -> ReduceC FreshIOC (Res b)) -> c a -> ReduceC FreshIOC (c b)
+
+instance Container c => AppWither AppForce c where
+  stratWither _ f a = do
+    f' <- fetch f
+    a' <- unwrap a
+    wrap <$> f' a'
+
+appWitherDelayPrepF :: Delay (Res (Res a -> ReduceC FreshIOC (Res b)) -> Res a -> FreshIOC (Res b))
+appWitherDelayPrepF = $sRunEvalFresh $ allocC \f a -> do
+  f' <- fetch f
+  runReduce $ f' a
+instance AppWither AppDelay Delay where
+  stratWither _ f a = mkDelayFresh $ (appWitherDelayPrepF `DelayApp` wrap f) `DelayApp` a
+
+wither :: forall sig m strat c k a b. (Has Fresh sig m, MonadFix m, AppWither strat c)
+  => strat
+  -> (Res (Maybe a) -> a -> ReduceC FreshIOC (Res (Maybe b)))
+  -> m (c (RadixChunk c k a) -> FreshIOC (c (RadixChunk c k b)), RadixTree c k a -> FreshIOC (RadixTree c k b)) -- impredicativity
+wither strat f = mdo
+  goVal <- allocC \vR -> do
+    vM <- fetch vR
+    case vM of
+      Nothing -> pure sNothing
+      Just v -> f vR v
+  goChunk <- allocC \chunkRes -> do
+    chunkRed <- fetch chunkRes
+    reducible reduceChunk chunkRed \case
+      Tip mask v -> allocReducedChunk unwrap . Tip mask =<< goTree v
+      Bin mask l r -> do
+        l' <- stratWither strat goChunk l
+        r' <- stratWither strat goChunk r
+        allocReducedChunk unwrap $ Bin mask l' r'
+      Nil -> pure sNil
+  let 
+    goTree :: RadixTree c k a -> ReduceC FreshIOC (RadixTree c k b)
+    goTree (RadixTree vC subC) = RadixTree
+        <$> stratWither strat goVal vC
+        <*> stratWither strat goChunk subC
+  pure (runReduce . stratWither strat goChunk, runReduce . goTree)
+
+data OnOne c this fin = OnOne
+  { onOneVal :: !(Res (Maybe this) -> this -> FreshIOC (Res (Maybe fin))) -- this must be unwrapped for this conclusion
+  , onOneSubtree :: !(forall k. Res (RadixChunk c k this) -> FreshIOC (Res (RadixChunk c k fin))) }
 newtype OnBoth one two fin = OnBoth
   { onBothVal :: Res (Maybe one) -> one -> Res (Maybe two) -> two -> FreshIOC (Res (Maybe fin)) }
-newtype MergeStrategy c = MergeStrategy
-  { _apply :: forall x y z. Res (Res x -> Res y -> Reduce'C "1" (Reduce'C "2" FreshIOC) (Res z)) -> c x -> c y -> Reduce'C "1" (Reduce'C "2" FreshIOC) (c z) }
 
-merge :: forall one two fin c k. forall sig1 m1. (Container c, Has FreshIO sig1 m1, MonadFix m1)
-  => MergeStrategy c
+class AppMerge strat c where
+  stratMerge :: strat -> Res (Res x -> Res y -> Reduce'C "1" (Reduce'C "2" FreshIOC) (Res z)) -> c x -> c y -> Reduce'C "1" (Reduce'C "2" FreshIOC) (c z)
+
+instance Container c => AppMerge AppForce c where
+  stratMerge _ f a b = do
+    f' <- fetch f
+    wrap <$> join (f' <$> unwrap' (Proxy @"1") a <*> unwrap' (Proxy @"2") b)
+
+appMergeDelayPrepF :: Delay (Res (Res x -> Res y -> Reduce'C "1" (Reduce'C "2" FreshIOC) (Res z)) -> Res x -> Res y -> FreshIOC (Res z))
+appMergeDelayPrepF = $sRunEvalFresh $ allocC \f a b -> do
+  f' <- fetch f
+  runReduce' @"2" $ runReduce' @"1" $ f' a b
+instance AppMerge AppDelay Delay where
+  stratMerge _ f a b = mkDelayFresh $ DelayApp (DelayApp (DelayApp appMergeDelayPrepF $ wrap f) a) b
+
+merge :: forall c k one two fin strat. forall sig1 m1. (Container c, Has Fresh sig1 m1, MonadFix m1, AppMerge strat c)
+  => strat
   -> OnOne c one fin
   -> OnOne c two fin
   -> OnBoth one two fin
   -> m1 (RadixTree c k one
     -> RadixTree c k two
-    -> FreshIOC (RadixTree c k fin))
-merge (MergeStrategy apply) one1 one2 both = mdo
+    -> FreshIOC (RadixTree c k fin)) -- impredicativity...
+merge strat one1 one2 both = mdo
   mergeVal <- alloc \r1 r2 -> do
     v1 <- fetch r1
     v2 <- fetch r2
@@ -263,103 +329,46 @@ merge (MergeStrategy apply) one1 one2 both = mdo
       (Just a , Nothing) -> onOneVal one1 r1 a
       (Nothing, Just b ) -> onOneVal one2 r2 b
       (Nothing, Nothing) -> pure sNothing
-  let unsafeMask = \case
-        Nil -> error "impossible"
-        Tip mask _ -> mask
-        Bin mask _ _ -> mask
   mergeChunk <- alloc \res1 res2 -> do
     v1 <- fetch res1
     v2 <- fetch res2
+    let binOfMerges mask a1 a2 b1 b2 = do
+          a <- stratMerge strat mergeChunk a1 a2
+          b <- stratMerge strat mergeChunk b1 b2
+          mkBin unwrap True mask a b
+        unrelated key1 key2 = do
+          let (mask, pickRight) = makeMask key1 key2
+          a <- lift $ lift $ onOneSubtree one1 res1
+          b <- lift $ lift $ onOneSubtree one2 res2
+          mkBin unwrap pickRight mask (wrap a) (wrap b)
+        oneContainsTwo mask1 key2 l1 r1 = case tryMask mask1 key2 of
+          Just True  -> binOfMerges mask1 l1 sNil r1 (wrap res2)
+          Just False -> binOfMerges mask1 l1 (wrap res2) r1 sNil
+          Nothing -> unrelated mask1 key2
+        twoContainsOne key1 mask2 l2 r2 = case tryMask mask2 key1 of
+          Just False -> binOfMerges mask2 (wrap res1) l2 sNil r2
+          Just True  -> binOfMerges mask2 sNil l2 (wrap res1) r2
+          Nothing -> unrelated mask2 key1
     reducible' (Proxy @"1") (reduceChunk' (Proxy @"1")) v1 \v1' ->
       reducible' (Proxy @"2") (reduceChunk' (Proxy @"2")) v2 \v2' ->
         case (v1', v2') of
           (_, Nil) -> lift $ lift $ onOneSubtree one1 res1
           (Nil, _) -> lift $ lift $ onOneSubtree one2 res2
           (Bin mask1 l1 r1, Bin mask2 l2 r2)
-            | mask1 == mask2 -> do
-              a <- apply mergeChunk l1 l2
-              b <- apply mergeChunk r1 r2
-              mkBin unwrap True mask1 a b
-          (Bin mask1 l1 r1, unsafeMask -> mask2)
-            | Just pickRight <- tryMask mask1 mask2
-              -> if pickRight
-                  then do
-                    a <- apply mergeChunk l1 sNil
-                    b <- apply mergeChunk r1 (wrap res2)
-                    mkBin unwrap True mask1 a b
-                  else do
-                    a <- apply mergeChunk l1 (wrap res2)
-                    b <- apply mergeChunk r1 sNil
-                    mkBin unwrap True mask1 a b
-          (unsafeMask -> mask1, Bin mask2 l2 r2)
-            | Just pickRight <- tryMask mask2 mask1
-              -> if pickRight
-                  then do
-                    a <- apply mergeChunk sNil l2
-                    b <- apply mergeChunk (wrap res1) r2
-                    mkBin unwrap True mask1 a b
-                  else do
-                    a <- apply mergeChunk (wrap res1) l2
-                    b <- apply mergeChunk sNil r2
-                    mkBin unwrap True mask1 a b
-          (Tip mask1 l, Tip mask2 r)
-            | mask1 == mask2 -> mkTip unwrap mask1 =<< mergeTree l r
-          (unsafeMask -> mask1, unsafeMask -> mask2) -> do
-            let (mask, pickRight) = makeMask mask1 mask2
-            a <- lift $ lift $ onOneSubtree one1 res1
-            b <- lift $ lift $ onOneSubtree one2 res2
-            mkBin unwrap pickRight mask (wrap a) (wrap b)
+            | mask1 == mask2 -> binOfMerges mask1 l1 l2 r1 r2
+            | otherwise -> if countTrailingZeros mask1 >= countTrailingZeros mask2
+              then oneContainsTwo mask1 mask2 l1 r1
+              else twoContainsOne mask1 mask2 l2 r2
+          (Bin mask1 l1 r1, Tip key2 _) -> oneContainsTwo mask1 key2 l1 r1
+          (Tip key1 _, Bin mask2 l2 r2) -> twoContainsOne key1 mask2 l2 r2
+          (Tip key1 l, Tip key2 r)
+            | key1 == key2 -> mkTip unwrap key1 =<< mergeTree l r
+            | otherwise -> unrelated key1 key2
   let mergeTree (RadixTree k1 s1) (RadixTree k2 s2) =
         RadixTree
-          <$> apply mergeVal k1 k2
-          <*> apply mergeChunk s1 s2
+          <$> stratMerge strat mergeVal k1 k2
+          <*> stratMerge strat mergeChunk s1 s2
   pure \a b -> runReduce' @"2" $ runReduce' @"1" $ mergeTree a b
-
-
--- merge = runWriter @(Reduced' "one") (\_ -> pure) $ runWriter @(Reduced' "two") (\_ -> pure) $ getCompose $ mergeTree [] a b where
---   merger = _
---   mergeTree p (RadixTree v1 s1) (RadixTree v2 s2) = _
--- valid, but non-streaming
--- merge :: forall f c one two fin. (Applicative f, Container c)
---   => OnOne f one fin
---   -> OnOne f two fin
---   -> OnBoth f one two fin
---   -> RadixTree c k one
---   -> RadixTree c k two
---   -> f (RadixTree c k fin)
--- merge one1 one2 match = \a b -> runIdentity $ runWriter @(Reduced' "one") (\_ -> pure) $ runWriter @(Reduced' "two") (\_ -> pure) $ getCompose $ mergeTree [] a b where
---   mergeVal p v1M v2M = Compose do
---     v1 <- extract' (Proxy @"one") v1M
---     v2 <- extract' (Proxy @"two") v2M
---     pure case (v1, v2) of
---       (Just a , Just b ) -> onBothVal match p a b
---       (Just a , Nothing) -> onOneVal one1 p a
---       (Nothing, Just b ) -> onOneVal one2 p b
---       (Nothing, Nothing) -> pure Nothing
---   mergeTree p (RadixTree v1 s1) (RadixTree v2 s2) = RadixTree <$> (construct <$> mergeVal p v1 v2) <*> mergeChunk p s1 s2
---   mergeChunk p s1RM s2RM = Compose do
---     s1R <- extract' (Proxy @"one") s1RM
---     s2R <- extract' (Proxy @"two") s2RM
---     reducible' (Proxy @"one") (reduceChunk' (Proxy @"one")) s1R \s1 ->
---       reducible' (Proxy @"two") (reduceChunk' (Proxy @"two")) s2R \s2 ->
-        -- _
--- mergeVal = construct \p v1 v2 -> case (v1, v2) of
---   (Just a , Just b ) -> runIdentity $ onBothVal both p a b
---   (Just a , Nothing) -> runIdentity $ onOneVal one1 p a
---   (Nothing, Just b ) -> runIdentity $ onOneVal one2 p b
---   (Nothing, Nothing) -> Nothing
-
--- sMerge :: Container c
---   => OnOne Identity one fin
---   -> OnOne Identity two fin
---   -> OnBoth Identity one two fin
---   -> RadixTree c k one
---   -> RadixTree c k two
---   -> RadixTree c k fin
--- sMerge one1 one2 both = mergeTree [] where
---   mergeTree p (RadixTree v1 s1) (RadixTree v2 s2) = RadixTree (mergeVal <*> p <*> v1 <*> v2) _
-
--- TODO: monadic... monadic
 
 -- selectors
 
@@ -439,6 +448,24 @@ max = runNonDet
     r' -> pure r')
   (pure . Just)
   (pure Nothing)
+
+-- construction
+
+empty :: Container c => RadixTree c k a
+empty = RadixTree sNothing sNil
+
+fromListM :: forall c sig m k v. (Has FreshIO sig m, Container c, IsRadixKey k) => [(k, v)] -> m (RadixTree c k v)
+fromListM = foldM (\t (k, v) -> insert (selEq k) v t) empty
+
+toListM :: forall c sig m k v. (Has FreshIO sig m, Container c, IsRadixKey k) => RadixTree c k v -> m [(k, v)]
+toListM = fmap catMaybes . runNonDetA . lookupKV selChoose
+
+-- aliases
+
+type Map = RadixTree
+type MapR = Map Res
+type Set = RadixTree
+type SetR k = MapR k ()
 
 -- debug
 

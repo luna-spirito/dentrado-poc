@@ -24,7 +24,7 @@ import GHC.Base (Type)
 import Data.Coerce (coerce)
 import Control.Effect.Sum (inj)
 import GHC.IsList (fromList, toList)
-import Control.Carrier.NonDet.Church (NonDetC)
+import Control.Carrier.NonDet.Church (NonDetC, runNonDetA)
 import qualified RIO.Seq as Seq
 import qualified RIO.Partial as P
 
@@ -154,18 +154,21 @@ mkIBinNonRe = IBin
 mkIBin :: (Container c1, Container c2, Has FreshIO sig m) => (forall b. c2 b -> ReduceC m (c1 b)) -> Bool -> Chunk -> c2 (InvRadixChunk c2 k a) -> c2 (RadixChunk c2 k a) -> m (c1 (InvRadixChunk c2 k a))
 mkIBin f a b c d = allocReducedInvChunk f $ mkIBinNonRe a b c d
 
-lookup :: (SelectorZipper sel (ReduceC m), Container c, Has FreshIO sig m) => sel k SZipper -> RadixZipper c k a -> m (Maybe a)
-lookup sel zipper = runReduce =<< accessRadixZipper
+lookupKV :: (Has FreshIO sig m, SelectorZipper sel (ReduceC m), Container c, RT.IsRadixKey k) => sel k SZipper -> RadixZipper c k a -> m (Maybe (k, a))
+lookupKV sel zipper = runReduce =<< accessRadixZipper
   (\_ _ -> id)
   (\p a b -> join $ fst RT.internalLookup p a b)
   (\p a b -> join $ snd RT.internalLookup p a b)
   (\_ _ -> id)
   (\_ _ _ -> id)
-  (\_ _ val _ _ -> fetchC val)
+  (\(RT.FinalPath k) _ val _ _ -> ((RT.fromRadixKey k,) <$>) <$> fetchC val)
   (\_ _ _ -> id)
   (\_ _ _ -> id)
   (\_ _ _ -> id)
   sel zipper
+
+lookup :: (Has FreshIO sig m, SelectorZipper sel (ReduceC m), Container c, RT.IsRadixKey k) => sel k SZipper -> RadixZipper c k a -> m (Maybe a)
+lookup sel zipper = fmap snd <$> lookupKV sel zipper
 
 insert :: (SelectorZipper sel (ReduceC m), Container c, Has FreshIO sig m) => sel k SZipper -> a -> RadixZipper c k a -> m (RadixZipper c k a)
 insert path val zipper = runReduce =<< accessRadixZipper
@@ -264,12 +267,9 @@ focus =
     (\pickRight mask super other topval invtree chunk -> (\invchunk' -> other topval invchunk' invtree)  =<< mkIBin pure (not pickRight) mask super chunk) -- on sub, invchunk
     selOr
 
-empty :: Container c => RadixZipper c k a
-empty = RadixZipper [] ($sRunEvalFresh $ allocC InvRadixNil) RT.sEmpty
-
 -- selectors
 
-data instance RT.SelEq k SZipper = SelEqZ ![Chunk]
+newtype instance RT.SelEq k SZipper = SelEqZ [Chunk]
 data instance RT.SelEq k SInvtree = SelEqIT !Int ![Chunk]
 data instance RT.SelEq k SInvchunk = SelEqIC !Chunk ![Chunk]
 
@@ -340,13 +340,13 @@ instance Algebra sig m => Algebra (NonDetLR :+: sig) (NonDetLRC m) where
     dst = run . runNonDetLR
       (liftA2 pl)
       (liftA2 pr)
-      (pure . runNonDetLRA)
+      (pure . runNonDetLRTranspose)
       (pure (pure $ NonDetLRC \_l _r _p n -> n))
-    pl left main = (\(NonDetLRC left') (NonDetLRC main') -> NonDetLRC \l r p n -> left' l r p n `l` main' l r p n) <$> left <*> main 
+    pl left main = (\(NonDetLRC left') (NonDetLRC main') -> NonDetLRC \l r p n -> left' l r p n `l` main' l r p n) <$> left <*> main
     pr main right = (\(NonDetLRC main') (NonDetLRC right') -> NonDetLRC \l r p n -> main' l r p n `r` right' l r p n) <$> main <*> right
-    runNonDetLRA :: Applicative f => NonDetLRC f a -> f (NonDetLRC m2 a)
-    runNonDetLRA = runNonDetLR pl pr (pure . pure) (pure $ NonDetLRC \_l _r _p n -> n)
-  {-# INLINE alg #-}  
+    runNonDetLRTranspose :: Applicative f => NonDetLRC f a -> f (NonDetLRC m2 a)
+    runNonDetLRTranspose = runNonDetLR pl pr (pure . pure) (pure $ NonDetLRC \_l _r _p n -> n)
+  {-# INLINE alg #-}
 
 -- Run NonDeLRC, moving from bottom to top of the tree and collecting result into an alternative
 runNonDetLRInvA :: forall f m a. (Applicative m, Alternative f) => NonDetLRC m a -> Free (Compose m f) a
@@ -390,15 +390,19 @@ instance (HasLabelled "stray" NonDet sig m, HasLabelled "invtree" NonDetLR sig m
         else inj ChooseR -- if we're left, the other one is right
     pure if goUp
       then Right SelChooseIC
-      else Left $ Just $ RT.SelChooseC
+      else Left $ Just RT.SelChooseC
   selINil _sel = sendLabelled @"stray" $ inj Empty
 
 selChoose :: RT.SelChoose k SZipper
 selChoose = SelChooseZ
 
+runRZNonDet :: Applicative m => Labelled "stray" NonDetC (Labelled "invtree" NonDetLRC m) a -> Free (Compose m Seq) a
+runRZNonDet = runNonDetLRInvA . runLabelled @"invtree" . fmap P.fromJust . RT.min . runLabelled @"stray"
+{-# INLINE runRZNonDet #-}
+
 selCtxMinMax :: Monad m => (t -> Labelled "stray" NonDetC (Labelled "invtree" NonDetLRC m) (Maybe a)) -> (forall b. Seq b -> Maybe (b, Seq b)) -> t -> m (Maybe a)
-selCtxMinMax rtCtx seqPop act =  
-    extract $ runNonDetLRInvA $ runLabelled @"invtree" $ fmap P.fromJust $ RT.min $ runLabelled @"stray" $ rtCtx act
+selCtxMinMax rtCtx seqPop act =
+    extract $ runRZNonDet $ rtCtx act
   where
     extract :: Monad m => Free (Compose m Seq) (Maybe a) -> m (Maybe a)
     extract = \case
@@ -421,6 +425,22 @@ max :: Monad m => NonDetC (Labelled "stray" NonDetC (Labelled "invtree" NonDetLR
 max = selCtxMinMax RT.max \oldS -> case Seq.viewr oldS of
   Seq.EmptyR -> Nothing
   newS Seq.:> x -> Just (x, newS)
+
+-- construction
+
+empty :: Container c => RadixZipper c k a
+empty = RadixZipper [] ($sRunEvalFresh $ allocC InvRadixNil) RT.sEmpty
+
+fromListM :: forall c sig m k v. (Has FreshIO sig m, Container c, RT.IsRadixKey k) => [(k, v)] -> m (RadixZipper c k v)
+fromListM = foldM (\t (k, v) -> insert (selEq k) v t) empty
+
+toAscListM :: forall c sig m k v. (Has FreshIO sig m, Container c, RT.IsRadixKey k) => RadixZipper c k v -> m [(k, v)]
+toAscListM = toList' . runRZNonDet . runNonDetA . lookupKV selChoose where
+  toList' :: Free (Compose m Seq) [Maybe (k, v)] -> m [(k, v)]
+  toList' = \case
+    Pure x -> pure $ catMaybes x
+    Free (Compose act) -> act >>= \s ->
+      fmap join $ traverse toList' $ toList s
 
 -- debug
 

@@ -84,16 +84,19 @@ reduce' (Proxy @s) = do
 
 ----
 
-class Cast a b where -- better to use one from lib
+class Cast a b where -- better to use one from lib. In any case, shouldn't be defined *here*.
   cast :: a -> b
 instance Cast a a where
   cast = id
-instance Cast (a, b) a where
-  cast = fst
-instance Cast (a, b) b where
-  cast = snd
 
+-- TODO: Res (Maybe a) should store variant info at ptr level, not at the data level. Therefore, we'll need
+-- some new class that defines how things are packed.
 data Res a = Res !Word64 !a -- identified resource, probably requires fetching from the disk
+newtype ResPOC a = ResPOC Word64 -- welp, yeah. This declaration will be merged into Res in the final
+-- dentrado implementation, but, since POC doesn't have any internal storage and can't fetch resource by some identifier, these types
+-- are separate here. For now.
+instance Cast (Res a) (ResPOC a) where
+  cast (Res p _) = ResPOC p
 
 alloc :: Has Fresh sig m => a -> m (Res a)
 alloc v = (\i -> Res (fromIntegral i) v) <$> fresh
@@ -130,11 +133,16 @@ instance Container Res where
   unwrap' _ = pure
   tryUnwrap = Just
   same (Res aId _) (Res bId _) = aId == bId
+data AppForce = AppForce
 
 data Delay a where
-  DelayFresh :: !(Delay (FreshIOC (Res a))) -> !(IORef (Maybe (Res a))) -> Delay a
+  DelayFresh :: !(Delay (FreshIOC (Res a))) -> !(IORef (Maybe (Res a))) -> Delay a -- TODO: when some Delay is duplicated into `a` and `b`,
+  -- if `a` emits Reduced, `b` should emit Reduced independently, to ensure that reduction happens in both ctxs of `a` and `b`.
   DelayApp :: !(Delay (Res a -> b)) -> !(Delay a) -> Delay b
   DelayPin :: !(Res a) -> Delay a
+
+mkDelayFresh :: (Has FreshIO sig m) => Delay (FreshIOC (Res a)) -> m (Delay a)
+mkDelayFresh x = DelayFresh x <$> sendM (FreshIOC $ newIORef Nothing)
 
 delayFresh :: Has (FreshIO :+: Reduce' s) sig m => Proxy s -> Delay (FreshIOC (Res a)) -> IORef (Maybe (Res a)) -> m (Res a)
 delayFresh (Proxy @s) actM memo =
@@ -178,6 +186,7 @@ instance Container Delay where
     (DelayApp df1 da1, DelayApp df2 da2) ->
       df1 `same` df2 && da1 `same` da2
     _nonMatching -> False
+data AppDelay = AppDelay
 
 -- | Presence of Delay fields in some types interferes with construction of the most optimal spine.
 -- Reducible is a potential fix that allows to "reduce" the spine as more Delayed computations
