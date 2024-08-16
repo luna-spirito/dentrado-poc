@@ -27,9 +27,9 @@ sFresh = getQ >>= \case
     putQ $ StaticFresh modId newI
     pure $ LitE $ IntegerL $ (fromIntegral modId `unsafeShiftL` 55) + (fromIntegral i `unsafeShiftL` 47) + (1 `unsafeShiftL` 62)
 
-runEvalFresh :: Int -> FreshC Identity a -> a
-runEvalFresh x y = run $ evalFresh x y
+freshI :: Int -> FreshC Identity a -> a
+freshI x y = run $ evalFresh x y
 
 -- statically evaluates `FreshC Identity x`, should be used with care
-sRunEvalFresh :: Q Exp
-sRunEvalFresh = varE 'runEvalFresh `appE` sFresh
+sFreshI :: Q Exp
+sFreshI = varE 'freshI `appE` sFresh

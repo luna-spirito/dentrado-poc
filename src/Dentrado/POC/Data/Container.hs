@@ -8,7 +8,7 @@ import Control.Algebra
 import GHC.Base (Symbol)
 import Control.Effect.Fresh (Fresh (..))
 import Control.Carrier.Fresh.Church (fresh)
-import Dentrado.POC.TH (moduleId, sRunEvalFresh)
+import Dentrado.POC.TH (moduleId, sFreshI)
 import Control.Carrier.Reader (ReaderC, runReader)
 import Data.Kind (Type)
 import Control.Effect.Reader (ask)
@@ -101,7 +101,7 @@ instance Cast (Res a) (ResPOC a) where
 alloc :: Has Fresh sig m => a -> m (Res a)
 alloc v = (\i -> Res (fromIntegral i) v) <$> fresh
 
-fetch :: Has Fresh sig m => Res a -> m a
+fetch :: Has FreshIO sig m => Res a -> m a
 fetch (Res _ x) = pure x -- temp
 
 tryFetch :: Res a -> Maybe a
@@ -215,4 +215,5 @@ reducible :: Has (FreshIO :+: Reduce) sig m => (a -> ReduceC FreshIOC a) -> Redu
 reducible = reducible' (Proxy @"")
 
 sNothing :: Container c => c (Maybe a)
-sNothing = wrap $ $sRunEvalFresh $ alloc Nothing
+sNothing = wrap $ $sFreshI $ alloc Nothing
+

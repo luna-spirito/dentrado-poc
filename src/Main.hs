@@ -95,10 +95,6 @@ groupSetUpd f (SetUpd added removed) =
 mapKVDiff :: Map k v -> Map k v -> SetUpd (k, v)
 mapKVDiff = _
 
-cascadeUpdate :: (u -> a -> Maybe (u, a)) -> u -> a -> a
-cascadeUpdate f origU origA = case f origU origA of
-  Nothing -> origA
-  Just (u, a) -> cascadeUpdate f u a
 
 -- setToMap :: Set a -> Map a ()
 -- setToMap = Map.fromSet $ const ()

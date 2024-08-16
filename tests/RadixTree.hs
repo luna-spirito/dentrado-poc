@@ -13,7 +13,7 @@ import qualified Dentrado.POC.Data.RadixZipper as RZ
 import System.IO.Unsafe (unsafePerformIO)
 import Language.Haskell.TH (newDeclarationGroup)
 import qualified Dentrado.POC.Data.RadixTree as RT
-import Dentrado.POC.TH (moduleId, sRunEvalFresh)
+import Dentrado.POC.TH (moduleId, sFreshI)
 import qualified Data.Map.Merge.Strict as Map
 
 $(moduleId 101)
@@ -156,12 +156,12 @@ instance Arbitrary v => Arbitrary (MergeInput v) where
 
 mergeSubRT :: RT.RadixTree Res k Int -> RT.RadixTree Res k Int -> FreshIOC (RT.RadixTree Res k Int)
 mergeSubRT =
-  let negateAll = $sRunEvalFresh $ fst <$> RT.wither @_ @_ @_ @Res AppForce \_ val -> allocC $ Just (-val)
-  in $sRunEvalFresh $ RT.merge
+  $sFreshI $ RT.merge
     AppForce
-    (RT.OnOne (\a _ -> pure a) pure)
-    (RT.OnOne (\_ b -> allocC $ Just (-b)) negateAll)
+    RT.onOneKeep
+    ($sFreshI $ RT.onOneWitherM AppForce \_ b -> allocC $ Just (- b))
     (RT.OnBoth \_ a _ b -> allocC $ Just $ a - b)
+    Nothing
 
 mergeSubMap :: Ord k => Map k Int -> Map k Int -> Map k Int
 mergeSubMap = Map.merge (Map.mapMissing $ const id) (Map.mapMissing \_ a -> -a) (Map.zipWithMatched \_ a b -> a - b)

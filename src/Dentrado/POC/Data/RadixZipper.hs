@@ -1,8 +1,8 @@
 {-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
 {-# HLINT ignore "Use uncurry" #-}
 {-# LANGUAGE DeriveFunctor #-}
-{-# HLINT ignore "Use if" #-}
 module Dentrado.POC.Data.RadixZipper where
+
 import RIO hiding (mask, toList, catch)
 import Control.Algebra
 import Control.Effect.Writer
@@ -10,7 +10,7 @@ import Dentrado.POC.Data.Container
 import Dentrado.POC.Data.RadixTree (RadixChunk, Chunk, RadixTree)
 import qualified Dentrado.POC.Data.RadixTree as RT
 import Control.Effect.Fresh (Fresh)
-import Dentrado.POC.TH (moduleId, sRunEvalFresh)
+import Dentrado.POC.TH (moduleId, sFreshI)
 import Control.Carrier.Writer.Church (WriterC, runWriter)
 import Data.Monoid (First(..))
 import qualified Control.Applicative as A
@@ -214,7 +214,7 @@ pop k rt = runWriter (\(First a) b -> pure (a, b)) $ update
   k rt
 
 sITop :: Container c => c (InvRadixChunk c k a)
-sITop = $sRunEvalFresh $ allocC $ mkReducible ITop
+sITop = $sFreshI $ allocC $ mkReducible ITop
 
 focus :: forall c k a sig m sel. (SelectorZipper sel (ReduceC m), Container c, Has FreshIO sig m) => sel k SZipper -> RadixZipper c k a -> m (RadixZipper c k a)
 focus =
@@ -429,7 +429,7 @@ max = selCtxMinMax RT.max \oldS -> case Seq.viewr oldS of
 -- construction
 
 empty :: Container c => RadixZipper c k a
-empty = RadixZipper [] ($sRunEvalFresh $ allocC InvRadixNil) RT.sEmpty
+empty = RadixZipper [] ($sFreshI $ allocC InvRadixNil) RT.sEmpty
 
 fromListM :: forall c sig m k v. (Has FreshIO sig m, Container c, RT.IsRadixKey k) => [(k, v)] -> m (RadixZipper c k v)
 fromListM = foldM (\t (k, v) -> insert (selEq k) v t) empty
