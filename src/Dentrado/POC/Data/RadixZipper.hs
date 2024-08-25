@@ -1,3 +1,5 @@
+-- temporarily disabled to speed up POC development
+
 {-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
 {-# HLINT ignore "Use uncurry" #-}
 {-# LANGUAGE DeriveFunctor #-}

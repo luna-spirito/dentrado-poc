@@ -1,0 +1,28 @@
+module Dentrado.POC.Types where -- probably should be moved to Dentrado.POC.Data.Types?
+
+import RIO
+import System.IO.Unsafe (unsafePerformIO)
+
+type Chunk = Word32
+
+
+-- | Presence of Delay fields in some types interferes with construction of the most optimal spine.
+-- Reducible is a potential fix that allows to "reduce" the spine as more Delayed computations
+-- are resolved.
+newtype Reducible a = Reducible (IORef a)
+
+readReducible :: Reducible a -> a
+readReducible (Reducible x) = unsafePerformIO $ readIORef x
+
+instance Show a => Show (Reducible a) where
+  show = show . readReducible
+
+data RadixTree c k a = RadixTree !(c (Maybe a)) !(c (RadixChunk c k a)) -- both element and next is containerized, both can be left unwrapped.
+  deriving Generic
+type RadixChunk c k a = Reducible (RadixChunk' c k a)
+data RadixChunk' c k a
+  = Nil
+  | Tip !Chunk !(RadixTree c k a) -- RadixTree is the only possible branch. Still could be containerized, but I'm not sure it's worth it
+  | Bin !Chunk !(c (RadixChunk c k a)) !(c (RadixChunk c k a)) -- Either branch can be accessed, so containerization
+  deriving Generic
+

@@ -211,4 +211,44 @@ let SiteEvent = type
   | UpdatePost : { id : Id, val : { title : Maybe Text, value : Maybe Text, answers : Maybe Id } }>
 -}
 
+-- I will strat prototyping things here, will move them out later. Thanks.
+
+-- Желательно всё уместить в StateGraph, чтобы он был монолитным объектом.
+-- Это позволит сохранить чистую семантику
+-- Так что...
+-- 1) Мы или делаем его полностью монолитным, включая в StateGraph информацию о самих данных и зависимостях
+-- 2) Мы храним данные о сателлитах всё же отдельно
+-- Временное решение: две структры, полная и расширенная
+-- type DepId = Word32
+-- data StateEntry s v = StateEntry !s !(RadixSet (DepId, _)) !v -- signal, dependencies and the final value
+-- data StateGraph k s v = StateGraph !v !(RadixTree k (RadixZipper EventId StateEntry)) -- initial value and updates for each object
+-- newtype StateGraphDeps k = StateGraphDeps (RadixTree DepId (RadixTree EventId (RadixSet k))
+
+-- stateGraph do
+--   dep1 <- _
+--   dep2 <- _
+--   pure
+--     (_functionGetsSamplerReturnsV
+--     , )
+
+newtype Timestamp = Timestamp Word32 deriving (Eq, Ord)
+-- | Event id, local to the timestamp.
+-- 8 highest bits represent id of the source cluster server.
+-- 24 lowest bit represent "epoch", monotonic id of event within the source cluster server within the second.
+newtype LocalId = LocalId Word32 deriving (Eq, Ord)
+-- | Full Event ID
+data EventId = EventId !Timestamp !LocalId deriving (Eq, Ord)
+
+instance RT.IsRadixKey EventId where
+  toRadixKey (EventId (Timestamp a) (LocalId b)) = [a, b]
+  fromRadixKey = \case
+    [a, b] -> EventId (Timestamp a) (LocalId b)
+    _ -> error "key corrupted"
+
+{-
+
+
+
+-}
+
 
