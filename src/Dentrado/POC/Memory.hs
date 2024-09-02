@@ -364,60 +364,41 @@ reducible = reducible' (Proxy @"")
 infixr 1 :->
 data a :-> b where
   FunBuiltin :: !(ResB (a -> b)) -> (a :-> b)
-  FunUnsafeSignal :: !(ResB (Any1 (Signaller m a))) -> (i :-> M m a)
-
-data Signaller m r i = Signaller !(ValT i) !(i -> m r)
+  FunCurry :: ((a, b) :-> c) -> (a :-> b :-> c)
+  FunCurry1 :: {-no bang-}ValT a -> !a -> !((a, b) :-> c) -> (b :-> c)
 
 -- TODO: maybe unsafes could be cleaned by... uh... Res (c a) ~ Res (Any1 c)?
 -- well, implement Res in a way that it allows deserialized data to itself say the type.
 
 -- "Signals" are *exclusively* builtins.
-data M m r
-  = forall i. MUnsafeSignal !(ResB (Any1 (Signaller m r))) !i
-  | forall a. MBind !(ValT a) !(M m a) !(a :-> M m r)
-
 instance (Typeable a, Typeable b) => Ser (a :-> b) where
   ser = \case
     FunBuiltin x -> putWord8 0 *> ser x
-    FunUnsafeSignal x -> putWord8 1 *> case TypeRep @b of
-      _M `T.App` TypeRep `T.App` TypeRep -> ser x
+    FunCurry f -> case TypeRep @b of
+      arr `T.App` TypeRep `T.App` TypeRep
+        | Just HRefl <- eqTypeRep arr (TypeRep @(:->))
+        -> putWord8 1 *> ser f
       _imp -> error "impossible"
+    FunCurry1 xT@(valSerProof -> Dict) x f -> putWord8 2 *> ser (Any1 (Val xT x)) *> ser f
   deser = getWord8 >>= \case
     0 -> FunBuiltin <$> deser
-    _1 -> case TypeRep @b of
-      (TypeRep @m_) `T.App` TypeRep `T.App` TypeRep
-        | Just HRefl <- eqTypeRep (TypeRep @m_) (TypeRep @M) -> FunUnsafeSignal <$> deser
-      _imp -> empty
+    1 -> case TypeRep @b of
+      arr `T.App` TypeRep `T.App` TypeRep
+        | Just HRefl <- eqTypeRep arr (TypeRep @(:->))
+        -> FunCurry <$> deser
+      _err -> empty
+    _2 -> do
+      Any1 (Val xT@(valSerProof -> Dict) x) <- deser
+      FunCurry1 xT x <$> deser
 
-instance (Typeable m, Typeable a) => Ser (M m a) where
-  ser = \case
-    MUnsafeSignal @_ @_ @i f@(ResB _ (Any1 @_ @i2 (Signaller (valSerProof -> Dict) _))) i ->
-      putWord8 0 *> ser f *> withUnsafeEq @i @i2 (ser i)
-    MBind aT@(valSerProof -> Dict) aM f ->
-      putWord8 1 *> ser (Any1 aT) *> ser aM *> ser f
-  deser = getWord8 >>= \case
-    0 -> do
-      signaller'@(ResB _ (Any1 @_ @i (Signaller (valSerProof -> Dict) _))) <- deser
-      MUnsafeSignal signaller' <$> deser @i
-    _1 -> do
-      Any1 aT@(valSerProof -> Dict) <- deser
-      aM <- deser
-      MBind aT aM <$> deser
-  
-  -- ser = \case
-  --   MSignal res@(ResB _ (valSerProof -> Dict, _)) i -> putWord8 0 *> ser res *> ser i
-  --   MBind a aT@(valSerProof -> Dict) b -> putWord8 1 *> ser a *> ser (Any1 aT) *> ser b
-  -- deser = getWord8 >>= \case
-  --   0 -> do
-  --     f <- deser
-  --     pure $ MSignal f i
+funApp :: InferValT a => a :-> b -> a -> b
+funApp = funApp' inferValT
 
-funApp :: a :-> b -> a -> b
-funApp f x = case f of
+funApp' :: ValT a -> (a :-> b) -> a -> b
+funApp' xT f x = case f of
   FunBuiltin (ResB _ f') -> f' x
-  FunUnsafeSignal f' -> MUnsafeSignal f' x
-
--- runM :: M m a -> 
+  FunCurry f' -> FunCurry1 xT x f'
+  FunCurry1 aT a f' -> funApp' (ValTTuple aT xT) f' (a, x)
 
 --
 
@@ -457,6 +438,8 @@ monadTypeableProof = \case
   MonadTReduceC1 (monadTypeableProof -> Dict) -> Dict
   MonadTReduceC2 (monadTypeableProof -> Dict) -> Dict
 
+--
+
 data ContainerT a where
   ContainerTRes :: ContainerT Res
 
@@ -475,67 +458,127 @@ containerContainerProof = \case
 
 --
 
+newtype M m a = M { unM :: m a }
+newtype C c a = C { unC :: c a }
+  deriving Ser
+
 -- ValT is a **runtime** value that stores type of the object.
 -- It shouldn't necessarily be GADT, but this is the best way I see to connect it to the Hask type.
 data ValT a where
-  ValTFun :: !(ValT a) -> !(ValT b) -> ValT (a :-> b)
+  ValTFun :: !(ValT a) -> !(EValT b) -> ValT (a :-> b)
   ValTTuple :: !(ValT a) -> !(ValT b) -> ValT (a, b)
   ValTRadixTree :: !(ContainerT c) -> !(ValT k) -> !(ValT v) -> ValT (RadixTree c k v)
-  ValTContainer :: !(ContainerT c) -> !(ValT a) -> ValT (c a)
-  ValTMonad :: !(MonadT m) -> !(ValT a) -> ValT (M m a)
+  ValTContainer :: !(ContainerT c) -> !(ValT a) -> ValT (C c a)
+  ValTMaybe :: !(ValT a) -> ValT (Maybe a)
+  ValTReducible :: !(ValT a) -> ValT (Reducible a)
+  ValTRadixChunk :: !(ContainerT c) -> !(ValT k) -> !(ValT v) -> ValT (RadixChunk' c k v)
+
+-- EValT is an ephemeral extension of ValT. It includes types that
+-- cannot be easily serialized.
+-- One typical case for EValT to appear is as the right hand of an :-> arrow.
+-- This refers to a computation that produces a non-serializable result (like a monad).
+data EValT a where
+  EValT{-Lift-} :: ValT a -> EValT a
+  EValTMonad :: MonadT m -> EValT a -> EValT (M m a)
 
 class InferValT a where
   inferValT :: ValT a
-instance (InferValT a, InferValT b) => InferValT (a :-> b) where
-  inferValT = ValTFun inferValT inferValT
+instance (InferValT a, InferEValT b) => InferValT (a :-> b) where
+  inferValT = ValTFun inferValT inferEValT
 instance (InferValT a, InferValT b) => InferValT (a, b) where
   inferValT = ValTTuple inferValT inferValT
 instance (InferContainerT c, InferValT k, InferValT v) => InferValT (RadixTree c k v) where
   inferValT = ValTRadixTree inferContainerT inferValT inferValT
-instance (InferContainerT c, InferValT v) => InferValT (c v) where
+instance (InferContainerT c, InferValT v) => InferValT (C c v) where
   inferValT = ValTContainer inferContainerT inferValT
-instance (InferMonadT m, InferValT a) => InferValT (M m a) where
-  inferValT = ValTMonad inferMonadT inferValT
+instance InferValT a => InferValT (Maybe a) where
+  inferValT = ValTMaybe inferValT
+instance InferValT a => InferValT (Reducible a) where
+  inferValT = ValTReducible inferValT
+instance (InferContainerT c, InferValT k, InferValT v) => InferValT (RadixChunk' c k v) where
+  inferValT = ValTRadixChunk inferContainerT inferValT inferValT
+
+class InferEValT a where
+  inferEValT :: EValT a
+instance {-# OVERLAPPABLE #-} InferValT a => InferEValT a where
+  inferEValT = EValT inferValT
+instance (InferMonadT m, InferEValT a) => InferEValT (M m a) where
+  inferEValT = EValTMonad inferMonadT inferEValT
 
 valSerProof :: ValT x -> Dict (Ser x)
 valSerProof = \case
-  ValTFun (valSerProof -> Dict) (valSerProof -> Dict) -> Dict
-  ValTTuple (valSerProof -> Dict) (valSerProof -> Dict) -> Dict--withDict (valSerProof a) (withDict (valSerProof b) Dict)
+  ValTFun (valSerProof -> Dict) (evalTypeableProof -> Dict) -> Dict
+  ValTTuple (valSerProof -> Dict) (valSerProof -> Dict) -> Dict
   ValTRadixTree (containerContainerProof -> Dict) (valSerProof -> Dict) (valSerProof -> Dict) -> Dict
   ValTContainer (containerContainerProof -> Dict) (valSerProof -> Dict) -> Dict
-  ValTMonad (monadTypeableProof -> Dict) (valSerProof -> Dict) -> Dict
+  ValTMaybe (valSerProof -> Dict) -> Dict
+  ValTReducible (valSerProof -> Dict) -> Dict
+  ValTRadixChunk (containerContainerProof -> Dict) (valSerProof -> Dict) (valSerProof -> Dict) -> Dict
 
-instance Ser (Any1 ValT) where -- The payload is the value.
+evalTypeableProof :: EValT x -> Dict (Typeable x)
+evalTypeableProof = \case
+  EValT (valSerProof -> Dict) -> Dict
+  EValTMonad (monadTypeableProof -> Dict) (evalTypeableProof -> Dict) -> Dict
+
+deserValT :: Word8 -> ConsumeC (Obj Word64) (StateC ByteString (EmptyC AppIOC)) (Any1 ValT)
+deserValT = \case
+  0 -> do
+    Any1 a <- deser
+    Any1 b <- deser
+    pure $ Any1 $ ValTFun a b
+  1 -> do
+    Any1 a <- deser
+    Any1 b <- deser
+    pure $ Any1 $ ValTTuple a b
+  2 -> do
+    Any1 c <- deser
+    Any1 k <- deser
+    Any1 v <- deser
+    pure $ Any1 $ ValTRadixTree c k v
+  3 -> do
+    Any1 c <- deser
+    Any1 v <- deser
+    pure $ Any1 $ ValTContainer c v
+  4 -> do
+    Any1 a <- deser
+    pure $ Any1 $ ValTMaybe a
+  5 -> do
+    Any1 a <- deser
+    pure $ Any1 $ ValTReducible a
+  _6 -> do
+    Any1 c <- deser
+    Any1 k <- deser
+    Any1 v <- deser
+    pure $ Any1 $ ValTRadixChunk c k v
+  -- >= 150 RESERVED FOR EVAL
+
+instance Ser (Any1 ValT) where
   ser (Any1 x) = case x of
     ValTFun a b -> putWord8 0 *> ser (Any1 a) *> ser (Any1 b)
     ValTTuple a b -> putWord8 1 *> ser (Any1 a) *> ser (Any1 b)
     ValTRadixTree c k v -> putWord8 2 *> ser (Any1 c) *> ser (Any1 k) *> ser (Any1 v)
     ValTContainer c v -> putWord8 3 *> ser (Any1 c) *> ser (Any1 v)
-    ValTMonad m a -> putWord8 4 *> ser (Any1 m) *> ser (Any1 a)
+    ValTMaybe a -> putWord8 4 *> ser (Any1 a)
+    ValTReducible a -> putWord8 5 *> ser (Any1 a)
+    ValTRadixChunk c k v -> putWord8 6 *> ser (Any1 c) *> ser (Any1 k) *> ser (Any1 v)
+    -- >= 150 RESERVED FOR EVAL
+  deser = getWord8 >>= deserValT
+
+instance Ser (Any1 EValT) where
+  ser (Any1 x) = case x of
+    EValT a -> ser (Any1 a)
+    EValTMonad m a -> putWord8 150 *> ser (Any1 m) *> ser (Any1 a)
   deser = getWord8 >>= \case
-    0 -> do
-      Any1 a <- deser
-      Any1 b <- deser
-      pure $ Any1 $ ValTFun a b
-    1 -> do
-      Any1 a <- deser
-      Any1 b <- deser
-      pure $ Any1 $ ValTTuple a b
-    2 -> do
-      Any1 c <- deser
-      Any1 k <- deser
-      Any1 v <- deser
-      pure $ Any1 $ ValTRadixTree c k v
-    3 -> do
-      Any1 c <- deser
-      Any1 v <- deser
-      pure $ Any1 $ ValTContainer c v
-    _4 -> do
+    n | n < 150 -> do
+      Any1 x <- deser
+      pure $ Any1 $ EValT x
+    _150 -> do
       Any1 m <- deser
       Any1 a <- deser
-      pure $ Any1 $ ValTMonad m a
+      pure $ Any1 $ EValTMonad m a
 
-data Val a = Val { getType :: !(ValT a), getVal :: !a }
+data Val a = Val !(ValT a) !a
+data EVal a = EVal !(EValT a) !a
 
 asVal :: InferValT a => a -> Val a
 asVal = Val inferValT
@@ -603,23 +646,23 @@ data AppForce = AppForce
 
 data Delay a where
   DelayPin :: !(Res a) -> Delay a
-  DelayCache :: !(DelayApp (M AppIOC (Res a))) -> !(IORef (Maybe (Res a))) -> Delay a -- TODO: when some Delay is duplicated into `a` and `b`,
+  DelayCache :: !(DelayApp (M AppIOC (C Res a))) -> !(IORef (Maybe (Res a))) -> Delay a -- TODO: when some Delay is duplicated into `a` and `b`,
 
 data DelayApp a where
   DelayAppUnsafeFun :: !(Res (Any1 Val)) {- typeOf val ~ a -} -> DelayApp a
-  DelayApp :: !(DelayApp (Res a :-> b)) -> !(Delay a) -> DelayApp b -- we could store (DelayApp a) as the second argument, but I believe this interface is good enough
+  DelayApp :: !(DelayApp (C Res a :-> b)) -> !(Delay a) -> DelayApp b -- we could store (DelayApp a) as the second argument, but I believe this interface is good enough
 
-mkDelayCache :: Has AppIO sig m => DelayApp (M AppIOC (Res a)) -> m (Delay a)
+mkDelayCache :: Has AppIO sig m => DelayApp (M AppIOC (C Res a)) -> m (Delay a)
 mkDelayCache x = DelayCache x <$> sendAIO (newIORef Nothing)
 
-delayCache :: Has (AppIO :+: Reduce' s) sig m => Proxy s -> DelayApp (M AppIOC (Res a)) -> IORef (Maybe (Res a)) -> m (Res a)
+delayCache :: Has (AppIO :+: Reduce' s) sig m => Proxy s -> DelayApp (M AppIOC (C Res a)) -> IORef (Maybe (Res a)) -> m (Res a)
 delayCache (Proxy @s) actM memo =
   sendAIO (readIORef memo) >>= \case
     Just res -> pure res
     Nothing -> do
       reduce' (Proxy @s)
-      act <- delayAppVal (Proxy @s) actM
-      res <- sendM act
+      M act <- delayAppVal (Proxy @s) actM
+      C res <- sendM act
       sendAIO $ writeIORef memo (Just res)
       pure res
 
@@ -627,15 +670,15 @@ withUnsafeEq :: forall a b x. (a ~ b => x) -> x
 withUnsafeEq = withDict (unsafeCoerce @() @(Dict (a ~ b)) ())
 
 delayAppVal :: forall sig m s x. Has (AppIO :+: Reduce' s) sig m => Proxy s -> DelayApp x -> m x
-delayAppVal proxy = fmap (\(Val _ x) -> x) . delayAppVal' where
-  delayAppVal' :: forall y. DelayApp y -> m (Val y)
+delayAppVal proxy = fmap (\(EVal _ x) -> x) . delayAppVal' where
+  delayAppVal' :: forall y. DelayApp y -> m (EVal y)
   delayAppVal' = \case
     DelayAppUnsafeFun f -> do
-      Any1 @_ @a val <- fetchC' proxy f
-      pure $ withUnsafeEq @a @y val
-    DelayApp (f :: DelayApp (Res a :-> y)) a -> delayAppVal' f >>= \case
-      Val (ValTFun (valSerProof -> Dict) bT) f' ->
-        Val bT . funApp f' <$> unwrap' proxy a
+      Any1 @_ @a (Val vT v) <- fetchC' proxy f
+      pure $ withUnsafeEq @a @y $ EVal (EValT vT) v
+    DelayApp (f :: DelayApp (C Res a :-> y)) a -> delayAppVal' f >>= \case
+      EVal (EValT (ValTFun aT@(valSerProof -> Dict) bT)) f' ->
+        EVal bT . funApp' aT f' . C <$> unwrap' proxy a
 
 instance Container Delay where
   wrap = DelayPin
@@ -675,25 +718,25 @@ instance Typeable a => Ser (Delay a) where
 instance Typeable a => Ser (DelayApp a) where -- Actually, this task is mostly about serializing ust a list of [Res], which is already a thing.
 -- we could use some manipulations to cut costs and reuse existing functionality.
   ser = void . ser' 0 where
-    ser' :: forall b. Word8 -> DelayApp b -> WriterC (RevList (Obj (Any1 Res))) (WriterC Builder AppIOC) (ValT b)
+    ser' :: forall b. Word8 -> DelayApp b -> WriterC (RevList (Obj (Any1 Res))) (WriterC Builder AppIOC) (EValT b)
     ser' args = \case
       DelayAppUnsafeFun f -> do
         putWord8 args *> ser f
         Any1 @_ @c (Val valT _) <- fetch f
-        pure $ withUnsafeEq @b @c valT
+        pure $ withUnsafeEq @b @c $ EValT valT
       DelayApp f a -> ser' (args + 1) f >>= \case
-        ValTFun (ValTContainer ContainerTRes (valSerProof -> Dict)) bT -> ser a $> bT
+        EValT (ValTFun (ValTContainer ContainerTRes (valSerProof -> Dict)) bT) -> ser a $> bT
   deser = do
       args <- getWord8
       valR <- deser
       Any1 (Val valT _) <- fetch valR
-      deser' args (DelayAppUnsafeFun valR) valT
+      deser' args (DelayAppUnsafeFun valR) $ EValT valT
     where
-      deser' :: forall a1. Word8 -> DelayApp a1 -> ValT a1 -> ConsumeC (Obj Word64) (StateC ByteString (EmptyC AppIOC)) (DelayApp a)
-      deser' 0 d (valSerProof -> Dict) = do
+      deser' :: forall a1. Word8 -> DelayApp a1 -> EValT a1 -> ConsumeC (Obj Word64) (StateC ByteString (EmptyC AppIOC)) (DelayApp a)
+      deser' 0 d (evalTypeableProof -> Dict) = do
         HRefl <- maybe empty pure $ eqTypeRep (TypeRep @a1) (TypeRep @a)
         pure d
-      deser' args d (ValTFun (ValTContainer ContainerTRes (valSerProof -> Dict)) bT) = do
+      deser' args d (EValT (ValTFun (ValTContainer ContainerTRes (valSerProof -> Dict)) bT)) = do
         a <- deser
         deser' (args - 1) (DelayApp d a) bT
       deser' _args _d _nonFun = empty
@@ -710,9 +753,6 @@ wrapB = wrap . ResBuiltin
 
 sNothing :: ResB (Maybe a)
 sNothing = $sFreshI $ builtin Nothing-- $sFreshI $ builtin Nothing
-
-mkBuiltinSignal :: (Has Fresh sig1 m1, InferValT i) => (i -> m a) -> m1 (i :-> M m a)
-mkBuiltinSignal f = FunUnsafeSignal <$> builtin (Any1 $ Signaller inferValT f)
 
 delayAppBuiltinFun :: (Has Fresh sig m, InferValT a) => a -> m (DelayApp a)
 delayAppBuiltinFun x = DelayAppUnsafeFun . ResBuiltin <$> builtin (Any1 $ asVal x)

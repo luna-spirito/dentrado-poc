@@ -18,7 +18,7 @@ import Control.Effect.Fresh (Fresh)
 import Language.Haskell.TH (Q, Exp, lamE, varE, appE, newName, varP)
 import Control.Carrier.Reader (runReader)
 import Data.Kind (Type)
-import Dentrado.POC.Memory (Res, Cast (..), Container (..), AppIO, Reduce' (..), Delay (..), ReduceC, AppIOC, AppForce(..), Reduce, RevList, AppDelay(..), Reduce'C (..), allocC, mkReducible, tryFetchC, reduce', runReduce, fetchC, reducible, revSnoc, sNothing, fetch, unwrap, mkDelayCache, runReduce', alloc, reducible', builtin, Ser, ResB (..), wrapB, (:->), funApp, delayAppBuiltinFun, DelayApp (..), mkBuiltinSignal)
+import Dentrado.POC.Memory (Res (..), Cast (..), Container (..), AppIO, Reduce' (..), Delay (..), ReduceC, AppIOC, AppForce(..), Reduce, RevList, AppDelay(..), Reduce'C (..), allocC, mkReducible, tryFetchC, reduce', runReduce, fetchC, reducible, revSnoc, sNothing, fetch, unwrap, mkDelayCache, runReduce', alloc, reducible', builtin, Ser, ResB (..), wrapB, (:->) (..), delayAppBuiltinFun, DelayApp (..), M (..), C (..), InferValT, InferContainerT)
 import Control.Effect.Writer (tell)
 import Dentrado.POC.Types (Chunk, RadixTree (..), RadixChunk, RadixChunk' (..), readReducible)
 
@@ -241,7 +241,7 @@ pop k rt = runWriter (\(First a) b -> pure (a, b)) $ update
 -- TODO: move onTree/onBin/onTip/onNil to strategy
 class (Container c, Container cfin) => AppWither strat m c cfin where
   -- stratWither :: strat -> ResB (Res a :-> ReduceC m (Res b)) -> c a -> ReduceC m (cfin b)
-  stratWitherLift :: Has Fresh sig2 m2 => strat -> (Res a -> ReduceC m (Res b)) -> m2 (c a -> ReduceC m (cfin b))
+  stratWitherLift :: (Has Fresh sig2 m2, InferValT a, InferValT b) => strat -> (Res a -> ReduceC m (Res b)) -> m2 (c a -> ReduceC m (cfin b))
 
 instance (Has AppIO sig m, Container c, Container cfin) => AppWither AppForce m c cfin where
   stratWitherLift _ f = pure \a -> do
@@ -249,19 +249,12 @@ instance (Has AppIO sig m, Container c, Container cfin) => AppWither AppForce m 
     wrap <$> f a'
 
 instance AppWither AppDelay AppIOC Delay Delay where
-  --stratWither _ f a = mkDelayCache $ (appWitherDelayPrepF `DelayApp` wrap f) `DelayApp` a
   stratWitherLift _ f = do
-    preparedF <- delayAppBuiltinFun =<< mkBuiltinSignal _
+    preparedF <- delayAppBuiltinFun . FunBuiltin =<< builtin (M . fmap C . runReduce . f . unC)
     pure \a -> mkDelayCache (preparedF `DelayApp` a)
-{-
-appWitherDelayPrepF :: Delay (Res (Res a -> ReduceC AppIOC (Res b)) -> Res a -> AppIOC (Res b))
-appWitherDelayPrepF = wrapB $ $sFreshI $ builtin \f a -> do
-  f' <- fetch f
-  runReduce $ f' a
-instance AppWither AppDelay AppIOC Delay Delay where
-  stratWither _ f a = mkDelayCache $ (appWitherDelayPrepF `DelayApp` wrap f) `DelayApp` a
 
-witherF :: forall tree chunk sig1 m1 sig2 m2 strat c cfin k a b. (Has Fresh sig1 m1, MonadFix m1, Has AppIO sig2 m2, AppWither strat m2 c cfin)
+witherF :: forall tree chunk sig1 m1 sig2 m2 strat c cfin k a b.
+  (Has Fresh sig1 m1, MonadFix m1, AppWither strat m2 c cfin, InferValT a, InferValT b, Ser a, Has AppIO sig2 m2, Typeable k, InferValT chunk, InferValT k, InferContainerT c)
   => (cfin (Maybe b) -> cfin chunk -> m2 tree)
   -> (Bool -> Chunk -> cfin chunk -> cfin chunk -> m2 (Res chunk))
   -> (Chunk -> tree -> m2 (Res chunk))
@@ -270,35 +263,36 @@ witherF :: forall tree chunk sig1 m1 sig2 m2 strat c cfin k a b. (Has Fresh sig1
   -> (Res (Maybe a) -> a -> ReduceC m2 (Res (Maybe b)))
   -> m1 (c (RadixChunk c k a) -> ReduceC m2 (cfin chunk), RadixTree c k a -> m2 tree) -- impredicativity
 witherF onTree onBin onTip onNil strat f = mdo
-  goVal <- allocC \vR -> do
+  goVal <- stratWitherLift strat \vR -> do
     vM <- fetch vR
     case vM of
-      Nothing -> pure sNothing
+      Nothing -> pure $ ResBuiltin sNothing
       Just v -> f vR v
-  goChunk <- allocC \chunkRes -> do
+  goChunk <- stratWitherLift strat \chunkRes -> do
     chunkRed <- fetch chunkRes
     reducible reduceChunk chunkRed \case
       Tip mask v -> do
         t <- goTree v
         lift $ onTip mask t
       Bin mask l r -> do
-        (l', r') <- (,) <$> stratWither strat goChunk l <*> stratWither strat goChunk r
+        (l', r') <- (,) <$> goChunk l <*> goChunk r
         lift $ onBin True mask l' r'
       Nil -> lift onNil
   let
     goTree :: RadixTree c k a -> ReduceC m2 tree
     goTree (RadixTree vC subC) = do
       (a, b) <- (,)
-        <$> stratWither strat goVal vC
-        <*> stratWither strat goChunk subC
+        <$> goVal vC
+        <*> goChunk subC
       lift $ onTree a b
-  pure (stratWither strat goChunk, runReduce . goTree)
+  pure (goChunk, runReduce . goTree)
 
-wither :: forall sig1 m1 sig2 m2 strat c cfin k a b. (Has Fresh sig1 m1, MonadFix m1, Has AppIO sig2 m2, AppWither strat m2 c cfin)
+wither :: forall sig1 m1 sig2 m2 strat c cfin k a b.
+  (Has Fresh sig1 m1, MonadFix m1, Has AppIO sig2 m2, AppWither strat m2 c cfin, Ser b, Ser a, Typeable k, InferValT b, InferValT a, InferValT k, InferContainerT cfin, InferContainerT c)
   => strat
   -> (Res (Maybe a) -> a -> ReduceC m2 (Res (Maybe b)))
   -> m1 (c (RadixChunk c k a) -> ReduceC m2 (cfin (RadixChunk cfin k b)), RadixTree c k a -> m2 (RadixTree cfin k b)) -- impredicativity
-wither = witherF (\a b -> pure $ RadixTree a b) (mkBin unwrap) (mkTip unwrap) (pure sNil)
+wither = witherF (\a b -> pure $ RadixTree a b) (mkBin unwrap) (mkTip unwrap) (pure $ ResBuiltin sNil)
 
 sWither :: Q Exp
 sWither = do
@@ -320,15 +314,20 @@ data OnSame chunk m c cfin k one two fin = OnSame
   , onSameSubtreeR :: !(Res (RadixChunk c k one) -> Res (RadixChunk c k two) -> m (Res chunk)) }
 
 class (Container c, Container cfin) => AppMerge strat m c cfin where
-  stratMerge :: strat -> Res (Res x -> Res y -> Reduce'C "1" (Reduce'C "2" m) (Res z)) -> c x -> c y -> Reduce'C "1" (Reduce'C "2" m) (cfin z)
+  -- stratMerge :: strat -> Res (Res x -> Res y -> Reduce'C "1" (Reduce'C "2" m) (Res z)) -> c x -> c y -> Reduce'C "1" (Reduce'C "2" m) (cfin z)
+  stratMergeLift :: (Has Fresh sig2 m2, InferValT x, InferValT y, InferValT z)
+    => strat -> (Res x -> Res y -> Reduce'C "1" (Reduce'C "2" m) (Res z)) -> m2 (c x -> c y -> Reduce'C "1" (Reduce'C "2" m) (cfin z))
 
 instance (Has AppIO sig m, Container c, Container cfin) => AppMerge AppForce m c cfin where
-  stratMerge _ f a b = do
-    f' <- fetch f
-    wrap <$> join (f' <$> unwrap' (Proxy @"1") a <*> unwrap' (Proxy @"2") b)
+  stratMergeLift _ f = pure \a b ->
+    wrap <$> join (f <$> unwrap' (Proxy @"1") a <*> unwrap' (Proxy @"2") b)
 
 instance AppMerge AppDelay AppIOC Delay Delay where
-  stratMerge _ f a b = mkDelayCache $ DelayApp (DelayApp (DelayApp appMergeDelayPrepF $ wrap f) a) b
+  stratMergeLift _ f = do
+    preparedF <- delayAppBuiltinFun . FunCurry . FunBuiltin =<< builtin \(C a, C b) -> M $
+      fmap C $ runReduce' @"2" $ runReduce' @"1" $ f a b
+    pure \a b -> mkDelayCache (preparedF `DelayApp` a `DelayApp` b)
+ 
 
 reduce1 :: Algebra sig m => ReduceC m a -> Reduce'C "1" (Reduce'C "2" m) a
 reduce1 (Reduce'C act) = do
@@ -341,7 +340,10 @@ reduce2 (Reduce'C act) = do
   lift $ lift $ runReader flag act
 
 -- I believe there is a problem with how mergeF handles references and containers. It performs some destructive wraps and unwraps here and there.
-mergeF :: forall sig1 m1 sig2 m2 strat c cfin k one two fin chunk tree. (Has Fresh sig1 m1, MonadFix m1, AppMerge strat m2 c cfin, Has AppIO sig2 m2)
+mergeF :: forall sig1 m1 sig2 m2 strat c cfin k one two fin chunk tree.
+  (Has Fresh sig1 m1, MonadFix m1, AppMerge strat m2 c cfin, Has AppIO sig2 m2
+  , InferContainerT c, InferValT one, InferValT two, InferValT fin, InferValT chunk, InferValT k, Typeable k
+  , Ser one, Ser two)
   => (cfin (Maybe fin) -> cfin chunk -> m2 tree)
   -> (Bool -> Chunk -> cfin chunk -> cfin chunk -> m2 (Res chunk))
   -> (Chunk -> tree -> m2 (Res chunk))
@@ -361,8 +363,8 @@ mergeF onTree onBin onTip strat one1 one2 both sameM = mdo
           then h hdl
           else o
         Nothing -> \_ _ _ o -> o
-    checkSameMergeChunk a b = checkSame a a (\s -> lift $ lift $ onSameSubtree s a b) (stratMerge strat mergeChunk a b)
-  mergeVal <- alloc \r1 r2 -> do
+    checkSameMergeChunk a b = checkSame a a (\s -> lift $ lift $ onSameSubtree s a b) (mergeChunk a b)
+  mergeVal <- stratMergeLift strat \r1 r2 -> do
     checkSame r1 r2
       (\s -> lift $ lift $ onSameValR s r1 r2)
       do
@@ -372,8 +374,8 @@ mergeF onTree onBin onTip strat one1 one2 both sameM = mdo
           (Just a , Just b ) -> onBothVal both r1 a r2 b
           (Just a , Nothing) -> onOneVal one1 r1 a
           (Nothing, Just b ) -> onOneVal one2 r2 b
-          (Nothing, Nothing) -> pure sNothing
-  mergeChunk :: Res (Res (RadixChunk c k one) -> Res (RadixChunk c k two) -> Reduce'C "1" (Reduce'C "2" m3) (Res chunk)) <- alloc \res1 res2 ->
+          (Nothing, Nothing) -> pure $ ResBuiltin sNothing
+  mergeChunk  <- stratMergeLift strat \res1 res2 ->
     checkSame
       res1
       res2
@@ -389,12 +391,12 @@ mergeF onTree onBin onTip strat one1 one2 both sameM = mdo
               (a, b) <- (,) <$> reduce1 (onOneSubtree one1 res1) <*> reduce2 (onOneSubtree one2 res2)
               lift $ lift $ onBin pickRight mask (wrap a) (wrap b)
             oneContainsTwo mask1 key2 l1 r1 = case tryMask mask1 key2 of
-              Just True  -> binOfMerges mask1 l1 sNil r1 (wrap res2)
-              Just False -> binOfMerges mask1 l1 (wrap res2) r1 sNil
+              Just True  -> binOfMerges mask1 l1 (wrapB sNil) r1 (wrap res2)
+              Just False -> binOfMerges mask1 l1 (wrap res2) r1 (wrapB sNil)
               Nothing -> unrelated mask1 key2
             twoContainsOne key1 mask2 l2 r2 = case tryMask mask2 key1 of
-              Just False -> binOfMerges mask2 (wrap res1) l2 sNil r2
-              Just True  -> binOfMerges mask2 sNil l2 (wrap res1) r2
+              Just False -> binOfMerges mask2 (wrap res1) l2 (wrapB sNil) r2
+              Just True  -> binOfMerges mask2 (wrapB sNil) l2 (wrap res1) r2
               Nothing -> unrelated mask2 key1
         reducible' (Proxy @"1") (reduceChunk' (Proxy @"1")) v1 \v1' ->
           reducible' (Proxy @"2") (reduceChunk' (Proxy @"2")) v2 \v2' ->
@@ -415,12 +417,15 @@ mergeF onTree onBin onTip strat one1 one2 both sameM = mdo
                 | otherwise -> unrelated key1 key2
   let mergeTree (RadixTree k1 s1) (RadixTree k2 s2) = do
         (a, b) <- (,)
-          <$> checkSame k1 k2 (\s -> lift $ lift $ onSameVal s k1 k2) (stratMerge strat mergeVal k1 k2)
+          <$> checkSame k1 k2 (\s -> lift $ lift $ onSameVal s k1 k2) (mergeVal k1 k2)
           <*> checkSameMergeChunk s1 s2
         lift $ lift $ onTree a b
   pure \a b -> runReduce' @"2" $ runReduce' @"1" $ mergeTree a b
 
-merge :: (Has Fresh sig1 m1, MonadFix m1, Has AppIO sig2 m2, AppMerge strat m2 c cfin)
+merge ::
+  (Has Fresh sig1 m1, MonadFix m1, AppMerge strat m2 c cfin, Has AppIO sig2 m2
+  , InferContainerT c, InferContainerT cfin, InferValT one, InferValT two, InferValT fin, InferValT k, Typeable k
+  , Ser one, Ser two, Ser fin)
   => strat
   -> OnOne (RadixChunk cfin k fin) m2 c k one fin
   -> OnOne (RadixChunk cfin k fin) m2 c k two fin
@@ -454,10 +459,13 @@ sMerge = do
 onOneKeep :: Applicative m => OnOne (RadixChunk c k fin) m c k fin fin
 onOneKeep = OnOne (const . pure) pure
 
-onBothZip :: Has Fresh sig m => (one -> two -> Maybe fin) -> OnBoth m one two fin
+onBothZip :: (Has AppIO sig m, Ser fin) => (one -> two -> Maybe fin) -> OnBoth m one two fin
 onBothZip f = OnBoth \_ one _ two -> alloc $ f one two
 
-onOneWitherFM :: (Has Fresh sig1 m1, MonadFix m1, Container c, Has AppIO sig2 m2, AppWither strat m2 c cfin)
+onOneWitherFM ::
+  (Has Fresh sig1 m1, MonadFix m1, Container c, AppWither strat m2 c cfin, Has AppIO sig2 m2,
+  InferContainerT c, InferValT b, InferValT a, InferValT chunk, InferValT k, Typeable k,
+  Ser a)
   => (cfin (Maybe b) -> cfin chunk -> m2 tree)
   -> (Bool -> Chunk -> cfin chunk -> cfin chunk -> m2 (Res chunk))
   -> (Chunk -> tree -> m2 (Res chunk))
@@ -468,11 +476,12 @@ onOneWitherFM onTree onBin onTip onNil strat f = do
   toFin <- fst <$> witherF onTree onBin onTip onNil strat \x y -> lift (f x y)
   pure $ OnOne f \chunk -> toFin (wrap chunk) >>= unwrap
 
-onOneWitherM :: (Has Fresh sig m, MonadFix m, Container c, Has AppIO sig2 m2, AppWither strat m2 c cfin) => strat -> (Res (Maybe this) -> this -> m2 (Res (Maybe fin))) -> m (OnOne (RadixChunk cfin k fin) m2 c k this fin)
-onOneWitherM = onOneWitherFM (\a b -> pure $ RadixTree a b) (mkBin unwrap) (mkTip unwrap) (pure sNil)
+onOneWitherM :: (Has Fresh sig m, MonadFix m, Container c, Has AppIO sig2 m2, AppWither strat m2 c cfin, Ser this, InferContainerT c, InferContainerT cfin, InferValT fin, InferValT this, InferValT k, Typeable k, Ser fin)
+  => strat -> (Res (Maybe this) -> this -> m2 (Res (Maybe fin))) -> m (OnOne (RadixChunk cfin k fin) m2 c k this fin)
+onOneWitherM = onOneWitherFM (\a b -> pure $ RadixTree a b) (mkBin unwrap) (mkTip unwrap) (pure $ wrapB sNil)
 
 mergeWithUpdate :: forall c sig1 m1 sig2 m2 k fin upd.
-  (Container c, Has Fresh sig1 m1, MonadFix m1, Has AppIO sig2 m2)
+  (Container c, Has Fresh sig1 m1, MonadFix m1, Has AppIO sig2 m2, Ser fin, InferValT k, InferValT upd, InferValT fin, InferContainerT c, Ser upd, Typeable k)
   => (Maybe fin -> upd -> fin)
   -> m1 (RadixTree c k fin
     -> RadixTree c k upd
@@ -485,7 +494,8 @@ mergeWithUpdate f = do
 
 -- diff
 
-diffF :: (Has Fresh sig1 m1, MonadFix m1, AppMerge strat m2 c cfin, AppWither strat m2 c cfin, Has AppIO sig2 m2)
+diffF ::
+  (Has Fresh sig1 m1, MonadFix m1, AppMerge strat m2 c cfin, AppWither strat m2 c cfin, Has AppIO sig2 m2, InferContainerT c, InferValT fin, InferValT a, InferValT chunk, InferValT k, Ser a, Typeable k)
   => (cfin (Maybe fin) -> cfin chunk -> m2 tree)
   -> (Bool -> Chunk -> cfin chunk -> cfin chunk -> m2 (Res chunk))
   -> (Chunk -> tree -> m2 (Res chunk))
@@ -498,14 +508,13 @@ diffF onTree onBin onTip onNil strat f = do
   w2 <- onOneWitherFM onTree onBin onTip onNil strat \_ x -> f (MapAdd x)
   mergeF onTree onBin onTip strat w1 w2
     (OnBoth \_ a _ b -> f (MapUpd a b))
-    (Just $ OnSame (\_ _ -> pure sNothing) (\_ _ -> pure sNothing) (\_ _ -> wrap <$> onNil) (\_ _ -> onNil))
+    (Just $ OnSame (\_ _ -> pure $ wrapB sNothing) (\_ _ -> pure $ wrapB sNothing) (\_ _ -> wrap <$> onNil) (\_ _ -> onNil))
 
-diff :: (Has Fresh sig1 m1, MonadFix m1, AppMerge strat m2 c cfin, AppWither strat m2 c cfin, Has AppIO sig2 m2)
+diff :: (Has Fresh sig1 m1, MonadFix m1, AppMerge strat m2 c cfin, AppWither strat m2 c cfin, Has AppIO sig2 m2, Ser a, InferContainerT c, InferContainerT cfin, InferValT fin, InferValT a, InferValT k, Typeable k, Ser fin)
   => strat
   -> (MapDiffE a -> m2 (Res (Maybe fin)))
   -> m1 (RadixTree c k a -> RadixTree c k a -> m2 (RadixTree cfin k fin))
-diff = diffF (\a b -> pure $ RadixTree a b) (mkBin unwrap) (mkTip unwrap) (pure sNil)
--}
+diff = diffF (\a b -> pure $ RadixTree a b) (mkBin unwrap) (mkTip unwrap) (pure $ wrapB sNil)
 
 -- selectors
 
@@ -590,10 +599,10 @@ toListM = fmap catMaybes . runNonDetA . lookupKV selChoose
 tryFetchShow :: (Container c, Show a) => c a -> String
 tryFetchShow = maybe "<>" show . tryFetchC
 
-instance (Container c, Show a) => Show (RadixTree c k a) where
-  show (RadixTree val chunk) = "(RadixTree (" <> tryFetchShow val <> ") " <> tryFetchShow chunk <> ")"
-instance (Container c, Show a) => Show (RadixChunk' c k a) where
-  show = \case
-    Nil -> "Nil"
-    Tip key val -> "(Tip " <> show key <> " " <> show val <> ")"
-    Bin mask l r -> "(Bin " <> show mask <> " " <> tryFetchShow l <> " " <> tryFetchShow r <> ")"
+-- instance (Container c, Show a) => Show (RadixTree c k a) where
+--   show (RadixTree val chunk) = "(RadixTree (" <> tryFetchShow val <> ") " <> tryFetchShow chunk <> ")"
+-- instance (Container c, Show a) => Show (RadixChunk' c k a) where
+--   show = \case
+--     Nil -> "Nil"
+--     Tip key val -> "(Tip " <> show key <> " " <> show val <> ")"
+--     Bin mask l r -> "(Bin " <> show mask <> " " <> tryFetchShow l <> " " <> tryFetchShow r <> ")"
