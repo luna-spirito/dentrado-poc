@@ -18,7 +18,7 @@ import Control.Effect.Fresh (Fresh)
 import Language.Haskell.TH (Q, Exp, lamE, varE, appE, newName, varP)
 import Control.Carrier.Reader (runReader)
 import Data.Kind (Type)
-import Dentrado.POC.Memory (Res, Cast (..), Container (..), AppIO, Reduce' (..), Delay (..), ReduceC, AppIOC, AppForce(..), Reduce, RevList, AppDelay(..), Reduce'C (..), allocC, mkReducible, tryFetchC, reduce', runReduce, fetchC, reducible, revSnoc, sNothing, fetch, unwrap, mkDelayCache, runReduce', alloc, reducible', builtin, Ser, ResB (..), wrapB, (:->), funApp, delayAppBuiltinFun, DelayApp (..))
+import Dentrado.POC.Memory (Res, Cast (..), Container (..), AppIO, Reduce' (..), Delay (..), ReduceC, AppIOC, AppForce(..), Reduce, RevList, AppDelay(..), Reduce'C (..), allocC, mkReducible, tryFetchC, reduce', runReduce, fetchC, reducible, revSnoc, sNothing, fetch, unwrap, mkDelayCache, runReduce', alloc, reducible', builtin, Ser, ResB (..), wrapB, (:->), funApp, delayAppBuiltinFun, DelayApp (..), mkBuiltinSignal)
 import Control.Effect.Writer (tell)
 import Dentrado.POC.Types (Chunk, RadixTree (..), RadixChunk, RadixChunk' (..), readReducible)
 
@@ -241,17 +241,17 @@ pop k rt = runWriter (\(First a) b -> pure (a, b)) $ update
 -- TODO: move onTree/onBin/onTip/onNil to strategy
 class (Container c, Container cfin) => AppWither strat m c cfin where
   -- stratWither :: strat -> ResB (Res a :-> ReduceC m (Res b)) -> c a -> ReduceC m (cfin b)
-  stratWitherLift :: Has Fresh sig2 m2 => strat -> (Res a :-> ReduceC m (Res b)) -> m2 (c a -> ReduceC m (cfin b))
+  stratWitherLift :: Has Fresh sig2 m2 => strat -> (Res a -> ReduceC m (Res b)) -> m2 (c a -> ReduceC m (cfin b))
 
 instance (Has AppIO sig m, Container c, Container cfin) => AppWither AppForce m c cfin where
   stratWitherLift _ f = pure \a -> do
     a' <- unwrap a
-    wrap <$> funApp f a'
+    wrap <$> f a'
 
 instance AppWither AppDelay AppIOC Delay Delay where
   --stratWither _ f a = mkDelayCache $ (appWitherDelayPrepF `DelayApp` wrap f) `DelayApp` a
   stratWitherLift _ f = do
-    preparedF <- delayAppBuiltinFun _
+    preparedF <- delayAppBuiltinFun =<< mkBuiltinSignal _
     pure \a -> mkDelayCache (preparedF `DelayApp` a)
 {-
 appWitherDelayPrepF :: Delay (Res (Res a -> ReduceC AppIOC (Res b)) -> Res a -> AppIOC (Res b))

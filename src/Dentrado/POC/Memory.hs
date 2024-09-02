@@ -1,6 +1,7 @@
 {-# LANGUAGE DefaultSignatures #-}
 {-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE QuantifiedConstraints #-}
+{-# LANGUAGE PolyKinds #-}
 module Dentrado.POC.Memory where
 
 import RIO hiding (mask, toList, catch, ask, asks, runReader, Reader)
@@ -77,7 +78,6 @@ instance Cast a a where
 
 data Dynamic1 f = forall a. Dynamic1 !(Type.Reflection.TypeRep a) !(f a)
 data Any1 f = forall a. Any1 !(f a)
-data Any1Of2 f = forall (a :: Type -> Type). Any1Of2 !(f a) -- I couldn't use PolyKinds here. If you can, do it please.
 
 -- Resources and storage
 
@@ -229,15 +229,15 @@ instance (Container c, Ser a, Typeable c, Typeable k) => Ser (RadixChunk' c k a)
 
 -- GSer
 
-class GSer f where
+class GSer (f :: k -> Type) where
   gSer :: f x -> WriterC (RevList (Obj (Any1 Res))) (WriterC Builder AppIOC) ()
   gDeser :: ConsumeC (Obj Word64) (StateC ByteString (EmptyC AppIOC)) (f x) -- probably better to encapsulate
 
-class GSerSum f where
+class GSerSum (f :: k -> Type) where
   gSerSum :: Int -> f x -> WriterC (RevList (Obj (Any1 Res))) (WriterC Builder AppIOC) ()
   gDeserSum :: Int -> ConsumeC (Obj Word64) (StateC ByteString (EmptyC AppIOC)) (f x)
 
-class GSumSize (f :: Type -> Type) where
+class GSumSize (f :: k -> Type) where
   sumSize :: Proxy f -> Int
 
 instance (GSumSize a, GSumSize b) => GSumSize (a G.:+: b) where
@@ -258,9 +258,9 @@ instance (GSumSize a, GSerSum a, GSerSum b) => GSerSum (a G.:+: b) where
   gDeserSum i = if i >= sumSize (Proxy @a)
     then G.R1 <$> gDeserSum (i - sumSize (Proxy @a))
     else G.L1 <$> gDeserSum i
-gSerSum_ :: GSer f => Int -> f x -> WriterC (RevList (Obj (Any1 Res))) (WriterC Builder AppIOC) ()
+gSerSum_ :: forall k (f :: k -> Type) x. GSer f => Int -> f x -> WriterC (RevList (Obj (Any1 Res))) (WriterC Builder AppIOC) ()
 gSerSum_ i v = putWord8 (fromIntegral i) *> gSer v
-gDeserSum_ :: (GSer f) => Int -> ConsumeC (Obj Word64) (StateC ByteString (EmptyC AppIOC)) (f x)
+gDeserSum_ :: forall k (f :: k -> Type) x. GSer f => Int -> ConsumeC (Obj Word64) (StateC ByteString (EmptyC AppIOC)) (f x)
 gDeserSum_ = \case
   0 -> error "invalid fresh"
   _ -> gDeser
@@ -270,7 +270,7 @@ instance GSer (a G.:*: b) => GSerSum (a G.:*: b) where
 instance GSerSum a => GSerSum (G.M1 i c a) where
   gSerSum i = gSerSum i . G.unM1
   gDeserSum i = G.M1 <$> gDeserSum i
-instance GSer (G.K1 c a) => GSerSum (G.K1 c a) where
+instance GSer (G.K1 c a :: k -> Type) => GSerSum (G.K1 c a :: k -> Type) where
   gSerSum = gSerSum_
   gDeserSum = gDeserSum_
 instance GSerSum G.U1 where
@@ -364,38 +364,98 @@ reducible = reducible' (Proxy @"")
 infixr 1 :->
 data a :-> b where
   FunBuiltin :: !(ResB (a -> b)) -> (a :-> b)
-  FunSignal :: !(ResB (ValT i, i -> m a)) -> (i :-> M m a)
+  FunUnsafeSignal :: !(ResB (Any1 (Signaller m a))) -> (i :-> M m a)
+
+data Signaller m r i = Signaller !(ValT i) !(i -> m r)
+
+-- TODO: maybe unsafes could be cleaned by... uh... Res (c a) ~ Res (Any1 c)?
+-- well, implement Res in a way that it allows deserialized data to itself say the type.
+
+-- "Signals" are *exclusively* builtins.
+data M m r
+  = forall i. MUnsafeSignal !(ResB (Any1 (Signaller m r))) !i
+  | forall a. MBind !(ValT a) !(M m a) !(a :-> M m r)
 
 instance (Typeable a, Typeable b) => Ser (a :-> b) where
   ser = \case
     FunBuiltin x -> putWord8 0 *> ser x
-    FunSignal x -> putWord8 1 *> case TypeRep @b of
+    FunUnsafeSignal x -> putWord8 1 *> case TypeRep @b of
       _M `T.App` TypeRep `T.App` TypeRep -> ser x
       _imp -> error "impossible"
   deser = getWord8 >>= \case
     0 -> FunBuiltin <$> deser
     _1 -> case TypeRep @b of
       (TypeRep @m_) `T.App` TypeRep `T.App` TypeRep
-        | Just HRefl <- eqTypeRep (TypeRep @m_) (TypeRep @M) -> FunSignal <$> deser
+        | Just HRefl <- eqTypeRep (TypeRep @m_) (TypeRep @M) -> FunUnsafeSignal <$> deser
       _imp -> empty
+
+instance (Typeable m, Typeable a) => Ser (M m a) where
+  ser = \case
+    MUnsafeSignal @_ @_ @i f@(ResB _ (Any1 @_ @i2 (Signaller (valSerProof -> Dict) _))) i ->
+      putWord8 0 *> ser f *> withUnsafeEq @i @i2 (ser i)
+    MBind aT@(valSerProof -> Dict) aM f ->
+      putWord8 1 *> ser (Any1 aT) *> ser aM *> ser f
+  deser = getWord8 >>= \case
+    0 -> do
+      signaller'@(ResB _ (Any1 @_ @i (Signaller (valSerProof -> Dict) _))) <- deser
+      MUnsafeSignal signaller' <$> deser @i
+    _1 -> do
+      Any1 aT@(valSerProof -> Dict) <- deser
+      aM <- deser
+      MBind aT aM <$> deser
+  
+  -- ser = \case
+  --   MSignal res@(ResB _ (valSerProof -> Dict, _)) i -> putWord8 0 *> ser res *> ser i
+  --   MBind a aT@(valSerProof -> Dict) b -> putWord8 1 *> ser a *> ser (Any1 aT) *> ser b
+  -- deser = getWord8 >>= \case
+  --   0 -> do
+  --     f <- deser
+  --     pure $ MSignal f i
 
 funApp :: a :-> b -> a -> b
 funApp f x = case f of
   FunBuiltin (ResB _ f') -> f' x
-  FunSignal f' -> MSignal f' x
+  FunUnsafeSignal f' -> MUnsafeSignal f' x
+
+-- runM :: M m a -> 
 
 --
 
--- "Signals" are *exclusively* builtins.
-data M m a
-  = forall i. MSignal !(ResB (ValT i, i -> m a)) !i
-  | forall b. MBind !(M m b) !(b :-> M m a)
+data MonadT m where
+  MonadTAppIOC :: MonadT AppIOC
+  MonadTReduceC :: MonadT m -> MonadT (ReduceC m)
+  MonadTReduceC1 :: MonadT m -> MonadT (Reduce'C "1" m)
+  MonadTReduceC2 :: MonadT m -> MonadT (Reduce'C "2" m)
 
---
+class InferMonadT m where
+  inferMonadT :: MonadT m
+instance InferMonadT AppIOC where
+  inferMonadT = MonadTAppIOC
+instance InferMonadT m => InferMonadT (ReduceC m) where
+  inferMonadT = MonadTReduceC inferMonadT
+instance InferMonadT m => InferMonadT (Reduce'C "1" m) where
+  inferMonadT = MonadTReduceC1 inferMonadT
+instance InferMonadT m => InferMonadT (Reduce'C "2" m) where
+  inferMonadT = MonadTReduceC2 inferMonadT
 
-instance Ser (Any1Of2 ContainerT) where
-  ser (Any1Of2 ContainerTRes) = pure ()
-  deser = pure $ Any1Of2 ContainerTRes
+instance Ser (Any1 MonadT) where
+  ser (Any1 x) = case x of
+    MonadTAppIOC -> putWord8 0
+    MonadTReduceC y -> putWord8 1 *> ser (Any1 y)
+    MonadTReduceC1 y -> putWord8 2 *> ser (Any1 y)
+    MonadTReduceC2 y -> putWord8 3 *> ser (Any1 y)
+  deser = getWord8 >>= \case
+    0 -> pure $ Any1 MonadTAppIOC
+    1 -> (\(Any1 x) -> Any1 $ MonadTReduceC x) <$> deser
+    2 -> (\(Any1 x) -> Any1 $ MonadTReduceC1 x) <$> deser
+    _3 -> (\(Any1 x) -> Any1 $ MonadTReduceC2 x) <$> deser
+
+monadTypeableProof :: MonadT m -> Dict (Typeable m)
+monadTypeableProof = \case
+  MonadTAppIOC -> Dict
+  MonadTReduceC (monadTypeableProof -> Dict) -> Dict
+  MonadTReduceC1 (monadTypeableProof -> Dict) -> Dict
+  MonadTReduceC2 (monadTypeableProof -> Dict) -> Dict
 
 data ContainerT a where
   ContainerTRes :: ContainerT Res
@@ -404,6 +464,10 @@ class InferContainerT a where
   inferContainerT :: ContainerT a
 instance InferContainerT Res where
   inferContainerT = ContainerTRes
+
+instance Ser (Any1 ContainerT) where
+  ser (Any1 ContainerTRes) = pure ()
+  deser = pure $ Any1 ContainerTRes
 
 containerContainerProof :: ContainerT a -> Dict (Container a)
 containerContainerProof = \case
@@ -418,7 +482,7 @@ data ValT a where
   ValTTuple :: !(ValT a) -> !(ValT b) -> ValT (a, b)
   ValTRadixTree :: !(ContainerT c) -> !(ValT k) -> !(ValT v) -> ValT (RadixTree c k v)
   ValTContainer :: !(ContainerT c) -> !(ValT a) -> ValT (c a)
-  -- ValTAppIOC :: !(ValT a) -> ValT (AppIOC a)
+  ValTMonad :: !(MonadT m) -> !(ValT a) -> ValT (M m a)
 
 class InferValT a where
   inferValT :: ValT a
@@ -430,6 +494,8 @@ instance (InferContainerT c, InferValT k, InferValT v) => InferValT (RadixTree c
   inferValT = ValTRadixTree inferContainerT inferValT inferValT
 instance (InferContainerT c, InferValT v) => InferValT (c v) where
   inferValT = ValTContainer inferContainerT inferValT
+instance (InferMonadT m, InferValT a) => InferValT (M m a) where
+  inferValT = ValTMonad inferMonadT inferValT
 
 valSerProof :: ValT x -> Dict (Ser x)
 valSerProof = \case
@@ -437,14 +503,15 @@ valSerProof = \case
   ValTTuple (valSerProof -> Dict) (valSerProof -> Dict) -> Dict--withDict (valSerProof a) (withDict (valSerProof b) Dict)
   ValTRadixTree (containerContainerProof -> Dict) (valSerProof -> Dict) (valSerProof -> Dict) -> Dict
   ValTContainer (containerContainerProof -> Dict) (valSerProof -> Dict) -> Dict
-  -- ValTAppIOC (valSerProof -> Dict) -> Dict
+  ValTMonad (monadTypeableProof -> Dict) (valSerProof -> Dict) -> Dict
 
 instance Ser (Any1 ValT) where -- The payload is the value.
   ser (Any1 x) = case x of
     ValTFun a b -> putWord8 0 *> ser (Any1 a) *> ser (Any1 b)
     ValTTuple a b -> putWord8 1 *> ser (Any1 a) *> ser (Any1 b)
-    ValTRadixTree c k v -> putWord8 2 *> ser (Any1Of2 c) *> ser (Any1 k) *> ser (Any1 v)
-    ValTContainer c v -> putWord8 3 *> ser (Any1Of2 c) *> ser (Any1 v)
+    ValTRadixTree c k v -> putWord8 2 *> ser (Any1 c) *> ser (Any1 k) *> ser (Any1 v)
+    ValTContainer c v -> putWord8 3 *> ser (Any1 c) *> ser (Any1 v)
+    ValTMonad m a -> putWord8 4 *> ser (Any1 m) *> ser (Any1 a)
   deser = getWord8 >>= \case
     0 -> do
       Any1 a <- deser
@@ -455,15 +522,18 @@ instance Ser (Any1 ValT) where -- The payload is the value.
       Any1 b <- deser
       pure $ Any1 $ ValTTuple a b
     2 -> do
-      Any1Of2 c <- deser
+      Any1 c <- deser
       Any1 k <- deser
       Any1 v <- deser
       pure $ Any1 $ ValTRadixTree c k v
-    _3 -> do
-      Any1Of2 c <- deser
+    3 -> do
+      Any1 c <- deser
       Any1 v <- deser
       pure $ Any1 $ ValTContainer c v
-
+    _4 -> do
+      Any1 m <- deser
+      Any1 a <- deser
+      pure $ Any1 $ ValTMonad m a
 
 data Val a = Val { getType :: !(ValT a), getVal :: !a }
 
@@ -533,16 +603,16 @@ data AppForce = AppForce
 
 data Delay a where
   DelayPin :: !(Res a) -> Delay a
-  DelayCache :: !(DelayApp (AppIOC (Res a))) -> !(IORef (Maybe (Res a))) -> Delay a -- TODO: when some Delay is duplicated into `a` and `b`,
+  DelayCache :: !(DelayApp (M AppIOC (Res a))) -> !(IORef (Maybe (Res a))) -> Delay a -- TODO: when some Delay is duplicated into `a` and `b`,
 
 data DelayApp a where
   DelayAppUnsafeFun :: !(Res (Any1 Val)) {- typeOf val ~ a -} -> DelayApp a
   DelayApp :: !(DelayApp (Res a :-> b)) -> !(Delay a) -> DelayApp b -- we could store (DelayApp a) as the second argument, but I believe this interface is good enough
 
-mkDelayCache :: Has AppIO sig m => DelayApp (AppIOC (Res a)) -> m (Delay a)
+mkDelayCache :: Has AppIO sig m => DelayApp (M AppIOC (Res a)) -> m (Delay a)
 mkDelayCache x = DelayCache x <$> sendAIO (newIORef Nothing)
 
-delayCache :: Has (AppIO :+: Reduce' s) sig m => Proxy s -> DelayApp (AppIOC (Res a)) -> IORef (Maybe (Res a)) -> m (Res a)
+delayCache :: Has (AppIO :+: Reduce' s) sig m => Proxy s -> DelayApp (M AppIOC (Res a)) -> IORef (Maybe (Res a)) -> m (Res a)
 delayCache (Proxy @s) actM memo =
   sendAIO (readIORef memo) >>= \case
     Just res -> pure res
@@ -640,6 +710,9 @@ wrapB = wrap . ResBuiltin
 
 sNothing :: ResB (Maybe a)
 sNothing = $sFreshI $ builtin Nothing-- $sFreshI $ builtin Nothing
+
+mkBuiltinSignal :: (Has Fresh sig1 m1, InferValT i) => (i -> m a) -> m1 (i :-> M m a)
+mkBuiltinSignal f = FunUnsafeSignal <$> builtin (Any1 $ Signaller inferValT f)
 
 delayAppBuiltinFun :: (Has Fresh sig m, InferValT a) => a -> m (DelayApp a)
 delayAppBuiltinFun x = DelayAppUnsafeFun . ResBuiltin <$> builtin (Any1 $ asVal x)
