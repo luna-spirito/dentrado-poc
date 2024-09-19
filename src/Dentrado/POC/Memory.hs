@@ -1,20 +1,20 @@
 {-# LANGUAGE DefaultSignatures #-}
 {-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE QuantifiedConstraints #-}
-{-# LANGUAGE PolyKinds #-}
 module Dentrado.POC.Memory where
 
 import RIO hiding (mask, toList, catch, ask, asks, runReader, Reader)
 import Control.Algebra
 import Dentrado.POC.TH (moduleId, sFreshI)
 import Data.Kind (Type)
+import Data.Type.Equality (type (~))
 import Control.Carrier.Lift
 import Control.Carrier.State.Church (StateC)
 import GHC.Exts (IsList(..))
 import RIO.List (uncons)
 import Control.Effect.State (get, put, State)
 import qualified GHC.Generics as G
-import Type.Reflection (TypeRep, pattern TypeRep, type (:~~:) (..), eqTypeRep)
+import Type.Reflection (pattern TypeRep, type (:~~:) (..), eqTypeRep)
 import Control.Carrier.Writer.Church (WriterC, Writer)
 import qualified Data.ByteString.Builder as B
 import Control.Effect.Writer (tell)
@@ -38,7 +38,7 @@ import Control.Effect.Sum (Member, inj)
 import Unsafe.Coerce (unsafeCoerce)
 import Data.ByteString.Unsafe as B
 import Data.Constraint (Dict(..), withDict)
-import Dentrado.POC.Types (Reducible(..), RadixTree, RadixChunk', readReducible)
+import Dentrado.POC.Types (Reducible(..), RadixTree, RadixChunk', readReducible, Dynamic1 (..), Any1 (..), Chunk)
 import qualified Type.Reflection as T
 
 $(moduleId 0)
@@ -76,9 +76,6 @@ class Cast a b where -- better to use one from lib. In any case, shouldn't be de
 instance Cast a a where
   cast = id
 
-data Dynamic1 f = forall a. Dynamic1 !(Type.Reflection.TypeRep a) !(f a)
-data Any1 f = forall a. Any1 !(f a)
-
 -- Resources and storage
 
 -- res builtin
@@ -89,22 +86,69 @@ data ResA a
   | ResUnloaded !Word64
   | ResLoaded !a
 data Res a
-  = ResBuiltin !(ResB a) -- ! ommitted so that the resource is lazily loaded.
+  = ResBuiltin !(ResB a)
   | ResAlloc !(MVar (ResA a))
 
 newtype EnvLoad = EnvLoad (forall a. Ser a => Word64 -> IO a)
 -- TODO ASAP: replace with RadixTree
 data Env = Env
-  { envFreshInd :: !(IORef Int)
-  , envBuiltins :: !(IntMap Dynamic)
+  { --envFreshInd :: !(IORef Int) -- POC-only
+    envBuiltins :: !(IntMap Dynamic)
   , envKnown :: !(MVar (IntMap (Weak (Dynamic1 Res)))) -- Resources, known to RAM. May not even be actually loaded.
   , envLoad :: !EnvLoad
-  -- , external :: !(MVar (Map Word64 (Map ByteString Res)))
+  , envKnownExt :: !(MVar (IntMap ([[Chunk]], Weak (Dynamic1 IORef)))) -- external resources known to RAM.
+  , envLocateExt :: !(MVar (RadixTree Res [Chunk] Word64)) -- maps full name of the external resource to the associated Word64
   }
+
+{-
+Res существует для того, чтобы перенумеровать используемые данные таким образом, чтобы значительно сократить
+количество используемого пространства с использованием того наблюдения, что некие состояние редки и могут вовсе никогда не встречаться,
+а другие — переиспользуются в огромном количестве мест.
+
+Однако обратной стороной нумерации заключается то, что она не всегда идеальна,
+и некоторый элемент мы можем случайно занумеровать один и тот же
+элемент несколько раз.
+
+Предполагаем, что определить подобное можно только пост-фактум.
+Если это так, то получается, что Res... не сравним.
+
+Получается, что Res — PartialEq. Это не то что бы новость.
+
+В данный момент, получается, существует многов типов памяти (ой как мне это не нравится):
+1) Память событий.
+Она должна быть отдельной сущностью потому, что это критический компонент
+Базы Данных. Dentrado восстановим (хотя бы частично) без всяких других
+данных, но вот без истории событий он умрёт, окончательно
+и бесповоротно.
+2) Статическая память. Она может быть аллоцирована в рамках любого
+процесса Dentrado, но не является настолько критичным компонентом системы, так как...
+... ну, это просто память, в которой хранится кэш.
+ОЧЕНЬ нежелательно добавлять в эту память функцию обновления чего-либо, так как
+это именно что кэш, и должен быть кэш неизменяемым. Статическая память, однако,
+может делать ссылки на другие типы памяти (например, на подполе события)
+3) Внешние ресурсы по типу изображений. Иными словами, push-based данные.
+Замечания: события — объективно push-based.
+4) Gear. По умолчанию Gear — pull-based, но, возможно?!,
+используемый в pull-based контексте внезапно может потребоваться в push-based?!
+
+Предложение: события — внешний ресурс.
+
+Итого есть три типа ресурсов:
+1) Статические. Вообще не меняются со временем.
+2) Push-based. Обновляются по воле внешних явлений.
+3) Pull-based. Обнвляются только тогда, когда запрошен обновлённый результат, и только если обновлены некие pull-based.
+
+Вероятно, не стоит заботиться о том, какова модель внутреннего устройства, push- или pull-. Dentrado достаточно знать, что каждое
+чтение ячейки может её изменить.
+
+ -}
+
+
+-- the problem is. This method needs t
 
 newtype AppIOC a = AppIOC { unAppIOC :: ReaderC Env IO a }
   deriving (Functor, Applicative, Monad)
-type AppIO = Fresh :+: Lift AppIOC :+: Reader Env
+type AppIO = Lift AppIOC :+: Reader Env
 
 sendAIO :: Has AppIO sig m => IO a -> m a
 sendAIO = sendM . AppIOC . lift
@@ -112,11 +156,8 @@ sendAIO = sendM . AppIOC . lift
 
 instance Algebra AppIO AppIOC where
   alg hdl sig ctx = case sig of
-    L Fresh -> AppIOC do
-      freshInd <- asks envFreshInd
-      sendIO $ atomicModifyIORef' freshInd \old -> (old + 1, ctx $> old)
-    R (L (LiftWith f)) -> f hdl ctx
-    R (R other) -> AppIOC $ alg (unAppIOC . hdl) (inj other) ctx
+    L (LiftWith f) -> f hdl ctx
+    R other -> AppIOC $ alg (unAppIOC . hdl) (inj other) ctx
 
 -- Serialization
 
@@ -143,16 +184,20 @@ instance (Algebra sig m, Member Empty sig) => Algebra (Consume e :+: sig) (Consu
       pure $ ctx $> x
     R other -> alg (unConsumeC . hdl) (R other) ctx
 
+-- AppIOC needed here because serialization rules could be tred in other Res
+type SerM = WriterC Builder AppIOC
+type DeserM = StateC ByteString (EmptyC AppIOC)
+
 -- | Serialization class.
 -- This class is used to serialize/deserialize objects.
 class Typeable a => Ser a where -- typeable is probably excessive, but is needed to "simplify" Ser (Res a)
-  ser :: a -> WriterC (RevList (Obj (Any1 Res))) (WriterC Builder AppIOC) ()
-  deser :: ConsumeC (Obj Word64) (StateC ByteString (EmptyC AppIOC)) a
+  ser :: a -> WriterC (RevList (Obj (Any1 Res))) SerM ()
+  deser :: ConsumeC (Obj Word64) DeserM a
 
-  default ser :: (Generic a, GSer (G.Rep a)) => a -> WriterC (RevList (Obj (Any1 Res))) (WriterC Builder AppIOC) ()
+  default ser :: (Generic a, GSer (G.Rep a)) => a -> WriterC (RevList (Obj (Any1 Res))) SerM ()
   ser = gSer . G.from
 
-  default deser :: (Generic a, GSer (G.Rep a)) => ConsumeC (Obj Word64) (StateC ByteString (EmptyC AppIOC)) a
+  default deser :: (Generic a, GSer (G.Rep a)) => ConsumeC (Obj Word64) DeserM a
   deser = G.to <$> gDeser
 
 putWord8 :: Has (Writer Builder) sig m => Word8 -> m ()
@@ -230,12 +275,12 @@ instance (Container c, Ser a, Typeable c, Typeable k) => Ser (RadixChunk' c k a)
 -- GSer
 
 class GSer (f :: k -> Type) where
-  gSer :: f x -> WriterC (RevList (Obj (Any1 Res))) (WriterC Builder AppIOC) ()
-  gDeser :: ConsumeC (Obj Word64) (StateC ByteString (EmptyC AppIOC)) (f x) -- probably better to encapsulate
+  gSer :: f x -> WriterC (RevList (Obj (Any1 Res))) SerM ()
+  gDeser :: ConsumeC (Obj Word64) DeserM (f x) -- probably better to encapsulate
 
 class GSerSum (f :: k -> Type) where
-  gSerSum :: Int -> f x -> WriterC (RevList (Obj (Any1 Res))) (WriterC Builder AppIOC) ()
-  gDeserSum :: Int -> ConsumeC (Obj Word64) (StateC ByteString (EmptyC AppIOC)) (f x)
+  gSerSum :: Int -> f x -> WriterC (RevList (Obj (Any1 Res))) SerM ()
+  gDeserSum :: Int -> ConsumeC (Obj Word64) DeserM (f x)
 
 class GSumSize (f :: k -> Type) where
   sumSize :: Proxy f -> Int
@@ -258,9 +303,9 @@ instance (GSumSize a, GSerSum a, GSerSum b) => GSerSum (a G.:+: b) where
   gDeserSum i = if i >= sumSize (Proxy @a)
     then G.R1 <$> gDeserSum (i - sumSize (Proxy @a))
     else G.L1 <$> gDeserSum i
-gSerSum_ :: forall k (f :: k -> Type) x. GSer f => Int -> f x -> WriterC (RevList (Obj (Any1 Res))) (WriterC Builder AppIOC) ()
+gSerSum_ :: forall k (f :: k -> Type) x. GSer f => Int -> f x -> WriterC (RevList (Obj (Any1 Res))) SerM ()
 gSerSum_ i v = putWord8 (fromIntegral i) *> gSer v
-gDeserSum_ :: forall k (f :: k -> Type) x. GSer f => Int -> ConsumeC (Obj Word64) (StateC ByteString (EmptyC AppIOC)) (f x)
+gDeserSum_ :: forall k (f :: k -> Type) x. GSer f => Int -> ConsumeC (Obj Word64) DeserM (f x)
 gDeserSum_ = \case
   0 -> error "invalid fresh"
   _ -> gDeser
@@ -520,7 +565,7 @@ evalTypeableProof = \case
   EValT (valSerProof -> Dict) -> Dict
   EValTMonad (monadTypeableProof -> Dict) (evalTypeableProof -> Dict) -> Dict
 
-deserValT :: Word8 -> ConsumeC (Obj Word64) (StateC ByteString (EmptyC AppIOC)) (Any1 ValT)
+deserValT :: Word8 -> ConsumeC (Obj Word64) DeserM (Any1 ValT)
 deserValT = \case
   0 -> do
     Any1 a <- deser
@@ -577,6 +622,7 @@ instance Ser (Any1 EValT) where
       Any1 a <- deser
       pure $ Any1 $ EValTMonad m a
 
+-- Do we need `a` here?
 data Val a = Val !(ValT a) !a
 data EVal a = EVal !(EValT a) !a
 
@@ -718,7 +764,7 @@ instance Typeable a => Ser (Delay a) where
 instance Typeable a => Ser (DelayApp a) where -- Actually, this task is mostly about serializing ust a list of [Res], which is already a thing.
 -- we could use some manipulations to cut costs and reuse existing functionality.
   ser = void . ser' 0 where
-    ser' :: forall b. Word8 -> DelayApp b -> WriterC (RevList (Obj (Any1 Res))) (WriterC Builder AppIOC) (EValT b)
+    ser' :: forall b. Word8 -> DelayApp b -> WriterC (RevList (Obj (Any1 Res))) SerM (EValT b)
     ser' args = \case
       DelayAppUnsafeFun f -> do
         putWord8 args *> ser f
@@ -732,7 +778,7 @@ instance Typeable a => Ser (DelayApp a) where -- Actually, this task is mostly a
       Any1 (Val valT _) <- fetch valR
       deser' args (DelayAppUnsafeFun valR) $ EValT valT
     where
-      deser' :: forall a1. Word8 -> DelayApp a1 -> EValT a1 -> ConsumeC (Obj Word64) (StateC ByteString (EmptyC AppIOC)) (DelayApp a)
+      deser' :: forall a1. Word8 -> DelayApp a1 -> EValT a1 -> ConsumeC (Obj Word64) DeserM (DelayApp a)
       deser' 0 d (evalTypeableProof -> Dict) = do
         HRefl <- maybe empty pure $ eqTypeRep (TypeRep @a1) (TypeRep @a)
         pure d

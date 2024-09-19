@@ -4,7 +4,6 @@ module Dentrado.POC.Db where
 import RIO
 import qualified Dentrado.POC.Data.RadixTree as RT
 import Control.Algebra
-import Dentrado.POC.Data.Container (Res (..), FreshIOC, ResPOC (..), alloc, Cast (cast), FreshIO, fetch)
 import Control.Applicative.Free (Ap, liftAp, runAp_, runAp)
 import Control.Effect.Fresh (Fresh)
 import Control.Carrier.State.Church (StateC)
@@ -13,203 +12,87 @@ import Control.Effect.State (get, put)
 import qualified Data.Data as D
 import qualified RIO.Partial as P
 import Dentrado.POC.TH (moduleId)
+import Dentrado.POC.Memory (AppIOC, (:->), Res, ValT, Val, M)
+import Dentrado.POC.Types (Any1)
+import Data.Dynamic (Dynamic)
+import Control.Carrier.Reader (ReaderC)
 
 $(moduleId 3)
 
--- To avoid problems with impredicativity, I'll try using monomorphic SnapshotC here.
-data AnyValue = forall a. Typeable a => AnyValue a
+{-
+We need a way to substitute sources of Gear without modifying the gear itself.
+So, uh, yes, AsmCtx, but how is it implemented?
+It would have been great to actually use Reader AsmCtx, so you're able to make global source
+substitutions, but "globality" could pose some issues in the long run.
 
-data Gear e a where
-  UnsafeGear :: forall cache e a. Typeable cache
-    => FreshIOC (cache, RT.SetR (GearId e))
-    -> (forall s. cache -> SnapshotC e s (cache, a))
-    -> (cache -> cache -> FreshIOC (RT.SetR (GearId e)) -> FreshIOC (Maybe (RT.SetR (GearId e))))
-    -> Gear e a
+When speaking of sources, do you mean "dynamic/external resources"?
+I believe yes, since they are changeable and the Gear already must have the functionality to
+handle the changes. However, this sounds more of a coincidence than some specific rule.
+For now, let's make it so only the dynamic sources are controlled by AsmCtx, later we'll rethink this approach if needed.
 
-data AnyGear e = forall b. Typeable b => AnyGear (Gear e b)
-instance Cast (Res (Gear e a)) (GearId e) where -- I have many questions, but probably not the best time to ask them
-  cast (Res i _) = ResPOC i
-type GearId e = ResPOC (AnyGear e)
+To better understand the structure, let's assume the following dynamic resources:
+* Gear (???)
+* Multi-source events. Specifically, cluster sources and bridges. Bridges later as replicating event stores.
+* External web data scraping & snapshotting
 
-data Snapshot e s (m :: Type -> Type) a where
-  SnapshotEvents :: Snapshot e s m e
-  SnapshotUnsafeReadGear :: Res (Gear e a) -> Snapshot e s m a
+---:
 
-data StorePOC e = StorePOC { events :: !e, gears :: !(RT.MapR (GearId e) AnyValue), gearsPins :: !(RT.MapR (GearId e) (RT.SetR (GearId e))) }
-newtype SnapshotC e s a = SnapshotC { runSnapshotC :: StateC (StorePOC e) FreshIOC a } -- Use RT
-  deriving (Functor, Applicative, Monad)
+okay... the idea of a global reader env sounds great and blah-blah, but, the problem is, different modules
+need different CTX, you know.
+Fine-grained ctx data is needed for better control anyways, whether right now or aas additional overlay.
+Also, if we make ctx fine-grained, we could make an assumption that each gear *is* sensitive to the CTX, and, on any change of the structure,
+Switch the underlying storage for saving the results.
+-}
 
-instance Algebra (Snapshot e s :+: FreshIO) (SnapshotC e s) where
-  alg hdl sig ctx = case sig of
-      L SnapshotEvents -> do
-        store <- SnapshotC $ get @(StorePOC e)
-        pure $ ctx $> store.events
-      L (SnapshotUnsafeReadGear gearR) -> do
-        store <- SnapshotC $ get @(StorePOC e)
-        let gearId = cast @_ @(GearId e) gearR
-        UnsafeGear initial upd getPinsUpd <- fetch gearR
-        (oldCache, initialPins) <- SnapshotC $
-          RT.lookup (RT.selEq gearId) store.gears >>= \case
-            Just x -> pure (P.fromJust $ D.cast x, Nothing)
-            Nothing -> second Just <$> lift initial
-        (newCache, output) <- upd oldCache
-        newGears <- RT.insert (RT.selEq gearId) (AnyValue newCache) store.gears
-        newPins <- SnapshotC $ lift $ getPinsUpd oldCache newCache (maybe (P.fromJust <$> RT.lookup (RT.selEq gearId) store.gearsPins) pure initialPins)
-        newGearsPins <- case newPins <|> initialPins of
-          Nothing -> pure store.gearsPins
-          Just x -> RT.insert (RT.selEq gearId) x store.gearsPins
-        SnapshotC $ put $ store { gears = newGears, gearsPins = newGearsPins }
-        pure $ ctx $> output
-      R other -> SnapshotC $ alg (runSnapshotC . hdl) (R other) ctx
+-- data AsmCtx = AsmCtx !(RT.Map Res (Res (Any1 Gear)) (Any1 Val)) -- TODO: does not update accordingly on ctx updates!
+--   , eventSources :: ![Word8]
+--   , }
+-- newtype Asm m a = Asm (ReaderC AsmCtx m a)
 
--- TODO: RT/DAG garbage collection & reachability
--- collectGarbage :: (RT.RadixTree
-
--- Monopair is used to perform monadic actions with two results.
--- It tries its best to share parts of the computation, but >>= could break sharing pretty quickly.
-
--- TODO: Evaluate performance... I believe it's not good. Check that places where Monopair is used don't break it.
-newtype Monopair m a = Monopair (forall b. (a -> m b) -> ((a, a) -> m b) -> m b)
-  deriving Functor
-
-runMonopair :: (a -> m b) -> ((a, a) -> m b) -> Monopair m a -> m b
-runMonopair p c (Monopair r) = r p c
-
-instance Applicative (Monopair m) where
-  pure x = Monopair \p _ -> p x
-  {-# INLINE pure #-}
-  Monopair r1 <*> Monopair r2 = Monopair \p choice -> r1
-    (\f -> r2 (p . f) (\(a1, a2) -> choice (f a1, f a2)))
-    (\(f1, f2) -> r2 (\a -> choice (f1 a, f2 a)) (\(a1, a2) -> choice (f1 a1, f2 a2)))
-  {-# INLINE (<*>) #-}
-
-monGetLRAnd :: ((a, a) -> a) -> Monopair m a -> (a -> m b) -> m b
-monGetLRAnd f m c = runMonopair c (c . f) m
-
-monTwo :: (a, a) -> Monopair m a
-monTwo a = Monopair \_ c -> c a
-
-instance Monad (Monopair m) where
-  Monopair aM >>= f = Monopair \p choice -> aM
-    (runMonopair p choice . f)
-    (\(a1, a2) -> monGetLRAnd fst (f a1) \b1 -> monGetLRAnd snd (f a2) \b2 -> choice (b1, b2))
-  {-# INLINE (>>=) #-}
+-- data Gear out where
+--   Gear :: ValT state -> state -> (state :-> Asm AppIOC (state, out)) -> Gear out
 
 {-
-instance Algebra sig m => Algebra (Choose :+: sig) (Monopair m) where
-  alg hdl sig ctx = Monopair \p choice -> case sig of
-      L Choose -> choice (ctx $> True, ctx $> False)
-      R other -> thread (dst ~<~ hdl) other (pure ctx) >>= run . runMonopair (coerce p) (coerce choice)
-    where
-      two :: (a, a) -> Monopair Identity a
-      two a = Monopair \_ c -> c a
-      dst :: Monopair Identity (Monopair m x1) -> m (Monopair Identity x1)
-      dst = run . runMonopair
-        (pure . runMonopair (pure . pure) (pure . two))
-        (pure . \(l, r) -> monGetLRAnd fst l \l' -> monGetLRAnd snd r \r' -> pure $ two (l', r'))
-  {-# INLINE alg #-}
 
-cascadeUpdate :: Monad m => (u -> a -> m (Maybe (u, a))) -> u -> a -> m a
-cascadeUpdate f origU origA = f origU origA >>= \case
-  Nothing -> pure origA
-  Just (u, a) -> cascadeUpdate f u a
+So, there are two things.
+First of all, there are actual gears that power the specific parts of the system.
+I. e. actual reactive cells.
 
--- invariant: keysOf origPins == keysOf oldUses
-collectGarbage :: forall sig m k. Has FreshIO sig m => RT.MapR k (RT.SetR k) -> RT.MapR k (RT.SetR k) -> RT.MapR k Int -> m (RT.MapR k (RT.SetR k), RT.MapR k Int)
-collectGarbage origPins newPins oldUses = do
-    _
-  where
-    mergePinUpds :: Res (RT.MapR k Integer) -> Res (RT.MapR k Integer) -> Monopair m (RT.MapR k Integer)
-    mergePinUpds = _
-    getRemovesAdds :: m (RT.MapR k Integer, RT.MapR k Integer)
-    getRemovesAdds = runMonopair (\x -> pure (x, x)) pure $
-      ($sFreshI $ RT.diffF
-        (\a b -> do
-          a' <- fetch a -- TODO: something needs to be done with Res (Maybe a)
-          case a' of
-            Nothing -> fetch b
-            Just a'' -> alloc a'' >>= \a''' -> mergePinUpds a''' b)
-        (const $ const \a b -> alloc =<< mergePinUpds a b)
-        (const alloc)
-        (pure RT.sEmpty)
-        AppForce
-        (alloc . Just <=< uncurry getUniquesInSets . RT.mapDiffEToPair RT.empty)
-      ) origPins newPins
-    getUniquesInSets :: RT.SetR k -> RT.SetR k -> Monopair m (RT.MapR k Integer)
-    getUniquesInSets = $sFreshI $ RT.diff AppForce \mapDiffE ->
-      case cast mapDiffE of
-        Nothing -> pure sNothing
-        Just RT.SetAdd -> monTwo (sNothing, sJust1)
-        Just RT.SetDel -> monTwo (sJust1, sNothing)
-    sJust1 = $sFreshI $ alloc (Just 1)
-    sSNil = $sFreshI $ alloc RT.sEmpty
+Second of all, there are templates, which could be provided with context (settings) to generate Gears.
+THEREFORE, factory is just a function CTX -> Gear ...
+That's it for the core of Dentrado, it could definitely work just this way.
+However, it's worth noting that Gears satisfy a law that they are pure in terms of input, so making a CTX -> Gear is not the most performant approach
+when there are quite a few similar Gears instantiated in the system.
+
+So, therefore, we could try to model gear as this:
+
 -}
-collectGarbage :: forall sig m k. Has FreshIO sig m => RT.MapR k (RT.SetR k) -> RT.MapR k (RT.SetR k) -> RT.MapR k Int -> m (RT.MapR k (RT.SetR k), RT.MapR k Int)
-collectGarbage _origPins newPins oldUses = traceM "gc unimplemented" $> (newPins, oldUses)
+data GearBuilder ctx out where
+  UnsafeGearBuilder :: ctx :-> M AppIOC (state :-> M AppIOC (state, out)) -> GearBuilder ctx out
+-- this is a normal, storeable value.
 
-data AssemblyF e s a where
-  AssemblyF :: Res (Gear e a) -> AssemblyF e s (SnapshotC e s a)
-type Assembly e s = Ap (AssemblyF e s)
+-- A "cached" version of GearBuilder, which still can be used as GearBuilder, but holds specific instantiation of ctx.
+-- data Gear ctx out where
+--   UnsafeGear ::
+--     GearBuilder ctx out ->
+--     Int {- pointer to the "external" resource being the state -} ->
+--     (state :-> M AppIOC (state, out)) -> Gear ctx out
 
-liftGear :: Res (Gear e a) -> Assembly e s (SnapshotC e s a)
-liftGear = liftAp . AssemblyF
+-- however, it's much better to not separate the "cache" from the Gear, making a built Gear an external resource in itself.
+data Gear ctx out where
+  UnsafeGear ::
+    GearBuilder ctx out ->
+    Int {- pointer to the external resource that stores (effective gear fn := cache) pair. -} ->
+    Gear ctx out
 
-newtype EndoM m a = EndoM { appEndoM :: a -> m a }
-instance Monad m => Semigroup (EndoM m a) where
-  EndoM a <> EndoM b = EndoM (a <=< b)
-instance Monad m => Monoid (EndoM m a) where
-  mempty = EndoM pure
+-- Therefore, external resources:
+-- 1) Can be indexed by multiple "full-formed" keys
+-- 2) Can be indexed by 1 and only 1 integer-based key, which gives access to a concrete kv-pair.
 
-withGear :: forall cache e s2 a sig1 m1. (Typeable cache, Has Fresh sig1 m1) => FreshIOC cache -> (forall s1. Assembly e s1 (cache -> SnapshotC e s1 (cache, a))) -> m1 (Assembly e s2 (SnapshotC e s2 a))
-withGear cacheM asm =
-  let deps = appEndoM
-        (runAp_
-          (\(AssemblyF gear) -> EndoM $ RT.insert (RT.selEq $ cast gear) ())
-          asm)
-        RT.empty
-      bodyf :: forall s3. cache -> SnapshotC e s3 (cache, a)
-      bodyf = run (runAp (\(AssemblyF gear) -> pure (send (SnapshotUnsafeReadGear @_ @_ @s3 gear))) asm)
-  in liftGear <$> alloc (UnsafeGear
-    ((,) <$> cacheM <*> deps)
-    bodyf
-    (const $ const $ const $ pure Nothing)
-  )
 
-{-
-Предположение: никакие два сервера и не имеют один и тот же ServerId.
-Если это всё же происходит, события с дублирующимся идентификатром сохраняются отдельно и не учитываются.
 
-Существует ли понятие кластера?
-Я думаю, что да. Физические устройства кому-то принадлежат. Следовательно, в конечном итоге
-они подчинены лицу, ими владеющими, а не "друг другу"
-Подобная система не предполагает, что различными устройствами кластера владеют разные личности, но подобный подход
-изначально небезопасный и его нужно избегать.
 
-Следовательно, существует кластер. В кластер входят устройства. Устройства подчиняются командам кластера.
-Команды управления кластером отдельны от иных событий и используются строго для того, чтобы *обновлять* текущее состояние
-кластера. Существует исключительно сейчас, следовательно, команды по типу Revoke/Inject не применимы к событиям-операциям над кластером.
 
-Всякое событие или помещается под тем идентификатором, под которым оно было задано источником, или вообще не размещается.
-По возможности используем ссылки не на EventId, а на Id (простые глобальные Fresh'ы), чтобы минимизировать проблемы с поражением истории
-
-Каждый новый запуск сервера создаёт новый лог, привязан к Timestamp.
-
-SERVERID = 0 IS RESERVED FOR CLUSTER OPERATIONS
-
-let Event = type < ClusterEvent : ClusterEvent | DataEvent : DataEvent >
-let ClusterEvent = type < Trust : { server : ServerId, do : Boolean } >
-type User = type < Core : {} | User : Id >
-let DataEvent = type 
-  { senderUser : Maybe User
-  , event :
-    < Now : SiteEvent
-    | Revoke : { event : EventId } 
-    | Inject : { time: Timestamp, event : SiteEvent } >}
-let SiteEvent = type
-  < SetUserLevel : { constrainedToThread : Id, level : < None | Member | Admin > }
-  | UpdateUser : { forceUser : User, val : { name : Maybe Text, password: Maybe () } }
-  | UpdatePost : { id : Id, val : { title : Maybe Text, value : Maybe Text, answers : Maybe Id } }>
--}
 
 -- I will strat prototyping things here, will move them out later. Thanks.
 
