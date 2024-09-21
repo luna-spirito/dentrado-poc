@@ -7,6 +7,7 @@ import Data.Kind (Type)
 
 data Dynamic1 f = forall a. Dynamic1 !(Type.Reflection.TypeRep a) !(f a)
 data Any1 f = forall a. Any1 !(f a)
+data Any2 f = forall a b. Any2 !(f a b)
 
 type Chunk = Word32
 

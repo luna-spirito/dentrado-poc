@@ -38,7 +38,7 @@ import Control.Effect.Sum (Member, inj)
 import Unsafe.Coerce (unsafeCoerce)
 import Data.ByteString.Unsafe as B
 import Data.Constraint (Dict(..), withDict)
-import Dentrado.POC.Types (Reducible(..), RadixTree, RadixChunk', readReducible, Dynamic1 (..), Any1 (..), Chunk)
+import Dentrado.POC.Types (Reducible(..), RadixTree, RadixChunk', readReducible, Dynamic1 (..), Any1 (..), Chunk, Any2)
 import qualified Type.Reflection as T
 
 $(moduleId 0)
@@ -76,7 +76,7 @@ class Cast a b where -- better to use one from lib. In any case, shouldn't be de
 instance Cast a a where
   cast = id
 
--- Resources and storage
+-- Resources
 
 -- res builtin
 data ResB a = ResB !Word64 {- no bang -} a
@@ -89,15 +89,46 @@ data Res a
   = ResBuiltin !(ResB a)
   | ResAlloc !(MVar (ResA a))
 
+-- Gears (I don't like that it's here)
+data GearUpd out state = GearUpd !(state :-> M AppIOC (state, out))
+data GearUpdCached out = forall state. GearUpdCached !(GearUpd out state) !state
+
+data GearBuilder ctx out where
+  UnsafeGearBuilder :: ctx :-> M AppIOC (Any1 (GearUpd out)) -> GearBuilder ctx out
+
+data Gear ctx out where
+  UnsafeGear ::
+    GearBuilder ctx out ->
+    Int {- pointer to the incremental GearUpdCached -} ->
+    Gear ctx out
+
 newtype EnvLoad = EnvLoad (forall a. Ser a => Word64 -> IO a)
 -- TODO ASAP: replace with RadixTree
 data Env = Env
-  { --envFreshInd :: !(IORef Int) -- POC-only
+  { -- envFreshInd :: !(IORef Int) -- POC-only
     envBuiltins :: !(IntMap Dynamic)
   , envKnown :: !(MVar (IntMap (Weak (Dynamic1 Res)))) -- Resources, known to RAM. May not even be actually loaded.
+  -- TODO: contention-free
   , envLoad :: !EnvLoad
-  , envKnownExt :: !(MVar (IntMap ([[Chunk]], Weak (Dynamic1 IORef)))) -- external resources known to RAM.
-  , envLocateExt :: !(MVar (RadixTree Res [Chunk] Word64)) -- maps full name of the external resource to the associated Word64
+  -- 
+  -- Problem: GearUpd is not IsRadixKey, and, if we force it to be IsRadixKey, it could horribly backfire
+  -- since it won't hold the reference to the original cell and it could be overriden.
+  -- Non-substitutable resources?
+  -- Usually we operate under the assumption that an existing resource can be easily switched for another.
+  -- However, this doesn't for RadixTree.
+  -- *Maybe* we should only the 
+  -- Just make all unsubstitutable, and perform merge by aliasing both indexes.
+  , envGearDescIndex :: !(MVar (RadixTree Res (Any2 GearUpd) Int))
+  , envGear :: !(MVar (IntMap (Dynamic1 GearUpdCached)))
+
+  , envEvents :: !(MVar [Any1 Val])
+  -- , envKnownExt :: !(MVar (IntMap ([[Chunk]], Weak (Dynamic1 IORef)))) -- external resources known to RAM.
+  -- , envLocateExt :: !(MVar (RadixTree Res [Chunk] Word64)) -- maps full name of the external resource to the associated Word64
+  -- Instead:
+  -- 1) Shortcutter (RadixTree from full name to the shorthand value (like Int). RADIX TREE specifically, so this is specifically
+  -- managed by the Resources & Resources-related garbage collection)
+  -- 2) 
+  -- Current approach: let's store all the things separately. Yeah, this could backfire horribly. But let's try.
   }
 
 {-
@@ -606,7 +637,7 @@ instance Ser (Any1 ValT) where
     ValTMaybe a -> putWord8 4 *> ser (Any1 a)
     ValTReducible a -> putWord8 5 *> ser (Any1 a)
     ValTRadixChunk c k v -> putWord8 6 *> ser (Any1 c) *> ser (Any1 k) *> ser (Any1 v)
-    -- >= 150 RESERVED FOR EVAL
+    -- >= 150 RESERVED FOR EVal
   deser = getWord8 >>= deserValT
 
 instance Ser (Any1 EValT) where

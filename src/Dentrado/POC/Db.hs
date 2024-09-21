@@ -69,6 +69,12 @@ So, therefore, we could try to model gear as this:
 -}
 data GearBuilder ctx out where
   UnsafeGearBuilder :: ctx :-> M AppIOC (state :-> M AppIOC (state, out)) -> GearBuilder ctx out
+
+data Gear ctx out where
+  UnsafeGear ::
+    GearBuilder ctx out ->
+    Int {- pointer to the external resource that stores (effective gear fn := cache) pair. -} ->
+    Gear ctx out
 -- this is a normal, storeable value.
 
 -- A "cached" version of GearBuilder, which still can be used as GearBuilder, but holds specific instantiation of ctx.
@@ -79,11 +85,6 @@ data GearBuilder ctx out where
 --     (state :-> M AppIOC (state, out)) -> Gear ctx out
 
 -- however, it's much better to not separate the "cache" from the Gear, making a built Gear an external resource in itself.
-data Gear ctx out where
-  UnsafeGear ::
-    GearBuilder ctx out ->
-    Int {- pointer to the external resource that stores (effective gear fn := cache) pair. -} ->
-    Gear ctx out
 
 -- Therefore, external resources:
 -- 1) Can be indexed by multiple "full-formed" keys
