@@ -177,19 +177,11 @@ class Typeable a => Ser a where
   ser :: a -> WriterC (RevList (Obj (Any1 Res))) SerM ()
   deser :: ConsumeC (Obj Word64) DeserM a
 
-  -- whether serialized form is equal. May come with false negatives.
-  -- eqSer a b = False is a lawful implementation.
-  -- No false positives allowed!
-  eqSer :: a -> a -> Bool
-
   default ser :: (Generic a, GSer (G.Rep a)) => a -> WriterC (RevList (Obj (Any1 Res))) SerM ()
   ser = gSer . G.from
 
   default deser :: (Generic a, GSer (G.Rep a)) => ConsumeC (Obj Word64) DeserM a
   deser = G.to <$> gDeser
-
-  default eqSer :: (Generic a, GSer (G.Rep a)) => a -> a -> Bool
-  eqSer a b = gEqSer (G.from a) (G.from b)
 
 getInd :: Res a -> AppIOC Word64
 getInd = \case
@@ -216,7 +208,6 @@ getWord8 = do
 instance Ser Word8 where
   ser = putWord8
   deser = getWord8
-  eqSer = (==)
 instance Ser Word32 where
   ser = tell . B.word32BE
   deser = do
@@ -229,7 +220,6 @@ instance Ser Word32 where
       (fromIntegral @_ @Word32 (old `B.unsafeIndex` 1) `unsafeShiftL` 16) .|.
       (fromIntegral @_ @Word32 (old `B.unsafeIndex` 2) `unsafeShiftL`  8) .|.
       fromIntegral @_ @Word32 (old `B.unsafeIndex` 3)
-  eqSer = (==)
 
 instance Ser Word64 where
   ser = tell . B.word64BE
@@ -245,13 +235,11 @@ instance Ser Word64 where
               (fromIntegral (old `B.unsafeIndex` 5) `unsafeShiftL` 16) .|.
               (fromIntegral (old `B.unsafeIndex` 6) `unsafeShiftL`  8) .|.
               (fromIntegral (old `B.unsafeIndex` 7) )
-  eqSer = (==)
 
 -- Hope this won't backfire...
 instance Ser Int where
   ser = ser @Word64 . fromIntegral
   deser = fromIntegral <$> deser @Word64
-  eqSer = (==)
 
 instance Ser a => Ser (Maybe a)
 
@@ -263,7 +251,6 @@ instance Typeable a => Ser (ResB a) where
       _notRes -> empty
     builtins <- asks envBuiltins
     pure $ ResB addr $ P.fromJust $ fromDynamic $ P.fromJust $ IMap.lookup (fromIntegral addr) builtins -- TODO-post-POC
-  eqSer (ResB i1 _) (ResB i2 _) = i1 == i2
 
 instance Typeable a => Ser (Res a) where
   ser x = tell @(RevList (Obj (Any1 Res))) [ObjRes $ Any1 x]
@@ -291,10 +278,6 @@ instance Typeable a => Ser (Res a) where
                 Just HRefl <- pure $ eqTypeRep (TypeRep @a) t2 -- TODO-post-POC: invent something to deal with this failure
                 pure existing
           ) (fromIntegral addr) oldKnown)
-  eqSer a b = case (a, b) of
-    (ResBuiltin a', ResBuiltin b') -> eqSer a' b'
-    (ResAlloc a', ResAlloc b') -> a' == b'
-    _ -> False
 
 instance (Ser a, Ser b) => Ser (a, b) where
   ser (a, b) = ser a *> ser b
@@ -308,12 +291,10 @@ instance (Container c, Ser a, Typeable c, Typeable k) => Ser (RadixChunk' c k a)
 class GSer (f :: k -> Type) where
   gSer :: f x -> WriterC (RevList (Obj (Any1 Res))) SerM ()
   gDeser :: ConsumeC (Obj Word64) DeserM (f x) -- probably better to encapsulate
-  gEqSer :: f x -> f x -> Bool
 
 class GSerSum (f :: k -> Type) where
   gSerSum :: Int -> f x -> WriterC (RevList (Obj (Any1 Res))) SerM ()
   gDeserSum :: Int -> ConsumeC (Obj Word64) DeserM (f x)
-  gEqSerSum :: f x -> f x -> Bool
 
 class GSumSize (f :: k -> Type) where
   sumSize :: Proxy f -> Int
@@ -336,60 +317,44 @@ instance (GSumSize a, GSerSum a, GSerSum b) => GSerSum (a G.:+: b) where
   gDeserSum i = if i >= sumSize (Proxy @a)
     then G.R1 <$> gDeserSum (i - sumSize (Proxy @a))
     else G.L1 <$> gDeserSum i
-  gEqSerSum a b = case (a, b) of
-    (G.L1 a', G.L1 b') -> gEqSerSum a' b'
-    (G.R1 a', G.R1 b') -> gEqSerSum a' b'
-    (G.L1 {}, G.R1 {}) -> False
-    (G.R1 {}, G.L1 {}) -> False
 gSerSum_ :: forall k (f :: k -> Type) x. GSer f => Int -> f x -> WriterC (RevList (Obj (Any1 Res))) SerM ()
 gSerSum_ i v = putWord8 (fromIntegral i) *> gSer v
 gDeserSum_ :: forall k (f :: k -> Type) x. GSer f => Int -> ConsumeC (Obj Word64) DeserM (f x)
 gDeserSum_ = \case
   0 -> error "invalid fresh"
   _ -> gDeser
-gEqSerSum_ :: GSer f => f x -> f x -> Bool
-gEqSerSum_ a b = gEqSer a b
 instance GSer (a G.:*: b) => GSerSum (a G.:*: b) where
   gSerSum = gSerSum_
   gDeserSum = gDeserSum_
-  gEqSerSum = gEqSerSum_
 instance GSerSum a => GSerSum (G.M1 i c a) where
   gSerSum i = gSerSum i . G.unM1
   gDeserSum i = G.M1 <$> gDeserSum i
-  gEqSerSum (G.M1 a) (G.M1 b) = gEqSerSum a b
 instance GSer (G.K1 c a :: k -> Type) => GSerSum (G.K1 c a :: k -> Type) where
   gSerSum = gSerSum_
   gDeserSum = gDeserSum_
-  gEqSerSum = gEqSerSum_
 instance GSerSum G.U1 where
   gSerSum = gSerSum_
   gDeserSum = gDeserSum_
-  gEqSerSum = gEqSerSum_
 
 instance GSerSum (a G.:+: b) => GSer (a G.:+: b) where
   gSer = gSerSum 0
   gDeser = do
     i <- getWord8
     gDeserSum (fromIntegral i)
-  gEqSer = gEqSerSum
 instance (GSer a, GSer b) => GSer (a G.:*: b) where
   gSer (a G.:*: b) = gSer a *> gSer b
   gDeser = do
     i <- getWord8
     gDeserSum (fromIntegral i)
-  gEqSer (a1 G.:*: a2) (b1 G.:*: b2) = gEqSer a1 b1 && gEqSer a2 b2
 instance GSer a => GSer (G.M1 i c a) where
   gSer = gSer . G.unM1
   gDeser = G.M1 <$> gDeser
-  gEqSer (G.M1 a) (G.M1 b) = gEqSer a b
 instance Ser a => GSer (G.K1 i a) where
   gSer (G.K1 a) = ser a
   gDeser = G.K1 <$> deser
-  gEqSer (G.K1 a) (G.K1 b) = eqSer a b
 instance GSer G.U1 where
   gSer G.U1 = pure ()
   gDeser = pure G.U1
-  gEqSer G.U1 G.U1 = True
 
 -- Reduce
 
@@ -437,7 +402,6 @@ reduce' (Proxy @s) = do
 instance Ser a => Ser (Reducible a) where
   ser = ser . readReducible
   deser = mkReducible <$> deser
-  eqSer a b = readReducible a `eqSer` readReducible b
 
 mkReducible :: a -> Reducible a
 mkReducible = Reducible . unsafePerformIO . newIORef
@@ -485,18 +449,6 @@ instance (Typeable a, Typeable b) => Ser (a :-> b) where
     _2 -> do
       Any1 (Val xT@(valSerProof -> Dict) x) <- deser
       FunCurry1 xT x <$> deser
-  eqSer a b = case (a, b) of
-    (FunBuiltin a', FunBuiltin b') -> a' `eqSer` b'
-    (FunBuiltin _, _) -> False
-    (FunCurry a', FunCurry b') -> case TypeRep @b of
-      _ `T.App` TypeRep `T.App` TypeRep
-        -> a' `eqSer` b'
-    (FunCurry _, _) -> False
-    (FunCurry1 @a' (valSerProof -> Dict) a' fa', FunCurry1 @b' (valSerProof -> Dict) b' fb') ->
-      case eqTypeRep (TypeRep @a') (TypeRep @b') of
-        Just HRefl -> a' `eqSer` b' && fa' `eqSer` fb'
-        Nothing -> False
-    (FunCurry1 {}, _) -> False
 
 funApp :: InferValT a => a :-> b -> a -> b
 funApp = funApp' inferValT
@@ -537,15 +489,6 @@ instance Ser (Any1 MonadT) where
     1 -> (\(Any1 x) -> Any1 $ MonadTReduceC x) <$> deser
     2 -> (\(Any1 x) -> Any1 $ MonadTReduceC1 x) <$> deser
     _3 -> (\(Any1 x) -> Any1 $ MonadTReduceC2 x) <$> deser
-  eqSer (Any1 a) (Any1 b) = case (a, b) of
-    (MonadTAppIOC, MonadTAppIOC) -> True
-    (MonadTAppIOC, _) -> False
-    (MonadTReduceC a', MonadTReduceC b') -> (Any1 a') `eqSer` (Any1 b')
-    (MonadTReduceC _, _) -> False
-    (MonadTReduceC1 a', MonadTReduceC1 b') -> (Any1 a') `eqSer` (Any1 b')
-    (MonadTReduceC1 _, _) -> False
-    (MonadTReduceC2 a', MonadTReduceC2 b') -> (Any1 a') `eqSer` (Any1 b')
-    (MonadTReduceC2 _, _) -> False
 
 monadTypeableProof :: MonadT m -> Dict (Typeable m)
 monadTypeableProof = \case
@@ -567,7 +510,6 @@ instance InferContainerT Res where
 instance Ser (Any1 ContainerT) where
   ser (Any1 ContainerTRes) = pure ()
   deser = pure $ Any1 ContainerTRes
-  eqSer (Any1 ContainerTRes) (Any1 ContainerTRes) = True
 
 containerContainerProof :: ContainerT a -> Dict (Container a)
 containerContainerProof = \case
@@ -680,21 +622,6 @@ instance Ser (Any1 ValT) where
     ValTRadixChunk c k v -> putWord8 6 *> ser (Any1 c) *> ser (Any1 k) *> ser (Any1 v)
     -- >= 150 RESERVED FOR EVal
   deser = getWord8 >>= deserValT
-  eqSer (Any1 a) (Any1 b) = case (a, b) of
-    (ValTFun aa ab, ValTFun ba bb) -> Any1 aa `eqSer` Any1 ba && Any1 ab `eqSer` Any1 bb
-    (ValTFun {}, _) -> False
-    (ValTTuple aa ab, ValTTuple ba bb) -> Any1 aa `eqSer` Any1 ba && Any1 ab `eqSer` Any1 bb
-    (ValTTuple {}, _) -> False
-    (ValTRadixTree ac ak av, ValTRadixTree bc bk bv) -> Any1 ac `eqSer` Any1 bc && Any1 ak `eqSer` Any1 bk && Any1 av `eqSer` Any1 bv
-    (ValTRadixTree {}, _) -> False
-    (ValTContainer aa ab, ValTContainer ba bb) -> Any1 aa `eqSer` Any1 ba && Any1 ab `eqSer` Any1 bb
-    (ValTContainer {}, _) -> False
-    (ValTMaybe a', ValTMaybe b') -> Any1 a' `eqSer` Any1 b'
-    (ValTMaybe {}, _) -> False
-    (ValTReducible a', ValTReducible b') -> Any1 a' `eqSer` Any1 b'
-    (ValTReducible {}, _) -> False
-    (ValTRadixChunk ac ak av, ValTRadixChunk bc bk bv) -> Any1 ac `eqSer` Any1 bc && Any1 ak `eqSer` Any1 bk && Any1 av `eqSer` Any1 bv
-    (ValTRadixChunk {}, _) -> False
 
 instance Ser (Any1 EValT) where
   ser (Any1 x) = case x of
@@ -708,11 +635,6 @@ instance Ser (Any1 EValT) where
       Any1 m <- deser
       Any1 a <- deser
       pure $ Any1 $ EValTMonad m a
-  eqSer (Any1 a) (Any1 b) = case (a, b) of
-    (EValT a', EValT b') -> Any1 a' `eqSer` Any1 b'
-    (EValT {}, _) -> False
-    (EValTMonad am av, EValTMonad bm bv) -> Any1 am `eqSer` Any1 bm && Any1 av `eqSer` Any1 bv
-    (EValTMonad {}, _) -> False
 
 -- Do we need `a` here?
 data Val a = Val !(ValT a) !a
@@ -756,7 +678,7 @@ class (forall a. Typeable a => Ser (t a), Typeable t) => Container t where
   wrap :: Res a -> t a
   unwrap' :: Has (AppIO :+: Reduce' s) sig m => Proxy s -> t a -> m (Res a)
   tryUnwrap :: t a -> Maybe (Res a)
-  same :: t a -> t b -> Bool -- more general form of eqSer
+  same :: t a -> t b -> Bool -- may have false negatives. `same a b = False` is a lawful implementation
 
 allocC :: (Container t, Has AppIO sig m, Ser a) => a -> m (t a)
 allocC x = wrap <$> alloc x

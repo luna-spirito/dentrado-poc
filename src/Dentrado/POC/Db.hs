@@ -25,38 +25,15 @@ import Data.Constraint (Dict(..))
 $(moduleId 3)
 
 -- Slow operation.
--- confGear' :: (Typeable ctx, InferValT ctx, Ser cache, Typeable out) =>
---   ValT cfg ->
---   ValT cache ->
---   Maybe (cfg, cache) ->
---   GearTemplate ctx out cache cfg ->
---   ctx ->
---   AppIOC (Gear ctx out)
--- confGear' cfgT cacheT oldInstantiation orTemplate@(UnsafeGearTemplate initCache conf _fn) ctx = do
---   cfg <- unM $ funApp' (ValTTuple inferValT (ValTMaybe cfgT)) conf (ctx, fst <$> oldInstantiation)
---   let gearFn = GearFn cfgT cfg orTemplate
---   serGearFn <- SerializedGearFn <$> unstableSerialized gearFn
---   gearsFnIndexV <- asks envGearsIndex
---   cache <- tryLazy gearsFnIndexV \gearsFnIndex ->
---     RT.upsertChurch (RT.selEq serGearFn) gearsFnIndex <&> \case
---       (Just exGearFn, _) -> Left exGearFn
---       (Nothing, ins) -> Right do
---         frV <- asks envFreshInd
---         ind <- atomicModifyIORef' frV \old -> (old + 1, old)
---         gearsV <- asks envGears
---         modifyMVar_ gearsV $ pure . IMap.insert ind (Dynamic TypeRep $ maybe initCache snd oldInstantiation)
---         (, ind) <$> ins ind
---   pure $ UnsafeGear cacheT gearFn cache
-
 confGear' :: (Typeable ctx, InferValT ctx, Ser cache, Typeable out) =>
-  ValT cfg ->
-  cfg ->
+  -- ValT cfg ->
+  -- cfg ->
   ValT cache ->
   cache ->
-  GearTemplate ctx out cache cfg ->
+  GearFn ctx out cache ->
+  -- GearTemplate ctx out cache cfg ->
   AppIOC (Gear ctx out)
-confGear' cfgT cfg cacheT forkedCache template = do
-  let gearFn = GearFn cfgT cfg template
+confGear' cacheT forkedCache gearFn = do
   serGearFn <- SerializedGearFn <$> unstableSerialized gearFn
   gearsFnIndexV <- asks envGearsIndex
   cache <- tryLazy gearsFnIndexV \gearsFnIndex ->
@@ -72,19 +49,16 @@ confGear' cfgT cfg cacheT forkedCache template = do
 
 confNewGear :: (Typeable ctx, InferValT ctx, InferValT cfg, InferValT cache, Ser cache, Typeable out) => GearTemplate ctx out cache cfg -> ctx -> AppIOC (Gear ctx out)
 confNewGear template@(UnsafeGearTemplate initCache conf _fn) ctx = do
-  cfg <- unM $ funApp' {-(ValTTuple inferValT (ValTMaybe cfgT))-} inferValT conf (ctx, Nothing)
-  confGear' inferValT cfg inferValT initCache template
+  cfg <- unM $ funApp' inferValT conf (ctx, Nothing)
+  confGear' inferValT initCache $ GearFn inferValT cfg template
 
 reconfGear :: (Typeable ctx, InferValT ctx, Typeable out) => Gear ctx out -> ctx -> AppIOC (Gear ctx out)
-reconfGear oldGear@(UnsafeGear cacheT@(valSerProof -> Dict) (GearFn cfgT oldCfg template@(UnsafeGearTemplate _ conf _)) oldCacheInd) newCtx = do
+reconfGear (UnsafeGear cacheT@(valSerProof -> Dict) (GearFn cfgT oldCfg template@(UnsafeGearTemplate _ conf _)) oldCacheInd) newCtx = do
   gearsV <- asks envGears
   oldCache <- P.fromJust . fromDynamic . P.fromJust . IMap.lookup oldCacheInd <$> sendAI (readMVar gearsV)
   newCfg <- unM $ funApp' (ValTTuple inferValT (ValTMaybe cfgT)) conf (newCtx, Just oldCfg)
-  if oldCfg == newCfg
-    then pure oldGear
-    else confGear' cfgT newCfg cacheT oldCache template--cfgT cacheT (Just (oldCfg, oldCache)) template newCtx
-
--- TODO: quickly: do not reconfigure if old ctx = new ctx, this is actually important!
+  -- TODO: optimization: early return if oldCfg == newCfg.
+  confGear' cacheT oldCache $ GearFn cfgT newCfg template
 
 runGear :: Gear ctx out -> AppIOC out
 runGear (UnsafeGear cacheT@(valSerProof -> Dict) (GearFn cfgT cfg (UnsafeGearTemplate _ _ fn)) cacheInd) = do
