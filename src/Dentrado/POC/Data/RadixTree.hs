@@ -18,11 +18,17 @@ import Control.Effect.Fresh (Fresh)
 import Language.Haskell.TH (Q, Exp, lamE, varE, appE, newName, varP)
 import Control.Carrier.Reader (runReader)
 import Data.Kind (Type)
-import Dentrado.POC.Memory (Res (..), Cast (..), Container (..), AppIO, Reduce' (..), Delay (..), ReduceC, AppIOC, AppForce(..), Reduce, RevList, AppDelay(..), Reduce'C (..), allocC, mkReducible, tryFetchC, reduce', runReduce, fetchC, reducible, revSnoc, sNothing, fetch, unwrap, mkDelayCache, runReduce', alloc, reducible', builtin, Ser, ResB (..), wrapB, (:->) (..), delayAppBuiltinFun, DelayApp (..), M (..), C (..), InferValT, InferContainerT)
+import Dentrado.POC.Memory (Res (..), Cast (..), Container (..), AppIO, Reduce' (..), Delay (..), ReduceC, AppIOC, AppForce(..), Reduce, RevList, AppDelay(..), Reduce'C (..), allocC, mkReducible, tryFetchC, reduce', runReduce, fetchC, reducible, revSnoc, sNothing, fetch, unwrap, mkDelayCache, runReduce', alloc, reducible', builtin, Ser, ResB (..), wrapB, (:->) (..), delayAppBuiltinFun, DelayApp (..), M (..), C (..), InferValT, InferContainerT, Serialized (..), SerializedGearFn (..))
 import Control.Effect.Writer (tell)
 import Dentrado.POC.Types (Chunk, RadixTree (..), RadixChunk, RadixChunk' (..), readReducible)
+import qualified Data.ByteString as B
+import qualified Data.ByteString.Unsafe as B
+import qualified Data.ByteString.Builder as B
 
 $(moduleId 1)
+
+-- TODO: path compression for really long unique keys
+-- TODO: proper church encoding.
 
 class IsRadixKey key where
   toRadixKey :: key -> [Chunk]
@@ -31,13 +37,25 @@ class IsRadixKey key where
 instance IsRadixKey [Chunk] where
   toRadixKey = id
   fromRadixKey = id
--- damn
--- instance IsRadixKey (ResPOC a) where
---   toRadixKey (ResPOC i) = [fromIntegral $ i `div` 4294967296, fromIntegral $ i `mod` 4294967296]
---   fromRadixKey = \case
---     [a, b] -> ResPOC $ fromIntegral a * 4294967296 + fromIntegral b
---     _nonTwo -> error "key corrupted" -- this is okay. But, the problem is, `fromRadixKey` is exposed.
---     -- So it's better to tie this to some newtype'd [Chunk]?
+
+-- TODO: UNSAFE
+-- Deal with it when implementing deduplication
+-- instance IsRadixKey ByteString where
+instance IsRadixKey (Serialized a) where
+  toRadixKey = \(UnsafeSerialized x) -> f x where
+    f (B.null -> True) = []
+    f b =
+      let x =
+            (fromIntegral @_ @Word32 (b `B.unsafeIndex` 0) `unsafeShiftL` 24) .|.
+            (fromIntegral @_ @Word32 (b `B.unsafeIndex` 1) `unsafeShiftL` 16) .|.
+            (fromIntegral @_ @Word32 (b `B.unsafeIndex` 2) `unsafeShiftL`  8) .|.
+            fromIntegral @_ @Word32 (b `B.unsafeIndex` 3)
+      in x : f (B.drop 4 b)
+  fromRadixKey =
+    UnsafeSerialized . toStrictBytes . B.toLazyByteString . mconcat . fmap B.word32BE
+instance IsRadixKey (SerializedGearFn) where
+  toRadixKey (SerializedGearFn x) = toRadixKey x
+  fromRadixKey = SerializedGearFn . fromRadixKey
 
 tryMask :: Chunk -> Chunk -> Maybe Bool
 tryMask mask key =
@@ -186,18 +204,21 @@ lookupKV k tr = runReduce $ join $ snd internalLookup [] k tr
 lookup :: (Has AppIO sig m, Selector sel (ReduceC m), Container c, IsRadixKey k, Ser a, Typeable k) => sel k STree -> RadixTree c k a -> m (Maybe a)
 lookup k tr = fmap snd <$> lookupKV k tr
 
+internalNested :: (Ser a, Container c, Algebra sig m, Has AppIO sig m, Typeable k) => a -> [Chunk] -> m (c (RadixChunk c k a))
+internalNested val ks = do
+  finalVal <- allocC $ Just val
+  (_state, res) <- foldrM
+    (\key (subval, subchunk) ->
+      (wrapB sNothing,) <$> allocC (mkReducible $ mkTipNonRe key $ RadixTree subval subchunk)) -- unlikely reduced
+    (finalVal, wrapB sNil)
+    ks
+  pure res
+
 internalInsert :: forall sel c k sig m a. (Selector sel m, Container c, Has (AppIO :+: Reduce) sig m, Ser a, Typeable k) => a -> (RevList Chunk -> sel k SChunk -> c (RadixChunk c k a) -> m (m (c (RadixChunk c k a))), RevList Chunk -> sel k STree -> RadixTree c k a -> m (m (RadixTree c k a)))
 internalInsert val = accessRadix
   (\a b -> RadixTree a <$> b)
   (\_ (RadixTree _oldVal b) -> (`RadixTree` b) <$> allocC (Just val))
-  (\key1 keys2 _ -> do
-    finalVal <- allocC $ Just val
-    (_state, res) <- foldrM
-      (\key (subval, subchunk) ->
-        (wrapB sNothing,) <$> allocC (mkReducible $ mkTipNonRe key $ RadixTree subval subchunk)) -- unlikely reduced
-      (finalVal, wrapB sNil)
-      (key1:keys2)
-    pure res)
+  (\key1 keys2 _ -> internalNested val (key1:keys2))
   (\k v -> allocC . mkReducible . mkTipNonRe k =<< v)
   (\k r a b -> allocC . mkReducible . mkBinNonRe k r a =<< b)
 {-# INLINE internalInsert #-}
@@ -207,6 +228,7 @@ insert :: (Selector sel (ReduceC m), Container c, Has AppIO sig m, Ser p, Typeab
 insert k v tr = runReduce $ join $ snd (internalInsert v) [] k tr
 
 -- could be m (f (...)), but I don't think it's worth it
+-- edit: probably needed, but probably overshadowed by the Church theme
 internalUpdate :: (Selector sel m, Container c, Has (AppIO :+: Reduce) sig m, Ser a, Typeable k)
   => (c (Maybe a) -> m (c (Maybe a))) -> (RevList Chunk -> sel k SChunk -> c (RadixChunk c k a) -> m (m (c (RadixChunk c k a))), RevList Chunk -> sel k STree -> RadixTree c k a -> m (m (RadixTree c k a)))
 internalUpdate f = accessRadix
@@ -233,6 +255,25 @@ pop k rt = runWriter (\(First a) b -> pure (a, b)) $ update
     pure $ wrapB sNothing
   )
   k rt
+
+upsertChurchInternal ::
+  (Selector sel (ReduceC m), Container c, Has AppIO sig m, Ser a, Typeable k, IsRadixKey k) =>
+    (RevList Chunk -> sel k SChunk -> c (RadixChunk c k a) -> ReduceC m (  ReduceC m (Maybe (k, a)), a -> m (c (RadixChunk c k a)) )
+    , RevList Chunk -> sel k STree -> RadixTree c k a -> ReduceC m (  ReduceC m (Maybe (k, a)), a -> m (RadixTree c k a) ))
+-- actually the snd part could work with any other monad, but I'm afraid to break the specialization at any step, needs testing.
+upsertChurchInternal = accessRadix
+  (\a (lookRes, ins) -> (lookRes, \newVal -> RadixTree a <$> ins newVal)) -- on sub, tree
+  (\(FinalPath k) (RadixTree exVal sub) -> (fmap (fromRadixKey k,) <$> fetchC exVal, \newVal -> (`RadixTree` sub) <$> allocC (Just newVal))) -- on found, tree
+  (\k1 ks _ -> (pure Nothing, \newVal -> internalNested newVal (k1:ks))) -- on missing, chunk
+  (\key (lookRes, ins) -> (lookRes, \newVal -> mkTip pure key =<< ins newVal)) -- on Tip, chunk
+  (\k r a (lookRes, ins) -> (lookRes, \newVal -> mkBin pure k r a =<< ins newVal)) -- on branch, chunk
+{-# INLINE upsertChurchInternal #-}
+
+upsertChurch :: (Container c, Has AppIO sig m, Selector sel (ReduceC m), Ser a, Typeable k, IsRadixKey k) => sel k STree -> RadixTree c k a -> m (Maybe a, a -> m (RadixTree c k a))
+upsertChurch sel tree = runReduce do
+  (lookRes1M, ins1) <- snd upsertChurchInternal [] sel tree
+  lookRes1 <- lookRes1M
+  pure (snd <$> lookRes1, ins1)
 
 -- misc
 

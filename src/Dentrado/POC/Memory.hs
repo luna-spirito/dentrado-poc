@@ -1,5 +1,4 @@
 {-# LANGUAGE DefaultSignatures #-}
-{-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE QuantifiedConstraints #-}
 module Dentrado.POC.Memory where
 
@@ -15,7 +14,7 @@ import RIO.List (uncons)
 import Control.Effect.State (get, put, State)
 import qualified GHC.Generics as G
 import Type.Reflection (pattern TypeRep, type (:~~:) (..), eqTypeRep)
-import Control.Carrier.Writer.Church (WriterC, Writer)
+import Control.Carrier.Writer.Church (WriterC, Writer, runWriter)
 import qualified Data.ByteString.Builder as B
 import Control.Effect.Writer (tell)
 import Control.Carrier.Empty.Church (EmptyC, runEmpty)
@@ -38,7 +37,7 @@ import Control.Effect.Sum (Member, inj)
 import Unsafe.Coerce (unsafeCoerce)
 import Data.ByteString.Unsafe as B
 import Data.Constraint (Dict(..), withDict)
-import Dentrado.POC.Types (Reducible(..), RadixTree, RadixChunk', readReducible, Dynamic1 (..), Any1 (..), Chunk, Any2)
+import Dentrado.POC.Types (Reducible(..), RadixTree, RadixChunk', readReducible, Dynamic1 (..), Any1 (..))
 import qualified Type.Reflection as T
 
 $(moduleId 0)
@@ -76,6 +75,15 @@ class Cast a b where -- better to use one from lib. In any case, shouldn't be de
 instance Cast a a where
   cast = id
 
+tryLazy :: MonadUnliftIO m => MVar a -> (a -> m (Either b (m (a, b)))) -> m b
+tryLazy xV f = do
+  xTry <- readMVar xV
+  f xTry >>= \case
+    Left res -> pure res
+    Right _ -> modifyMVar xV \x -> f x >>= \case
+      Left res -> pure (x, res)
+      Right act -> act
+
 -- Resources
 
 -- res builtin
@@ -84,117 +92,60 @@ data ResB a = ResB !Word64 {- no bang -} a
 data ResA a
   = Ser a => ResNew !a -- Ser to serialize, since serialization is a background job
   | ResUnloaded !Word64
-  | ResLoaded !a
+  | ResLoaded !Word64 !a
 data Res a
   = ResBuiltin !(ResB a)
   | ResAlloc !(MVar (ResA a))
 
--- Gears (I don't like that it's here)
-data GearUpd out state = GearUpd !(state :-> M AppIOC (state, out))
-data GearUpdCached out = forall state. GearUpdCached !(GearUpd out state) !state
-
-data GearBuilder ctx out where
-  UnsafeGearBuilder :: ctx :-> M AppIOC (Any1 (GearUpd out)) -> GearBuilder ctx out
-
-data Gear ctx out where
-  UnsafeGear ::
-    GearBuilder ctx out ->
-    Int {- pointer to the incremental GearUpdCached -} ->
-    Gear ctx out
+-- Env
 
 newtype EnvLoad = EnvLoad (forall a. Ser a => Word64 -> IO a)
+newtype EnvStore = EnvStore (forall a. Ser a => a -> IO Word64)
 -- TODO ASAP: replace with RadixTree
 data Env = Env
-  { -- envFreshInd :: !(IORef Int) -- POC-only
-    envBuiltins :: !(IntMap Dynamic)
+  { envFreshInd :: !(IORef Int) -- POC-only
+  , envBuiltins :: !(IntMap Dynamic)
   , envKnown :: !(MVar (IntMap (Weak (Dynamic1 Res)))) -- Resources, known to RAM. May not even be actually loaded.
   -- TODO: contention-free
   , envLoad :: !EnvLoad
-  -- 
-  -- Problem: GearUpd is not IsRadixKey, and, if we force it to be IsRadixKey, it could horribly backfire
-  -- since it won't hold the reference to the original cell and it could be overriden.
-  -- Non-substitutable resources?
-  -- Usually we operate under the assumption that an existing resource can be easily switched for another.
-  -- However, this doesn't for RadixTree.
-  -- *Maybe* we should only the 
-  -- Just make all unsubstitutable, and perform merge by aliasing both indexes.
-  , envGearDescIndex :: !(MVar (RadixTree Res (Any2 GearUpd) Int))
-  , envGear :: !(MVar (IntMap (Dynamic1 GearUpdCached)))
+  , envStore :: !EnvStore
+  -- In the future, we'll need to implement deduplication mechanism.
+  -- However, putting deduplicatable entities (those that contain Res)
+  -- *as keys* of the RadixTree breaks a lot.
+  -- We'll either have to teach the deduplicator handle RadixTree, or
+  -- we invent something stupid to make sure that those Res are left alone
+  -- and not affected by the deduplicator.
+  -- For the time being, we'll consider deduplicator a non-existant concept.
+  , envGearsIndex :: !(MVar (RadixTree Res SerializedGearFn Int))
+  , envGears :: !(MVar (IntMap Dynamic))
 
   , envEvents :: !(MVar [Any1 Val])
-  -- , envKnownExt :: !(MVar (IntMap ([[Chunk]], Weak (Dynamic1 IORef)))) -- external resources known to RAM.
-  -- , envLocateExt :: !(MVar (RadixTree Res [Chunk] Word64)) -- maps full name of the external resource to the associated Word64
-  -- Instead:
-  -- 1) Shortcutter (RadixTree from full name to the shorthand value (like Int). RADIX TREE specifically, so this is specifically
-  -- managed by the Resources & Resources-related garbage collection)
-  -- 2) 
-  -- Current approach: let's store all the things separately. Yeah, this could backfire horribly. But let's try.
   }
 
-{-
-Res существует для того, чтобы перенумеровать используемые данные таким образом, чтобы значительно сократить
-количество используемого пространства с использованием того наблюдения, что некие состояние редки и могут вовсе никогда не встречаться,
-а другие — переиспользуются в огромном количестве мест.
-
-Однако обратной стороной нумерации заключается то, что она не всегда идеальна,
-и некоторый элемент мы можем случайно занумеровать один и тот же
-элемент несколько раз.
-
-Предполагаем, что определить подобное можно только пост-фактум.
-Если это так, то получается, что Res... не сравним.
-
-Получается, что Res — PartialEq. Это не то что бы новость.
-
-В данный момент, получается, существует многов типов памяти (ой как мне это не нравится):
-1) Память событий.
-Она должна быть отдельной сущностью потому, что это критический компонент
-Базы Данных. Dentrado восстановим (хотя бы частично) без всяких других
-данных, но вот без истории событий он умрёт, окончательно
-и бесповоротно.
-2) Статическая память. Она может быть аллоцирована в рамках любого
-процесса Dentrado, но не является настолько критичным компонентом системы, так как...
-... ну, это просто память, в которой хранится кэш.
-ОЧЕНЬ нежелательно добавлять в эту память функцию обновления чего-либо, так как
-это именно что кэш, и должен быть кэш неизменяемым. Статическая память, однако,
-может делать ссылки на другие типы памяти (например, на подполе события)
-3) Внешние ресурсы по типу изображений. Иными словами, push-based данные.
-Замечания: события — объективно push-based.
-4) Gear. По умолчанию Gear — pull-based, но, возможно?!,
-используемый в pull-based контексте внезапно может потребоваться в push-based?!
-
-Предложение: события — внешний ресурс.
-
-Итого есть три типа ресурсов:
-1) Статические. Вообще не меняются со временем.
-2) Push-based. Обновляются по воле внешних явлений.
-3) Pull-based. Обнвляются только тогда, когда запрошен обновлённый результат, и только если обновлены некие pull-based.
-
-Вероятно, не стоит заботиться о том, какова модель внутреннего устройства, push- или pull-. Dentrado достаточно знать, что каждое
-чтение ячейки может её изменить.
-
- -}
-
-
--- the problem is. This method needs t
-
 newtype AppIOC a = AppIOC { unAppIOC :: ReaderC Env IO a }
-  deriving (Functor, Applicative, Monad)
+  deriving (Functor, Applicative, Monad, MonadIO, MonadUnliftIO)
 type AppIO = Lift AppIOC :+: Reader Env
-
-sendAIO :: Has AppIO sig m => IO a -> m a
-sendAIO = sendM . AppIOC . lift
-{-# INLINE sendAIO #-}
 
 instance Algebra AppIO AppIOC where
   alg hdl sig ctx = case sig of
     L (LiftWith f) -> f hdl ctx
     R other -> AppIOC $ alg (unAppIOC . hdl) (inj other) ctx
 
+sendAI :: Has AppIO sig m => AppIOC a -> m a
+sendAI = sendM
+{-# INLINE sendAI #-}
+
+-- sendAI :: Has AppIO sig m => AppIOC a -> m a
+-- sendAI = sendM . AppIOC . lift
+-- {-# INLINE sendAI #-}
+
 -- Serialization
 
+-- TODO: Track gears & events & ... & other externals as Obj
 data Obj r
   = ObjRes !r
-  | ObjExt !Word64 !ByteString
+  -- | ObjExt !Word64 !ByteString
+  -- I can't handle this at the moment.
 
 data Consume e (m :: Type -> Type) a where
   Consume :: Consume e m e
@@ -221,15 +172,36 @@ type DeserM = StateC ByteString (EmptyC AppIOC)
 
 -- | Serialization class.
 -- This class is used to serialize/deserialize objects.
-class Typeable a => Ser a where -- typeable is probably excessive, but is needed to "simplify" Ser (Res a)
+-- Typeable: not required, but I see no reason not to include it here, because this requirement appears everywhere.
+class Typeable a => Ser a where
   ser :: a -> WriterC (RevList (Obj (Any1 Res))) SerM ()
   deser :: ConsumeC (Obj Word64) DeserM a
+
+  -- whether serialized form is equal. May come with false negatives.
+  -- eqSer a b = False is a lawful implementation.
+  -- No false positives allowed!
+  eqSer :: a -> a -> Bool
 
   default ser :: (Generic a, GSer (G.Rep a)) => a -> WriterC (RevList (Obj (Any1 Res))) SerM ()
   ser = gSer . G.from
 
   default deser :: (Generic a, GSer (G.Rep a)) => ConsumeC (Obj Word64) DeserM a
   deser = G.to <$> gDeser
+
+  default eqSer :: (Generic a, GSer (G.Rep a)) => a -> a -> Bool
+  eqSer a b = gEqSer (G.from a) (G.from b)
+
+getInd :: Res a -> AppIOC Word64
+getInd = \case
+  ResBuiltin (ResB i _) -> pure i
+  ResAlloc xV -> do
+    EnvStore store <- asks envStore
+    sendAI $ tryLazy xV $ pure . \case
+      ResUnloaded i -> Left i
+      ResLoaded i _ -> Left i
+      ResNew o -> Right do
+        i <- liftIO $ store o
+        pure (ResLoaded i o, i)
 
 putWord8 :: Has (Writer Builder) sig m => Word8 -> m ()
 putWord8 = tell . B.word8
@@ -244,6 +216,7 @@ getWord8 = do
 instance Ser Word8 where
   ser = putWord8
   deser = getWord8
+  eqSer = (==)
 instance Ser Word32 where
   ser = tell . B.word32BE
   deser = do
@@ -256,6 +229,29 @@ instance Ser Word32 where
       (fromIntegral @_ @Word32 (old `B.unsafeIndex` 1) `unsafeShiftL` 16) .|.
       (fromIntegral @_ @Word32 (old `B.unsafeIndex` 2) `unsafeShiftL`  8) .|.
       fromIntegral @_ @Word32 (old `B.unsafeIndex` 3)
+  eqSer = (==)
+
+instance Ser Word64 where
+  ser = tell . B.word64BE
+  deser = do
+    old <- get
+    E.guard (B.length old >= 8)
+    put $ B.drop 8 old
+    return $! (fromIntegral (old `B.unsafeIndex` 0) `unsafeShiftL` 56) .|.
+              (fromIntegral (old `B.unsafeIndex` 1) `unsafeShiftL` 48) .|.
+              (fromIntegral (old `B.unsafeIndex` 2) `unsafeShiftL` 40) .|.
+              (fromIntegral (old `B.unsafeIndex` 3) `unsafeShiftL` 32) .|.
+              (fromIntegral (old `B.unsafeIndex` 4) `unsafeShiftL` 24) .|.
+              (fromIntegral (old `B.unsafeIndex` 5) `unsafeShiftL` 16) .|.
+              (fromIntegral (old `B.unsafeIndex` 6) `unsafeShiftL`  8) .|.
+              (fromIntegral (old `B.unsafeIndex` 7) )
+  eqSer = (==)
+
+-- Hope this won't backfire...
+instance Ser Int where
+  ser = ser @Word64 . fromIntegral
+  deser = fromIntegral <$> deser @Word64
+  eqSer = (==)
 
 instance Ser a => Ser (Maybe a)
 
@@ -267,6 +263,7 @@ instance Typeable a => Ser (ResB a) where
       _notRes -> empty
     builtins <- asks envBuiltins
     pure $ ResB addr $ P.fromJust $ fromDynamic $ P.fromJust $ IMap.lookup (fromIntegral addr) builtins -- TODO-post-POC
+  eqSer (ResB i1 _) (ResB i2 _) = i1 == i2
 
 instance Typeable a => Ser (Res a) where
   ser x = tell @(RevList (Obj (Any1 Res))) [ObjRes $ Any1 x]
@@ -284,7 +281,7 @@ instance Typeable a => Ser (Res a) where
                 alive <- maybe (pure False) (fmap isJust . deRefWeak) val
                 pure $ guard alive *> val
               ) (fromIntegral addr)
-        sendAIO $ modifyMVar knownM \oldKnown -> swap <$> getCompose (IMap.alterF (Compose . \existingWeak -> do
+        sendAI $ liftIO $ modifyMVar knownM \oldKnown -> swap <$> getCompose (IMap.alterF (Compose . \existingWeak -> do
             existingM <- maybe (pure Nothing) deRefWeak existingWeak
             case existingM of
               Nothing -> do
@@ -293,8 +290,11 @@ instance Typeable a => Ser (Res a) where
               Just (Dynamic1 t2 existing) -> (, existingWeak) <$> do
                 Just HRefl <- pure $ eqTypeRep (TypeRep @a) t2 -- TODO-post-POC: invent something to deal with this failure
                 pure existing
-
           ) (fromIntegral addr) oldKnown)
+  eqSer a b = case (a, b) of
+    (ResBuiltin a', ResBuiltin b') -> eqSer a' b'
+    (ResAlloc a', ResAlloc b') -> a' == b'
+    _ -> False
 
 instance (Ser a, Ser b) => Ser (a, b) where
   ser (a, b) = ser a *> ser b
@@ -308,10 +308,12 @@ instance (Container c, Ser a, Typeable c, Typeable k) => Ser (RadixChunk' c k a)
 class GSer (f :: k -> Type) where
   gSer :: f x -> WriterC (RevList (Obj (Any1 Res))) SerM ()
   gDeser :: ConsumeC (Obj Word64) DeserM (f x) -- probably better to encapsulate
+  gEqSer :: f x -> f x -> Bool
 
 class GSerSum (f :: k -> Type) where
   gSerSum :: Int -> f x -> WriterC (RevList (Obj (Any1 Res))) SerM ()
   gDeserSum :: Int -> ConsumeC (Obj Word64) DeserM (f x)
+  gEqSerSum :: f x -> f x -> Bool
 
 class GSumSize (f :: k -> Type) where
   sumSize :: Proxy f -> Int
@@ -334,44 +336,60 @@ instance (GSumSize a, GSerSum a, GSerSum b) => GSerSum (a G.:+: b) where
   gDeserSum i = if i >= sumSize (Proxy @a)
     then G.R1 <$> gDeserSum (i - sumSize (Proxy @a))
     else G.L1 <$> gDeserSum i
+  gEqSerSum a b = case (a, b) of
+    (G.L1 a', G.L1 b') -> gEqSerSum a' b'
+    (G.R1 a', G.R1 b') -> gEqSerSum a' b'
+    (G.L1 {}, G.R1 {}) -> False
+    (G.R1 {}, G.L1 {}) -> False
 gSerSum_ :: forall k (f :: k -> Type) x. GSer f => Int -> f x -> WriterC (RevList (Obj (Any1 Res))) SerM ()
 gSerSum_ i v = putWord8 (fromIntegral i) *> gSer v
 gDeserSum_ :: forall k (f :: k -> Type) x. GSer f => Int -> ConsumeC (Obj Word64) DeserM (f x)
 gDeserSum_ = \case
   0 -> error "invalid fresh"
   _ -> gDeser
+gEqSerSum_ :: GSer f => f x -> f x -> Bool
+gEqSerSum_ a b = gEqSer a b
 instance GSer (a G.:*: b) => GSerSum (a G.:*: b) where
   gSerSum = gSerSum_
   gDeserSum = gDeserSum_
+  gEqSerSum = gEqSerSum_
 instance GSerSum a => GSerSum (G.M1 i c a) where
   gSerSum i = gSerSum i . G.unM1
   gDeserSum i = G.M1 <$> gDeserSum i
+  gEqSerSum (G.M1 a) (G.M1 b) = gEqSerSum a b
 instance GSer (G.K1 c a :: k -> Type) => GSerSum (G.K1 c a :: k -> Type) where
   gSerSum = gSerSum_
   gDeserSum = gDeserSum_
+  gEqSerSum = gEqSerSum_
 instance GSerSum G.U1 where
   gSerSum = gSerSum_
   gDeserSum = gDeserSum_
+  gEqSerSum = gEqSerSum_
 
 instance GSerSum (a G.:+: b) => GSer (a G.:+: b) where
   gSer = gSerSum 0
   gDeser = do
     i <- getWord8
     gDeserSum (fromIntegral i)
+  gEqSer = gEqSerSum
 instance (GSer a, GSer b) => GSer (a G.:*: b) where
   gSer (a G.:*: b) = gSer a *> gSer b
   gDeser = do
     i <- getWord8
     gDeserSum (fromIntegral i)
+  gEqSer (a1 G.:*: a2) (b1 G.:*: b2) = gEqSer a1 b1 && gEqSer a2 b2
 instance GSer a => GSer (G.M1 i c a) where
   gSer = gSer . G.unM1
   gDeser = G.M1 <$> gDeser
+  gEqSer (G.M1 a) (G.M1 b) = gEqSer a b
 instance Ser a => GSer (G.K1 i a) where
   gSer (G.K1 a) = ser a
   gDeser = G.K1 <$> deser
+  gEqSer (G.K1 a) (G.K1 b) = eqSer a b
 instance GSer G.U1 where
   gSer G.U1 = pure ()
   gDeser = pure G.U1
+  gEqSer G.U1 G.U1 = True
 
 -- Reduce
 
@@ -390,7 +408,7 @@ type ReduceC = Reduce'C ""
 
 runReduce' :: forall s sig m a. Has AppIO sig m => Reduce'C s m a -> m a
 runReduce' (Reduce'C act) = do
-  flag <- sendAIO $ newIORef False
+  flag <- sendAI $ newIORef False
   runReader flag act
 
 runReduce :: forall sig m a. Has AppIO sig m => ReduceC m a -> m a
@@ -400,11 +418,11 @@ catchReduce :: Has (AppIO :+: Reduce' s) sig m => Proxy s -> m a -> Reduce'C s A
 catchReduce (Proxy @s) act onReduce = do
   flag <- send $ GetReduce' @s
   liftWith @AppIOC \hdl ctx -> do
-    let orig `overwriteWith` new = when (orig /= new) $ sendAIO $ writeIORef flag new
-    outerVal <- sendAIO $ readIORef flag
+    let orig `overwriteWith` new = when (orig /= new) $ sendAI $ writeIORef flag new
+    outerVal <- sendAI $ readIORef flag
     outerVal `overwriteWith` False
     res <- hdl (ctx $> act)
-    innerVal <- sendAIO $ readIORef flag
+    innerVal <- sendAI $ readIORef flag
     innerVal `overwriteWith` outerVal
     when innerVal $
       let (Reduce'C redAct) = onReduce
@@ -414,23 +432,24 @@ catchReduce (Proxy @s) act onReduce = do
 reduce' :: Has (AppIO :+: Reduce' s) sig m => Proxy s -> m ()
 reduce' (Proxy @s) = do
   flag <- send $ GetReduce' @s
-  sendAIO $ writeIORef flag True
+  sendAI $ writeIORef flag True
 
 instance Ser a => Ser (Reducible a) where
   ser = ser . readReducible
   deser = mkReducible <$> deser
+  eqSer a b = readReducible a `eqSer` readReducible b
 
 mkReducible :: a -> Reducible a
 mkReducible = Reducible . unsafePerformIO . newIORef
 
 reducible' :: Has (AppIO :+: Reduce' s) sig m => Proxy s -> (a -> Reduce'C s AppIOC a) -> Reducible a -> (a -> m b) -> m b
 reducible' proxy reductor (Reducible red) f = do
-  orig <- sendAIO $ readIORef red
+  orig <- sendAI $ readIORef red
   catchReduce proxy
     (f orig)
     do
       newValue <- reductor orig
-      sendAIO $ writeIORef red newValue
+      sendAI $ writeIORef red newValue
 
 reducible :: Has (AppIO :+: Reduce) sig m => (a -> ReduceC AppIOC a) -> Reducible a -> (a -> m b) -> m b
 reducible = reducible' (Proxy @"")
@@ -466,6 +485,18 @@ instance (Typeable a, Typeable b) => Ser (a :-> b) where
     _2 -> do
       Any1 (Val xT@(valSerProof -> Dict) x) <- deser
       FunCurry1 xT x <$> deser
+  eqSer a b = case (a, b) of
+    (FunBuiltin a', FunBuiltin b') -> a' `eqSer` b'
+    (FunBuiltin _, _) -> False
+    (FunCurry a', FunCurry b') -> case TypeRep @b of
+      _ `T.App` TypeRep `T.App` TypeRep
+        -> a' `eqSer` b'
+    (FunCurry _, _) -> False
+    (FunCurry1 @a' (valSerProof -> Dict) a' fa', FunCurry1 @b' (valSerProof -> Dict) b' fb') ->
+      case eqTypeRep (TypeRep @a') (TypeRep @b') of
+        Just HRefl -> a' `eqSer` b' && fa' `eqSer` fb'
+        Nothing -> False
+    (FunCurry1 {}, _) -> False
 
 funApp :: InferValT a => a :-> b -> a -> b
 funApp = funApp' inferValT
@@ -506,6 +537,15 @@ instance Ser (Any1 MonadT) where
     1 -> (\(Any1 x) -> Any1 $ MonadTReduceC x) <$> deser
     2 -> (\(Any1 x) -> Any1 $ MonadTReduceC1 x) <$> deser
     _3 -> (\(Any1 x) -> Any1 $ MonadTReduceC2 x) <$> deser
+  eqSer (Any1 a) (Any1 b) = case (a, b) of
+    (MonadTAppIOC, MonadTAppIOC) -> True
+    (MonadTAppIOC, _) -> False
+    (MonadTReduceC a', MonadTReduceC b') -> (Any1 a') `eqSer` (Any1 b')
+    (MonadTReduceC _, _) -> False
+    (MonadTReduceC1 a', MonadTReduceC1 b') -> (Any1 a') `eqSer` (Any1 b')
+    (MonadTReduceC1 _, _) -> False
+    (MonadTReduceC2 a', MonadTReduceC2 b') -> (Any1 a') `eqSer` (Any1 b')
+    (MonadTReduceC2 _, _) -> False
 
 monadTypeableProof :: MonadT m -> Dict (Typeable m)
 monadTypeableProof = \case
@@ -527,6 +567,7 @@ instance InferContainerT Res where
 instance Ser (Any1 ContainerT) where
   ser (Any1 ContainerTRes) = pure ()
   deser = pure $ Any1 ContainerTRes
+  eqSer (Any1 ContainerTRes) (Any1 ContainerTRes) = True
 
 containerContainerProof :: ContainerT a -> Dict (Container a)
 containerContainerProof = \case
@@ -639,6 +680,21 @@ instance Ser (Any1 ValT) where
     ValTRadixChunk c k v -> putWord8 6 *> ser (Any1 c) *> ser (Any1 k) *> ser (Any1 v)
     -- >= 150 RESERVED FOR EVal
   deser = getWord8 >>= deserValT
+  eqSer (Any1 a) (Any1 b) = case (a, b) of
+    (ValTFun aa ab, ValTFun ba bb) -> Any1 aa `eqSer` Any1 ba && Any1 ab `eqSer` Any1 bb
+    (ValTFun {}, _) -> False
+    (ValTTuple aa ab, ValTTuple ba bb) -> Any1 aa `eqSer` Any1 ba && Any1 ab `eqSer` Any1 bb
+    (ValTTuple {}, _) -> False
+    (ValTRadixTree ac ak av, ValTRadixTree bc bk bv) -> Any1 ac `eqSer` Any1 bc && Any1 ak `eqSer` Any1 bk && Any1 av `eqSer` Any1 bv
+    (ValTRadixTree {}, _) -> False
+    (ValTContainer aa ab, ValTContainer ba bb) -> Any1 aa `eqSer` Any1 ba && Any1 ab `eqSer` Any1 bb
+    (ValTContainer {}, _) -> False
+    (ValTMaybe a', ValTMaybe b') -> Any1 a' `eqSer` Any1 b'
+    (ValTMaybe {}, _) -> False
+    (ValTReducible a', ValTReducible b') -> Any1 a' `eqSer` Any1 b'
+    (ValTReducible {}, _) -> False
+    (ValTRadixChunk ac ak av, ValTRadixChunk bc bk bv) -> Any1 ac `eqSer` Any1 bc && Any1 ak `eqSer` Any1 bk && Any1 av `eqSer` Any1 bv
+    (ValTRadixChunk {}, _) -> False
 
 instance Ser (Any1 EValT) where
   ser (Any1 x) = case x of
@@ -652,6 +708,11 @@ instance Ser (Any1 EValT) where
       Any1 m <- deser
       Any1 a <- deser
       pure $ Any1 $ EValTMonad m a
+  eqSer (Any1 a) (Any1 b) = case (a, b) of
+    (EValT a', EValT b') -> Any1 a' `eqSer` Any1 b'
+    (EValT {}, _) -> False
+    (EValTMonad am av, EValTMonad bm bv) -> Any1 am `eqSer` Any1 bm && Any1 av `eqSer` Any1 bv
+    (EValTMonad {}, _) -> False
 
 -- Do we need `a` here?
 data Val a = Val !(ValT a) !a
@@ -669,19 +730,19 @@ instance Ser (Any1 Val) where
 -- Container
 
 alloc :: (Has AppIO sig m, Ser a) => a -> m (Res a)
-alloc v = ResAlloc <$> sendAIO (newMVar $ ResNew v)
+alloc v = ResAlloc <$> sendAI (newMVar $ ResNew v)
 
 fetch :: forall sig m a. (Has AppIO sig m, Ser a) => Res a -> m a
 fetch = \case
   ResBuiltin (ResB _ v) -> pure v
   ResAlloc ref -> do
     EnvLoad load <- asks envLoad
-    sendAIO $ modifyMVar ref \res' -> case res' of
-      ResNew v -> pure (res', v)
-      ResUnloaded k -> do
-        v <- load @a k
-        pure (ResLoaded v, v)
-      ResLoaded v -> pure (res', v)
+    sendAI $ tryLazy ref $ pure . \case
+      ResNew v -> Left v
+      ResLoaded _ v -> Left v
+      ResUnloaded k -> Right do
+        v <- liftIO $ load @a k
+        pure (ResLoaded k v, v)
 
 tryFetch :: Res a -> Maybe a
 tryFetch = \case
@@ -689,13 +750,13 @@ tryFetch = \case
   ResAlloc ref -> case unsafePerformIO $ readMVar ref of
     ResNew v -> Just v
     ResUnloaded _ -> Nothing
-    ResLoaded v -> Just v
+    ResLoaded _ v -> Just v
 
 class (forall a. Typeable a => Ser (t a), Typeable t) => Container t where
   wrap :: Res a -> t a
   unwrap' :: Has (AppIO :+: Reduce' s) sig m => Proxy s -> t a -> m (Res a)
   tryUnwrap :: t a -> Maybe (Res a)
-  same :: t a -> t b -> Bool
+  same :: t a -> t b -> Bool -- more general form of eqSer
 
 allocC :: (Container t, Has AppIO sig m, Ser a) => a -> m (t a)
 allocC x = wrap <$> alloc x
@@ -730,17 +791,17 @@ data DelayApp a where
   DelayApp :: !(DelayApp (C Res a :-> b)) -> !(Delay a) -> DelayApp b -- we could store (DelayApp a) as the second argument, but I believe this interface is good enough
 
 mkDelayCache :: Has AppIO sig m => DelayApp (M AppIOC (C Res a)) -> m (Delay a)
-mkDelayCache x = DelayCache x <$> sendAIO (newIORef Nothing)
+mkDelayCache x = DelayCache x <$> sendAI (newIORef Nothing)
 
 delayCache :: Has (AppIO :+: Reduce' s) sig m => Proxy s -> DelayApp (M AppIOC (C Res a)) -> IORef (Maybe (Res a)) -> m (Res a)
 delayCache (Proxy @s) actM memo =
-  sendAIO (readIORef memo) >>= \case
+  sendAI (readIORef memo) >>= \case
     Just res -> pure res
     Nothing -> do
       reduce' (Proxy @s)
       M act <- delayAppVal (Proxy @s) actM
       C res <- sendM act
-      sendAIO $ writeIORef memo (Just res)
+      sendAI $ writeIORef memo (Just res)
       pure res
 
 withUnsafeEq :: forall a b x. (a ~ b => x) -> x
@@ -790,7 +851,7 @@ instance Typeable a => Ser (Delay a) where
     DelayCache app _memo -> putWord8 1 *> ser app
   deser = getWord8 >>= \case
     0 -> DelayPin <$> deser
-    _1 -> DelayCache <$> deser <*> sendAIO (newIORef Nothing)
+    _1 -> DelayCache <$> deser <*> sendAI (newIORef Nothing)
 
 instance Typeable a => Ser (DelayApp a) where -- Actually, this task is mostly about serializing ust a list of [Res], which is already a thing.
 -- we could use some manipulations to cut costs and reuse existing functionality.
@@ -833,3 +894,43 @@ sNothing = $sFreshI $ builtin Nothing-- $sFreshI $ builtin Nothing
 
 delayAppBuiltinFun :: (Has Fresh sig m, InferValT a) => a -> m (DelayApp a)
 delayAppBuiltinFun x = DelayAppUnsafeFun . ResBuiltin <$> builtin (Any1 $ asVal x)
+
+-- Gears (I don't like that it's here)
+
+-- | A template of the Gear, which can be instantiated into GearFn.
+data GearTemplate ctx (out :: Type) cache cfg = UnsafeGearTemplate !cache !((ctx, Maybe cfg) :-> M AppIOC cfg) !((cfg, cache) :-> M AppIOC (out, cache))
+  deriving Generic
+-- | GearFn, an instantiated GearTemplate that only needs `cache` as input.
+data GearFn ctx out cache = forall cfg. GearFn !(ValT cfg) !cfg !(GearTemplate ctx out cache cfg)
+-- | Gear, a GearFn paired with a reference to the `cache` storage.
+data Gear ctx out = forall cache. UnsafeGear !(ValT cache) !(GearFn ctx out cache) !Int
+
+-- An object in it's serialized form. Padded to Chunk size.
+newtype Serialized a = UnsafeSerialized ByteString
+
+-- "unstable" in a sense that serializing an object twice
+-- does not necessarily yield the same result.
+-- TODO: dedup, this doesn't work with dedup, at all.
+unstableSerialized :: Ser a => a -> AppIOC (Serialized a)
+unstableSerialized x = do
+  (val, UnsafeRevList refs) <- runWriter (\a b -> pure (a, b)) $ runWriter (\a _ -> pure a) $ ser x
+  refsI <- for refs \(ObjRes (Any1 r)) -> getInd r
+  pure $
+    let
+      unpadded = toStrictBytes $ B.toLazyByteString $ val <> mconcat (B.word64BE <$> refsI)
+      padded =
+        let finalSegSize = B.length unpadded `mod` 4
+        in unpadded <> if finalSegSize == 0 -- yes, I hate myself
+          then mempty
+          else B.pack $ replicate (4 - finalSegSize) (0 :: Word8)
+    in UnsafeSerialized padded
+
+-- Right now I don't have a good idea of how this could be represented generically over both f (GearFn) and number of arguments in Haskell.
+data SerializedGearFn = forall ctx out state. SerializedGearFn (Serialized (GearFn ctx out state))
+
+instance (Typeable ctx, Typeable out, Ser state, Typeable cfg) => Ser (GearTemplate ctx out state cfg)
+instance (Typeable ctx, Typeable out, Ser state) => Ser (GearFn ctx out state) where
+  ser (GearFn cfgT@(valSerProof -> Dict) cfg fn) = ser (Any1 cfgT) *> ser cfg *> ser fn
+  deser = do
+    Any1 cfgT@(valSerProof -> Dict) <- deser
+    GearFn cfgT <$> deser <*> deser

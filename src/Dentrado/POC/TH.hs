@@ -12,7 +12,7 @@ data StaticFresh = StaticFresh !Word8 !Word8
 
 moduleId :: Word8 -> Q [a]
 moduleId x = do
-  when (x >= 127) $ fail "moduleId too huge"
+  when (x >= 255) $ fail "moduleId too huge"
   getQ >>= \case
     Nothing -> putQ (StaticFresh x 0) $> []
     Just (StaticFresh {}) -> fail "moduleId assigned twice"
@@ -25,7 +25,7 @@ sFresh = getQ >>= \case
     let newI = i + 1
     when (newI == 0) $ fail "Out of indexes"
     putQ $ StaticFresh modId newI
-    pure $ LitE $ IntegerL $ (fromIntegral modId `unsafeShiftL` 55) + (fromIntegral i `unsafeShiftL` 47) + (1 `unsafeShiftL` 62)
+    pure $ LitE $ IntegerL $ negate $ (fromIntegral modId `unsafeShiftL` 55) + (fromIntegral i `unsafeShiftL` 47)
 
 freshI :: Int -> FreshC Identity a -> a
 freshI x y = run $ evalFresh x y
