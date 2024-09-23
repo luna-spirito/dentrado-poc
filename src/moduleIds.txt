@@ -1,4 +1,4 @@
-0: Dentrado.POC.Data.Container
+0: Dentrado.POC.Data.Memory
 1: Dentrado.POC.Data.RadixTree
 2: Dentrado.POC.Data.RadixZipper
 3: Dentrado.POC.Db

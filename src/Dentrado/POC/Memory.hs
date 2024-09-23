@@ -37,7 +37,7 @@ import Control.Effect.Sum (Member, inj)
 import Unsafe.Coerce (unsafeCoerce)
 import Data.ByteString.Unsafe as B
 import Data.Constraint (Dict(..), withDict)
-import Dentrado.POC.Types (Reducible(..), RadixTree, RadixChunk', readReducible, Dynamic1 (..), Any1 (..))
+import Dentrado.POC.Types (Reducible(..), RadixTree, RadixChunk', readReducible, Dynamic1 (..), Any1 (..), Timestamp, Event, EventId, LocalId, SiteAccessLevel)
 import qualified Type.Reflection as T
 
 $(moduleId 0)
@@ -119,7 +119,7 @@ data Env = Env
   , envGearsIndex :: !(MVar (RadixTree Res SerializedGearFn Int))
   , envGears :: !(MVar (IntMap Dynamic))
 
-  , envEvents :: !(MVar [Any1 Val])
+  , envEvents :: !(MVar ([(EventId, Any1 Val)], Int))
   }
 
 newtype AppIOC a = AppIOC { unAppIOC :: ReaderC Env IO a }
@@ -134,10 +134,6 @@ instance Algebra AppIO AppIOC where
 sendAI :: Has AppIO sig m => AppIOC a -> m a
 sendAI = sendM
 {-# INLINE sendAI #-}
-
--- sendAI :: Has AppIO sig m => AppIOC a -> m a
--- sendAI = sendM . AppIOC . lift
--- {-# INLINE sendAI #-}
 
 -- Serialization
 
@@ -237,6 +233,7 @@ instance Ser Word64 where
               (fromIntegral (old `B.unsafeIndex` 7) )
 
 -- Hope this won't backfire...
+-- TODO: Redo with varint
 instance Ser Int where
   ser = ser @Word64 . fromIntegral
   deser = fromIntegral <$> deser @Word64
@@ -279,12 +276,30 @@ instance Typeable a => Ser (Res a) where
                 pure existing
           ) (fromIntegral addr) oldKnown)
 
+instance Ser Text where
+  ser a =
+    let encoded = encodeUtf8 a
+    in ser (B.length encoded) *> tell (B.byteString encoded)
+  deser = do
+    l :: Int <- deser
+    old <- get
+    put $ B.drop l old
+    either (const E.empty) pure $ decodeUtf8' $ B.take l old
+
 instance (Ser a, Ser b) => Ser (a, b) where
   ser (a, b) = ser a *> ser b
   deser = (,) <$> deser <*> deser
 
 instance (Container c, Ser a, Typeable c, Typeable k) => Ser (RadixTree c k a)
 instance (Container c, Ser a, Typeable c, Typeable k) => Ser (RadixChunk' c k a)
+
+-- POC stuff
+instance Ser Timestamp
+instance Ser LocalId
+instance Ser EventId
+
+instance Ser SiteAccessLevel
+instance Ser Event
 
 -- GSer
 
@@ -531,6 +546,7 @@ data ValT a where
   ValTMaybe :: !(ValT a) -> ValT (Maybe a)
   ValTReducible :: !(ValT a) -> ValT (Reducible a)
   ValTRadixChunk :: !(ContainerT c) -> !(ValT k) -> !(ValT v) -> ValT (RadixChunk' c k v)
+  ValTEvent :: ValT Event -- should not be here, but tolerable for POC
 
 -- EValT is an ephemeral extension of ValT. It includes types that
 -- cannot be easily serialized.
@@ -556,6 +572,8 @@ instance InferValT a => InferValT (Reducible a) where
   inferValT = ValTReducible inferValT
 instance (InferContainerT c, InferValT k, InferValT v) => InferValT (RadixChunk' c k v) where
   inferValT = ValTRadixChunk inferContainerT inferValT inferValT
+instance InferValT Event where
+  inferValT = ValTEvent
 
 class InferEValT a where
   inferEValT :: EValT a
@@ -573,6 +591,7 @@ valSerProof = \case
   ValTMaybe (valSerProof -> Dict) -> Dict
   ValTReducible (valSerProof -> Dict) -> Dict
   ValTRadixChunk (containerContainerProof -> Dict) (valSerProof -> Dict) (valSerProof -> Dict) -> Dict
+  ValTEvent -> Dict
 
 evalTypeableProof :: EValT x -> Dict (Typeable x)
 evalTypeableProof = \case
@@ -604,11 +623,12 @@ deserValT = \case
   5 -> do
     Any1 a <- deser
     pure $ Any1 $ ValTReducible a
-  _6 -> do
+  6 -> do
     Any1 c <- deser
     Any1 k <- deser
     Any1 v <- deser
     pure $ Any1 $ ValTRadixChunk c k v
+  _7 -> pure $ Any1 $ ValTEvent
   -- >= 150 RESERVED FOR EVAL
 
 instance Ser (Any1 ValT) where
@@ -620,6 +640,7 @@ instance Ser (Any1 ValT) where
     ValTMaybe a -> putWord8 4 *> ser (Any1 a)
     ValTReducible a -> putWord8 5 *> ser (Any1 a)
     ValTRadixChunk c k v -> putWord8 6 *> ser (Any1 c) *> ser (Any1 k) *> ser (Any1 v)
+    ValTEvent -> putWord8 7
     -- >= 150 RESERVED FOR EVal
   deser = getWord8 >>= deserValT
 
@@ -642,6 +663,10 @@ data EVal a = EVal !(EValT a) !a
 
 asVal :: InferValT a => a -> Val a
 asVal = Val inferValT
+
+tryFromVal :: forall a. Typeable a => Any1 Val -> Maybe a
+tryFromVal (Any1 (Val @b (valSerProof -> Dict) a)) =
+  (\HRefl -> a) <$> eqTypeRep (TypeRep @a) (TypeRep @b)
 
 instance Ser (Any1 Val) where
   ser (Any1 (Val t@(valSerProof -> Dict) v)) = ser (Any1 t) *> ser v

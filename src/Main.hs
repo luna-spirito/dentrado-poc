@@ -1,6 +1,8 @@
 {-# LANGUAGE ApplicativeDo             #-}
 module Main where
 
+import RIO
+{-
 import Dentrado.POC.Db
 import RIO
 import Dentrado.POC.Data
@@ -232,6 +234,7 @@ userByLogin = (getConst <$>) <$> withCache (mempty, mempty) do
 
 -- users :: Assembly Events m (m (HashMap EventId (TimeState EventId AccountData)))
 -- users = _
+-}
 
 main :: IO ()
 main = pure ()

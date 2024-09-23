@@ -20,7 +20,7 @@ import Control.Carrier.Reader (runReader)
 import Data.Kind (Type)
 import Dentrado.POC.Memory (Res (..), Cast (..), Container (..), AppIO, Reduce' (..), Delay (..), ReduceC, AppIOC, AppForce(..), Reduce, RevList, AppDelay(..), Reduce'C (..), allocC, mkReducible, tryFetchC, reduce', runReduce, fetchC, reducible, revSnoc, sNothing, fetch, unwrap, mkDelayCache, runReduce', alloc, reducible', builtin, Ser, ResB (..), wrapB, (:->) (..), delayAppBuiltinFun, DelayApp (..), M (..), C (..), InferValT, InferContainerT, Serialized (..), SerializedGearFn (..))
 import Control.Effect.Writer (tell)
-import Dentrado.POC.Types (Chunk, RadixTree (..), RadixChunk, RadixChunk' (..), readReducible)
+import Dentrado.POC.Types (Chunk, RadixTree (..), RadixChunk, RadixChunk' (..), readReducible, EventId (EventId), Timestamp (..), LocalId (..))
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Unsafe as B
 import qualified Data.ByteString.Builder as B
@@ -57,6 +57,12 @@ instance IsRadixKey (SerializedGearFn) where
   toRadixKey (SerializedGearFn x) = toRadixKey x
   fromRadixKey = SerializedGearFn . fromRadixKey
 
+instance IsRadixKey EventId where
+  toRadixKey (EventId (Timestamp a) (LocalId b)) = [a, b]
+  fromRadixKey = \case
+    [a, b] -> EventId (Timestamp a) (LocalId b)
+    _ -> error "key corrupted"
+
 tryMask :: Chunk -> Chunk -> Maybe Bool
 tryMask mask key =
   if prefixBits .&. mask == prefixBits .&. key
@@ -87,11 +93,12 @@ type SetR k = MapR k ()
 
 data MapDiffE v = MapAdd !v | MapUpd !v !v | MapDel !v
 
-mapDiffEToPair :: a -> MapDiffE a -> (a, a)
-mapDiffEToPair n = \case
-  MapAdd v -> (n, v)
-  MapUpd v1 v2 -> (v1, v2)
-  MapDel v -> (v, n)
+hdlMapDiffE :: Monad m => (v -> a -> m a) -> (v -> a -> m a) -> MapDiffE v -> a -> m a
+hdlMapDiffE onDel onAdd = \case
+  MapDel v -> onDel v
+  MapUpd v1 v2 -> onAdd v2 <=< onDel v1
+  MapAdd v -> onAdd v
+{-# INLINE hdlMapDiffE #-}
 
 data SetDiffE = SetAdd | SetDel
 
@@ -477,6 +484,7 @@ merge ::
     -> m2 (RadixTree cfin k fin))
 merge = mergeF (\a b -> pure $ RadixTree a b) (mkBin unwrap) (mkTip unwrap)
 
+-- suggestion: remove that
 {-
 sMerge :: Q Exp
 sMerge = do
@@ -556,6 +564,11 @@ diff :: (Has Fresh sig1 m1, MonadFix m1, AppMerge strat m2 c cfin, AppWither str
   -> (MapDiffE a -> m2 (Res (Maybe fin)))
   -> m1 (RadixTree c k a -> RadixTree c k a -> m2 (RadixTree cfin k fin))
 diff = diffF (\a b -> pure $ RadixTree a b) (mkBin unwrap) (mkTip unwrap) (pure $ wrapB sNil)
+
+diffId ::
+  (Ser a, Ser (MapDiffE a), InferValT k, InferValT a, InferValT (MapDiffE a), InferContainerT cfin, InferContainerT c, AppWither strat m2 c cfin, AppMerge strat m2 c cfin, Has AppIO sig m2, Typeable k) =>
+  strat -> RadixTree c k a -> RadixTree c k a -> m2 (RadixTree cfin k (MapDiffE a))
+diffId strat = $sFreshI $ diff strat $ alloc . Just
 
 -- selectors
 
