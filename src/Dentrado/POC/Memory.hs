@@ -37,7 +37,7 @@ import Control.Effect.Sum (Member, inj)
 import Unsafe.Coerce (unsafeCoerce)
 import Data.ByteString.Unsafe as B
 import Data.Constraint (Dict(..), withDict)
-import Dentrado.POC.Types (Reducible(..), RadixTree, RadixChunk', readReducible, Dynamic1 (..), Any1 (..), Timestamp, Event, EventId, LocalId, SiteAccessLevel)
+import Dentrado.POC.Types (Reducible(..), RadixTree, RadixChunk', readReducible, Dynamic1 (..), Any1 (..), Timestamp, Event, EventId, LocalId, SiteAccessLevel, MapDiffE)
 import qualified Type.Reflection as T
 
 $(moduleId 0)
@@ -292,6 +292,7 @@ instance (Ser a, Ser b) => Ser (a, b) where
 
 instance (Container c, Ser a, Typeable c, Typeable k) => Ser (RadixTree c k a)
 instance (Container c, Ser a, Typeable c, Typeable k) => Ser (RadixChunk' c k a)
+instance Ser a => Ser (MapDiffE a)
 
 -- POC stuff
 instance Ser Timestamp
@@ -547,6 +548,7 @@ data ValT a where
   ValTReducible :: !(ValT a) -> ValT (Reducible a)
   ValTRadixChunk :: !(ContainerT c) -> !(ValT k) -> !(ValT v) -> ValT (RadixChunk' c k v)
   ValTEvent :: ValT Event -- should not be here, but tolerable for POC
+  ValTMapDiffE :: ValT a -> ValT (MapDiffE a)
 
 -- EValT is an ephemeral extension of ValT. It includes types that
 -- cannot be easily serialized.
@@ -574,6 +576,8 @@ instance (InferContainerT c, InferValT k, InferValT v) => InferValT (RadixChunk'
   inferValT = ValTRadixChunk inferContainerT inferValT inferValT
 instance InferValT Event where
   inferValT = ValTEvent
+instance InferValT a => InferValT (MapDiffE a) where
+  inferValT = ValTMapDiffE inferValT
 
 class InferEValT a where
   inferEValT :: EValT a
@@ -592,6 +596,7 @@ valSerProof = \case
   ValTReducible (valSerProof -> Dict) -> Dict
   ValTRadixChunk (containerContainerProof -> Dict) (valSerProof -> Dict) (valSerProof -> Dict) -> Dict
   ValTEvent -> Dict
+  ValTMapDiffE (valSerProof -> Dict) -> Dict
 
 evalTypeableProof :: EValT x -> Dict (Typeable x)
 evalTypeableProof = \case
@@ -628,7 +633,10 @@ deserValT = \case
     Any1 k <- deser
     Any1 v <- deser
     pure $ Any1 $ ValTRadixChunk c k v
-  _7 -> pure $ Any1 $ ValTEvent
+  7 -> pure $ Any1 $ ValTEvent
+  _8 -> do
+    Any1 a <- deser
+    pure $ Any1 $ ValTMapDiffE a
   -- >= 150 RESERVED FOR EVAL
 
 instance Ser (Any1 ValT) where
@@ -641,6 +649,7 @@ instance Ser (Any1 ValT) where
     ValTReducible a -> putWord8 5 *> ser (Any1 a)
     ValTRadixChunk c k v -> putWord8 6 *> ser (Any1 c) *> ser (Any1 k) *> ser (Any1 v)
     ValTEvent -> putWord8 7
+    ValTMapDiffE a -> putWord8 8 *> ser (Any1 a)
     -- >= 150 RESERVED FOR EVal
   deser = getWord8 >>= deserValT
 

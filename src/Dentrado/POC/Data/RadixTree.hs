@@ -20,7 +20,7 @@ import Control.Carrier.Reader (runReader)
 import Data.Kind (Type)
 import Dentrado.POC.Memory (Res (..), Cast (..), Container (..), AppIO, Reduce' (..), Delay (..), ReduceC, AppIOC, AppForce(..), Reduce, RevList, AppDelay(..), Reduce'C (..), allocC, mkReducible, tryFetchC, reduce', runReduce, fetchC, reducible, revSnoc, sNothing, fetch, unwrap, mkDelayCache, runReduce', alloc, reducible', builtin, Ser, ResB (..), wrapB, (:->) (..), delayAppBuiltinFun, DelayApp (..), M (..), C (..), InferValT, InferContainerT, Serialized (..), SerializedGearFn (..))
 import Control.Effect.Writer (tell)
-import Dentrado.POC.Types (Chunk, RadixTree (..), RadixChunk, RadixChunk' (..), readReducible, EventId (EventId), Timestamp (..), LocalId (..))
+import Dentrado.POC.Types (Chunk, RadixTree (..), RadixChunk, RadixChunk' (..), readReducible, EventId (EventId), Timestamp (..), LocalId (..), MapDiffE (..))
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Unsafe as B
 import qualified Data.ByteString.Builder as B
@@ -63,6 +63,14 @@ instance IsRadixKey EventId where
     [a, b] -> EventId (Timestamp a) (LocalId b)
     _ -> error "key corrupted"
 
+instance IsRadixKey [EventId] where
+  toRadixKey = concatMap toRadixKey
+  fromRadixKey = \case
+    (a:b:xs) -> fromRadixKey @EventId [a, b] : fromRadixKey @[EventId] xs
+    [] -> []
+    _ -> error "key corrupted"
+
+
 tryMask :: Chunk -> Chunk -> Maybe Bool
 tryMask mask key =
   if prefixBits .&. mask == prefixBits .&. key
@@ -90,8 +98,6 @@ type Map = RadixTree
 type MapR = Map Res
 type Set = RadixTree
 type SetR k = MapR k ()
-
-data MapDiffE v = MapAdd !v | MapUpd !v !v | MapDel !v
 
 hdlMapDiffE :: Monad m => (v -> a -> m a) -> (v -> a -> m a) -> MapDiffE v -> a -> m a
 hdlMapDiffE onDel onAdd = \case

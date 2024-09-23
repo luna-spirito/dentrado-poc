@@ -30,6 +30,9 @@ data RadixChunk' c (k :: Type) a
   | Bin !Chunk !(c (RadixChunk c k a)) !(c (RadixChunk c k a)) -- Either branch can be accessed, so containerization
   deriving Generic
 
+data MapDiffE v = MapAdd !v | MapUpd !v !v | MapDel !v
+  deriving Generic
+
 newtype Timestamp = Timestamp Word32
   deriving (Eq, Ord, Generic)
 
@@ -53,3 +56,4 @@ data Event
   | CreateArticle EventId EventId -- user's login, site's creation
   | UpdateArticle EventId EventId Text -- user's login, article's creation, content
   deriving Generic
+

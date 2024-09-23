@@ -13,7 +13,7 @@ import qualified Data.Data as D
 import qualified RIO.Partial as P
 import Dentrado.POC.TH (moduleId)
 import Dentrado.POC.Memory (AppIOC, (:->) (..), Res, ValT (..), Val, M (..), Gear (..), funApp, InferValT (..), Env (..), unstableSerialized, tryLazy, GearTemplate (..), GearFn (..), SerializedGearFn (..), Ser, sendAI, funApp', valSerProof, builtin, tryFromVal, AppForce (..), Container)
-import Dentrado.POC.Types (Any1 (..), Dynamic1 (..), RadixTree, Timestamp (..), EventId, Event)
+import Dentrado.POC.Types (Any1 (..), Dynamic1 (..), RadixTree, Timestamp (..), EventId, Event (..))
 import Data.Dynamic (Dynamic (..), fromDynamic)
 import Control.Carrier.Reader (ReaderC)
 import Control.Effect.Reader (asks)
@@ -140,7 +140,7 @@ events = $sFreshI $ builtinUnsafeGearTemplate
 
 bucket ::
   (Has Fresh sig m, InferValT v, InferValT k, InferValT cache, InferValT cfg, InferValT ctx, Ser cache, Ser v, RT.IsRadixKey k, RT.IsRadixKey bucketK, Container c, Typeable k, Typeable ctx, Typeable bucketK) =>
-  (v -> Maybe bucketK) ->
+  (v -> [bucketK]) ->
   GearTemplate ctx (RadixTree Res k v) cache cfg ->
   m (GearTemplate ctx (RadixTree Res bucketK (RadixTree c k v)) (RadixTree Res k v, RadixTree Res bucketK (RadixTree c k v)) (Gear ctx (RadixTree Res k v)))
 bucket semaphore inputGearTemplate = builtinUnsafeGearTemplate
@@ -149,14 +149,15 @@ bucket semaphore inputGearTemplate = builtinUnsafeGearTemplate
   \(inputGear, (oldInp, oldBuckets)) -> do
     newInp <- runGear inputGear
     let updBuckets buckets1 (k, vD) =
-          let upd1Bucket updater v buckets = case semaphore v of
-                Nothing -> pure buckets
-                Just targetBucketK -> do
+          let updWith updater v buckets2 = foldM
+                (\buckets targetBucketK -> do
                   (fromMaybe RT.empty -> targetBucket, ins) <- RT.upsertChurch (RT.selEq targetBucketK) buckets
-                  ins =<< updater v targetBucket
+                  ins =<< updater v targetBucket)
+                buckets2
+                (semaphore v)
           in RT.hdlMapDiffE
-            (upd1Bucket $ const $ RT.delete (RT.selEq k))
-            (upd1Bucket $ RT.insert (RT.selEq k))
+            (updWith $ const $ RT.delete (RT.selEq k))
+            (updWith $ RT.insert (RT.selEq k))
             vD
             buckets1
     newBuckets <- foldM
@@ -164,3 +165,14 @@ bucket semaphore inputGearTemplate = builtinUnsafeGearTemplate
       oldBuckets
       =<< RT.toListM @Res =<< RT.diffId AppForce oldInp newInp
     pure (newBuckets, (newInp, newBuckets))
+
+objsFor :: Event -> [EventId]
+objsFor = \case
+  Register -> []
+  Login reg -> [reg]
+  CreateSite login -> [login]
+  SetSiteAccessLevel login site usr _lvl -> [login, site, usr]
+  CreateArticle login site -> [login, site]
+  UpdateArticle login art _ -> [login, art]
+
+  
