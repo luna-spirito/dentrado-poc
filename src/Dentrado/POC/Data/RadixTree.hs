@@ -24,6 +24,7 @@ import Dentrado.POC.Types (Chunk, RadixTree (..), RadixChunk, RadixChunk' (..), 
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Unsafe as B
 import qualified Data.ByteString.Builder as B
+import qualified RIO.NonEmpty as NE
 
 $(moduleId 1)
 
@@ -33,10 +34,16 @@ $(moduleId 1)
 class IsRadixKey key where
   toRadixKey :: key -> [Chunk]
   fromRadixKey :: [Chunk] -> key
+  -- LAW: a `compare` b = toRadixKey a `compare` toRadixKey b
 
 instance IsRadixKey [Chunk] where
   toRadixKey = id
   fromRadixKey = id
+instance IsRadixKey Chunk where
+  toRadixKey = pure
+  fromRadixKey = \case
+    [x] -> x
+    _ -> error "key corrupted"
 
 -- TODO: UNSAFE
 -- Deal with it when implementing deduplication
@@ -78,6 +85,7 @@ tryMask mask key =
   else Nothing
   where
     prefixBits = complement $ mask - 1 `xor` mask
+{-# INLINE tryMask #-}
 
 makeMask :: Chunk -> Chunk -> (Chunk, Bool)
 makeMask l r =
@@ -510,6 +518,9 @@ sMerge = do
     )
 -}
 
+onOneErase :: Applicative m => OnOne (RadixChunk c2 k1 a) m c1 k2 this fin
+onOneErase = OnOne (const $ const $ pure $ wrapB sNothing) (const $ pure $ wrapB sNil)
+
 -- TODO: get rid of alloc's, first of all by creating a Maybe (Rec a) ~ Rec (Maybe a) isomorphism?
 onOneKeep :: Applicative m => OnOne (RadixChunk c k fin) m c k fin fin
 onOneKeep = OnOne (const . pure) pure
@@ -576,6 +587,10 @@ diffId ::
   strat -> RadixTree c k a -> RadixTree c k a -> m2 (RadixTree cfin k (MapDiffE a))
 diffId strat = $sFreshI $ diff strat $ alloc . Just
 
+intersection :: (AppMerge p m c2 c2, Has AppIO sig m, InferContainerT c2, InferValT two, InferValT fin,  InferValT k2, Ser two, Ser fin, Typeable k2) => p -> RadixTree c2 k2 fin -> RadixTree c2 k2 two -> m (RadixTree c2 k2 fin)
+intersection strat = $sFreshI $ merge strat onOneErase onOneErase (OnBoth \a _ _ _ -> pure a) $ Just $
+  OnSame (\l _ -> pure l) (\l _ -> pure l) (\l _ -> pure l) (\l _ -> pure l)
+
 -- selectors
 
 data family SelEq k t -- access equal to key
@@ -639,6 +654,38 @@ max = runNonDet
     r' -> pure r')
   (pure . Just)
   (pure Nothing)
+
+-- range
+
+-- Something's wrong here.
+
+-- `Maybe` stands for Unrestricted.
+-- `Bool` stands for inclusive?
+-- data Range = Range !(Maybe (Bool, NonEmpty Chunk)) !(Maybe (NonEmpty Chunk, Bool))
+
+-- splitRange :: Chunk -> Range -> (Maybe Range, Maybe Range)
+-- splitRange mask (Range lM rM) =
+--   let
+--     hasLeftSubrange = maybe True (maybe False (== False) . tryMask mask . NE.head . snd) lM
+--     hasRightSubrange = maybe True (maybe False (== True) . tryMask mask . NE.head . fst) rM
+--   in
+--     ( if hasLeftSubrange then Just (Range lM (if hasRightSubrange then Nothing else rM)) else Nothing
+--     , if hasRightSubrange then Just (Range (if hasLeftSubrange then Nothing else lM) rM) else Nothing)
+
+-- unconsRange :: Chunk -> Range -> Maybe Range
+-- unconsRange key (Range lM rM) =
+--   let
+--     isWithinLeft = maybe True ((key >=) . NE.head . snd) lM
+--     isWithinRight = maybe True ((key <=) . NE.head . fst) rM
+--   in if isWithinLeft && isWithinRight
+--     then Just $ Range
+--       (lM >>= \case
+--         (inc, x1 :| x2 : xs) | x1 == key -> Just (inc, x2 :| xs)
+--         _ -> Nothing)
+--       (rM >>= \case
+--         (x1 :| x2 : xs, inc) | x1 == key -> Just (x2 :| xs, inc)
+--         _ -> Nothing)
+--     else Nothing
 
 -- construction
 

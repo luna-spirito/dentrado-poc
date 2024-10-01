@@ -39,8 +39,11 @@ import Data.ByteString.Unsafe as B
 import Data.Constraint (Dict(..), withDict)
 import Dentrado.POC.Types (Reducible(..), RadixTree, RadixChunk', readReducible, Dynamic1 (..), Any1 (..), Timestamp, Event, EventId, LocalId, SiteAccessLevel, MapDiffE)
 import qualified Type.Reflection as T
+import qualified RIO.List as L
 
 $(moduleId 0)
+
+-- TODO: remove Typeable checks?..
 
 -- Misc
 
@@ -201,45 +204,6 @@ getWord8 = do
   put new
   pure x
 
-instance Ser Word8 where
-  ser = putWord8
-  deser = getWord8
-instance Ser Word32 where
-  ser = tell . B.word32BE
-  deser = do
-    old <- get
-    E.guard (B.length old >= 4)
-    put $ B.drop 4 old
-    -- https://hackage.haskell.org/package/cereal-0.5.8.3/docs/src/Data.Serialize.Get.html#getWord32be
-    pure $
-      (fromIntegral @_ @Word32 (old `B.unsafeIndex` 0) `unsafeShiftL` 24) .|.
-      (fromIntegral @_ @Word32 (old `B.unsafeIndex` 1) `unsafeShiftL` 16) .|.
-      (fromIntegral @_ @Word32 (old `B.unsafeIndex` 2) `unsafeShiftL`  8) .|.
-      fromIntegral @_ @Word32 (old `B.unsafeIndex` 3)
-
-instance Ser Word64 where
-  ser = tell . B.word64BE
-  deser = do
-    old <- get
-    E.guard (B.length old >= 8)
-    put $ B.drop 8 old
-    return $! (fromIntegral (old `B.unsafeIndex` 0) `unsafeShiftL` 56) .|.
-              (fromIntegral (old `B.unsafeIndex` 1) `unsafeShiftL` 48) .|.
-              (fromIntegral (old `B.unsafeIndex` 2) `unsafeShiftL` 40) .|.
-              (fromIntegral (old `B.unsafeIndex` 3) `unsafeShiftL` 32) .|.
-              (fromIntegral (old `B.unsafeIndex` 4) `unsafeShiftL` 24) .|.
-              (fromIntegral (old `B.unsafeIndex` 5) `unsafeShiftL` 16) .|.
-              (fromIntegral (old `B.unsafeIndex` 6) `unsafeShiftL`  8) .|.
-              (fromIntegral (old `B.unsafeIndex` 7) )
-
--- Hope this won't backfire...
--- TODO: Redo with varint
-instance Ser Int where
-  ser = ser @Word64 . fromIntegral
-  deser = fromIntegral <$> deser @Word64
-
-instance Ser a => Ser (Maybe a)
-
 instance Typeable a => Ser (ResB a) where
   ser x = tell @(RevList (Obj (Any1 Res))) [ObjRes $ Any1 $ ResBuiltin x]
   deser = do
@@ -276,6 +240,50 @@ instance Typeable a => Ser (Res a) where
                 pure existing
           ) (fromIntegral addr) oldKnown)
 
+instance Ser ()
+instance (Ser a, Ser b) => Ser (a, b) where
+  ser (a, b) = ser a *> ser b
+  deser = (,) <$> deser <*> deser
+
+instance Ser Word8 where
+  ser = putWord8
+  deser = getWord8
+instance Ser Word32 where
+  ser = tell . B.word32BE
+  deser = do
+    old <- get
+    E.guard (B.length old >= 4)
+    put $ B.drop 4 old
+    -- https://hackage.haskell.org/package/cereal-0.5.8.3/docs/src/Data.Serialize.Get.html#getWord32be
+    pure $
+      (fromIntegral @_ @Word32 (old `B.unsafeIndex` 0) `unsafeShiftL` 24) .|.
+      (fromIntegral @_ @Word32 (old `B.unsafeIndex` 1) `unsafeShiftL` 16) .|.
+      (fromIntegral @_ @Word32 (old `B.unsafeIndex` 2) `unsafeShiftL`  8) .|.
+      fromIntegral @_ @Word32 (old `B.unsafeIndex` 3)
+instance Ser Word64 where
+  ser = tell . B.word64BE
+  deser = do
+    old <- get
+    E.guard (B.length old >= 8)
+    put $ B.drop 8 old
+    return $! (fromIntegral (old `B.unsafeIndex` 0) `unsafeShiftL` 56) .|.
+              (fromIntegral (old `B.unsafeIndex` 1) `unsafeShiftL` 48) .|.
+              (fromIntegral (old `B.unsafeIndex` 2) `unsafeShiftL` 40) .|.
+              (fromIntegral (old `B.unsafeIndex` 3) `unsafeShiftL` 32) .|.
+              (fromIntegral (old `B.unsafeIndex` 4) `unsafeShiftL` 24) .|.
+              (fromIntegral (old `B.unsafeIndex` 5) `unsafeShiftL` 16) .|.
+              (fromIntegral (old `B.unsafeIndex` 6) `unsafeShiftL`  8) .|.
+              (fromIntegral (old `B.unsafeIndex` 7) )
+-- Hope this won't backfire...
+-- TODO: Redo with varint
+instance Ser Int where
+  ser = ser @Word64 . fromIntegral
+  deser = fromIntegral <$> deser @Word64
+
+instance Ser a => Ser (Maybe a)
+instance Ser a => Ser [a] where
+  ser l = ser (L.length l) *> for_ l ser
+
 instance Ser Text where
   ser a =
     let encoded = encodeUtf8 a
@@ -285,10 +293,6 @@ instance Ser Text where
     old <- get
     put $ B.drop l old
     either (const E.empty) pure $ decodeUtf8' $ B.take l old
-
-instance (Ser a, Ser b) => Ser (a, b) where
-  ser (a, b) = ser a *> ser b
-  deser = (,) <$> deser <*> deser
 
 instance (Container c, Ser a, Typeable c, Typeable k) => Ser (RadixTree c k a)
 instance (Container c, Ser a, Typeable c, Typeable k) => Ser (RadixChunk' c k a)
@@ -549,6 +553,13 @@ data ValT a where
   ValTRadixChunk :: !(ContainerT c) -> !(ValT k) -> !(ValT v) -> ValT (RadixChunk' c k v)
   ValTEvent :: ValT Event -- should not be here, but tolerable for POC
   ValTMapDiffE :: ValT a -> ValT (MapDiffE a)
+  ValTUnit :: ValT ()
+  ValTInt :: ValT Int
+  ValTEventId :: ValT EventId
+  ValTGear :: ValT ctx -> EValT out -> ValT (Gear ctx out)
+  ValTWord32 :: ValT Word32
+  -- ValTValGear :: ValT ctx -> ValT (ValGear ctx)
+  ValTList :: ValT a -> ValT [a]
 
 -- EValT is an ephemeral extension of ValT. It includes types that
 -- cannot be easily serialized.
@@ -578,6 +589,20 @@ instance InferValT Event where
   inferValT = ValTEvent
 instance InferValT a => InferValT (MapDiffE a) where
   inferValT = ValTMapDiffE inferValT
+instance InferValT () where
+  inferValT = ValTUnit
+instance InferValT Int where
+  inferValT = ValTInt
+instance InferValT EventId where
+  inferValT = ValTEventId
+instance (InferValT ctx, InferEValT out) => InferValT (Gear ctx out) where
+  inferValT = ValTGear inferValT inferEValT
+instance InferValT Word32 where
+  inferValT = ValTWord32
+-- instance InferValT ctx => InferValT (ValGear ctx) where
+--   inferValT = ValTValGear inferValT
+instance InferValT a => InferValT [a] where
+  inferValT = ValTList inferValT
 
 class InferEValT a where
   inferEValT :: EValT a
@@ -597,6 +622,13 @@ valSerProof = \case
   ValTRadixChunk (containerContainerProof -> Dict) (valSerProof -> Dict) (valSerProof -> Dict) -> Dict
   ValTEvent -> Dict
   ValTMapDiffE (valSerProof -> Dict) -> Dict
+  ValTUnit -> Dict
+  ValTInt -> Dict
+  ValTEventId -> Dict
+  ValTGear (valSerProof -> Dict) (evalTypeableProof -> Dict) -> Dict
+  ValTWord32 -> Dict
+  -- ValTValGear (valSerProof -> Dict) -> Dict
+  ValTList (valSerProof -> Dict) -> Dict
 
 evalTypeableProof :: EValT x -> Dict (Typeable x)
 evalTypeableProof = \case
@@ -633,10 +665,24 @@ deserValT = \case
     Any1 k <- deser
     Any1 v <- deser
     pure $ Any1 $ ValTRadixChunk c k v
-  7 -> pure $ Any1 $ ValTEvent
-  _8 -> do
+  7 -> pure $ Any1 ValTEvent
+  8 -> do
     Any1 a <- deser
     pure $ Any1 $ ValTMapDiffE a
+  9 -> pure $ Any1 ValTUnit
+  10 -> pure $ Any1 ValTInt
+  11 -> pure $ Any1 ValTEventId
+  12 -> do
+    Any1 ctx <- deser
+    Any1 out <- deser
+    pure $ Any1 $ ValTGear ctx out
+  13 -> pure $ Any1 ValTWord32
+  14 -> do
+    Any1 ctx <- deser
+    pure $ Any1 $ ValTValGear ctx
+  _15 -> do
+    Any1 a <- deser
+    pure $ Any1 $ ValTList a
   -- >= 150 RESERVED FOR EVAL
 
 instance Ser (Any1 ValT) where
@@ -650,6 +696,13 @@ instance Ser (Any1 ValT) where
     ValTRadixChunk c k v -> putWord8 6 *> ser (Any1 c) *> ser (Any1 k) *> ser (Any1 v)
     ValTEvent -> putWord8 7
     ValTMapDiffE a -> putWord8 8 *> ser (Any1 a)
+    ValTUnit -> putWord8 9
+    ValTInt -> putWord8 10
+    ValTEventId -> putWord8 11
+    ValTGear ctx out -> putWord8 12 *> ser (Any1 ctx) *> ser (Any1 out)
+    ValTWord32 -> putWord8 13
+    -- ValTValGear ctx -> putWord8 14 *> ser (Any1 ctx)
+    ValTList a -> putWord8 15 *> ser (Any1 a)
     -- >= 150 RESERVED FOR EVal
   deser = getWord8 >>= deserValT
 
@@ -861,6 +914,27 @@ data GearFn ctx out cache = forall cfg. GearFn !(ValT cfg) !cfg !(GearTemplate c
 -- | Gear, a GearFn paired with a reference to the `cache` storage.
 data Gear ctx out = forall cache. UnsafeGear !(ValT cache) !(GearFn ctx out cache) !Int
 
+instance (Typeable ctx, Typeable out, Ser state, Typeable cfg) => Ser (GearTemplate ctx out state cfg)
+instance (Typeable ctx, Typeable out, Ser state) => Ser (GearFn ctx out state) where
+  ser (GearFn cfgT@(valSerProof -> Dict) cfg fn) = ser (Any1 cfgT) *> ser cfg *> ser fn
+  deser = do
+    Any1 cfgT@(valSerProof -> Dict) <- deser
+    GearFn cfgT <$> deser <*> deser
+instance (Typeable ctx, Typeable out) => Ser (Gear ctx out) where
+  ser (UnsafeGear cacheT@(valSerProof -> Dict) fn cache) = ser (Any1 cacheT) *> ser fn *> ser cache
+  deser = do
+    Any1 cacheT@(valSerProof -> Dict) <- deser
+    UnsafeGear cacheT <$> deser <*> deser
+
+-- data ValGear ctx = forall out. ValGear !(ValT out) !(Gear ctx out)
+
+-- instance Typeable ctx => Ser (ValGear ctx) where
+--   ser (ValGear outT@(valSerProof -> Dict) gear) = ser (Any1 outT) *> ser gear
+--   deser = do
+--     Any1 outT@(valSerProof -> Dict) <- deser
+--     gear <- deser
+--     pure $ ValGear outT gear
+
 -- An object in it's serialized form. Padded to Chunk size.
 newtype Serialized a = UnsafeSerialized ByteString
 
@@ -883,10 +957,3 @@ unstableSerialized x = do
 
 -- Right now I don't have a good idea of how this could be represented generically over both f (GearFn) and number of arguments in Haskell.
 data SerializedGearFn = forall ctx out state. SerializedGearFn (Serialized (GearFn ctx out state))
-
-instance (Typeable ctx, Typeable out, Ser state, Typeable cfg) => Ser (GearTemplate ctx out state cfg)
-instance (Typeable ctx, Typeable out, Ser state) => Ser (GearFn ctx out state) where
-  ser (GearFn cfgT@(valSerProof -> Dict) cfg fn) = ser (Any1 cfgT) *> ser cfg *> ser fn
-  deser = do
-    Any1 cfgT@(valSerProof -> Dict) <- deser
-    GearFn cfgT <$> deser <*> deser

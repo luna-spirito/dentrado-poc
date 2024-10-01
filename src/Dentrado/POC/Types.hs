@@ -49,11 +49,14 @@ data SiteAccessLevel = SalNone | SalUser | SalModerator | SalAdmin
   deriving Generic
 
 data Event
-  = Register
-  | Login EventId -- user's registration
-  | CreateSite EventId -- user's login
-  | SetSiteAccessLevel EventId EventId EventId SiteAccessLevel -- admin's login, site's creation, user's registration
-  | CreateArticle EventId EventId -- user's login, site's creation
-  | UpdateArticle EventId EventId Text -- user's login, article's creation, content
+  = Register -- #0
+  | Login EventId -- #1: user's registration
+  -- UpdateProfile #2
+  | CreateSite EventId -- #3: user's login
+  | SetSiteAccessLevel EventId EventId EventId SiteAccessLevel -- #4: admin's login, site's creation, user's registration
+  -- Rate #5
+  | CreateMessage EventId EventId -- #6: user's login, site's creation
+  | UpdateMessage EventId EventId Text -- #7: user's login, article's creation, content
+  -- Connect/disconnect messages
   deriving Generic
 
