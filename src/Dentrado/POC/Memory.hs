@@ -677,9 +677,9 @@ deserValT = \case
     Any1 out <- deser
     pure $ Any1 $ ValTGear ctx out
   13 -> pure $ Any1 ValTWord32
-  14 -> do
-    Any1 ctx <- deser
-    pure $ Any1 $ ValTValGear ctx
+  -- 14 -> do
+  --   Any1 ctx <- deser
+  --   pure $ Any1 $ ValTValGear ctx
   _15 -> do
     Any1 a <- deser
     pure $ Any1 $ ValTList a

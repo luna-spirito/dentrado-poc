@@ -661,31 +661,30 @@ max = runNonDet
 
 -- `Maybe` stands for Unrestricted.
 -- `Bool` stands for inclusive?
--- data Range = Range !(Maybe (Bool, NonEmpty Chunk)) !(Maybe (NonEmpty Chunk, Bool))
+data Range = Range !(Maybe (Bool, NonEmpty Chunk)) !(Maybe (NonEmpty Chunk, Bool))
 
--- splitRange :: Chunk -> Range -> (Maybe Range, Maybe Range)
--- splitRange mask (Range lM rM) =
---   let
---     hasLeftSubrange = maybe True (maybe False (== False) . tryMask mask . NE.head . snd) lM
---     hasRightSubrange = maybe True (maybe False (== True) . tryMask mask . NE.head . fst) rM
---   in
---     ( if hasLeftSubrange then Just (Range lM (if hasRightSubrange then Nothing else rM)) else Nothing
---     , if hasRightSubrange then Just (Range (if hasLeftSubrange then Nothing else lM) rM) else Nothing)
+splitRange :: Chunk -> Range -> (Maybe Range, Maybe Range)
+splitRange mask (Range lM rM) =
+  let
+    hasLeftSubrange = maybe True (maybe False (== False) . tryMask mask . NE.head . snd) lM
+    hasRightSubrange = maybe True (maybe False (== True) . tryMask mask . NE.head . fst) rM
+  in
+    ( if hasLeftSubrange then Just (Range lM (if hasRightSubrange then Nothing else rM)) else Nothing
+    , if hasRightSubrange then Just (Range (if hasLeftSubrange then Nothing else lM) rM) else Nothing)
 
--- unconsRange :: Chunk -> Range -> Maybe Range
--- unconsRange key (Range lM rM) =
---   let
---     isWithinLeft = maybe True ((key >=) . NE.head . snd) lM
---     isWithinRight = maybe True ((key <=) . NE.head . fst) rM
---   in if isWithinLeft && isWithinRight
---     then Just $ Range
---       (lM >>= \case
---         (inc, x1 :| x2 : xs) | x1 == key -> Just (inc, x2 :| xs)
---         _ -> Nothing)
---       (rM >>= \case
---         (x1 :| x2 : xs, inc) | x1 == key -> Just (x2 :| xs, inc)
---         _ -> Nothing)
---     else Nothing
+unconsRange :: Chunk -> Range -> Either Bool Range
+unconsRange key (Range lM rM) =
+  let
+    isWithinLeft = maybe True ((key >=) . NE.head . snd) lM
+    isWithinRight = maybe True ((key <=) . NE.head . fst) rM
+  in if isWithinLeft && isWithinRight -- uncons shouldn't handle all the Writes since, for example, there is a 
+    then case rM of
+      Just (x :| _, inclusive)
+        | x == key -> Left inclusive
+      _ -> Right $ Range
+        (lM >>= \(inc, l) -> (inc,) <$> snd (NE.uncons l))
+        (rM >>= \(r, inc) -> (,inc) <$> snd (NE.uncons r))
+    else Left False
 
 -- construction
 
