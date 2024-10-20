@@ -1,7 +1,7 @@
 {-# LANGUAGE RecursiveDo, PatternSynonyms #-}
 {-# LANGUAGE ConstraintKinds #-}
 module Dentrado.POC.Data.RadixTree where
-import RIO hiding (lookup, Set, Map, mask, toList, catch, runReader)
+import RIO hiding (lookup, Set, Map, mask, toList, catch, runReader, (<|>))
 import Data.Bits (countTrailingZeros, (.&.), unsafeShiftR, complement, xor, finiteBitSize, unsafeShiftL, (.|.), countLeadingZeros)
 import Control.Algebra
 import Data.Foldable (foldrM)
@@ -10,10 +10,10 @@ import Control.Carrier.Writer.Church (WriterC, runWriter)
 import Control.Monad.Fix (MonadFix)
 import Data.Monoid (First(..))
 import Control.Effect.NonDet (NonDet)
-import Control.Effect.Choose (Choose(..))
+import Control.Effect.Choose (Choose(..), (<|>))
 import qualified Control.Effect.Empty as E
 import GHC.Exts (IsList(..))
-import Control.Carrier.NonDet.Church (runNonDet, NonDetC, runNonDetA)
+import Control.Carrier.NonDet.Church (runNonDet, NonDetC (..), runNonDetA)
 import Control.Effect.Fresh (Fresh)
 import Language.Haskell.TH (Q, Exp, lamE, varE, appE, newName, varP)
 import Control.Carrier.Reader (runReader)
@@ -25,6 +25,10 @@ import qualified Data.ByteString as B
 import qualified Data.ByteString.Unsafe as B
 import qualified Data.ByteString.Builder as B
 import qualified RIO.NonEmpty as NE
+import Control.Effect.Empty (Empty (..))
+import Data.Coerce (coerce)
+import Control.Monad.Free (Free (..))
+import Data.Functor.Compose (Compose (..))
 
 $(moduleId 1)
 
@@ -113,6 +117,13 @@ hdlMapDiffE onDel onAdd = \case
   MapUpd v1 v2 -> onAdd v2 <=< onDel v1
   MapAdd v -> onAdd v
 {-# INLINE hdlMapDiffE #-}
+
+mkMapDiffE :: Maybe a -> Maybe a -> Maybe (MapDiffE a)
+mkMapDiffE a b = case (a, b) of
+  (Nothing, Nothing) -> Nothing
+  (Nothing, Just b') -> Just $ MapAdd b'
+  (Just a', Nothing) -> Just $ MapDel a'
+  (Just a', Just b') -> Just $ MapUpd a' b'
 
 data SetDiffE = SetAdd | SetDel
 
@@ -607,54 +618,158 @@ instance Applicative m => Selector SelEq m where
   selNil (SelEqC key keys) = pure (key, keys)
 
 selEq :: IsRadixKey k => k -> SelEq k STree
-selEq k =
-  let k' = toRadixKey k
-  in SelEqT k'
+selEq = SelEqT . toRadixKey
 
 -- I'm writing this for the forth time or something.
 -- Me, please, DO NOT DELETE THIS.
-data family SelChoose k t -- access existing value by choosing
+data family SelNonDet k t -- access existing value by choosing
 
-data instance SelChoose k STree = SelChooseT
-data instance SelChoose k SChunk = SelChooseC
+data instance SelNonDet k STree = SelNonDetT
+data instance SelNonDet k SChunk = SelNonDetC
 
 -- I don't agree with how it is, but True refers to the left option
 -- and False refers to the right option of Choose.
 -- Why? I don't know.
-instance Has (AppIO :+: Reduce :+: NonDet) sig m => Selector SelChoose m where
-  selTree SelChooseT valM = do
+instance Has (AppIO :+: Reduce :+: NonDet) sig m => Selector SelNonDet m where
+  selTree SelNonDetT valM = do
     now <- send Choose
     if now
       then do
         exists <- isJust <$> fetchC valM
         unless exists E.empty
         pure Nothing
-      else pure $ Just SelChooseC
+      else pure $ Just SelNonDetC
   selBin self _ = do
     left <- send Choose
     pure $ Just (not left, self)
-  selTip SelChooseC _chunk = pure $ Just SelChooseT
+  selTip SelNonDetC _chunk = pure $ Just SelNonDetT
   selNil _ = E.empty
 
-selChoose :: SelChoose k STree
-selChoose = SelChooseT
+selNonDet :: SelNonDet k STree
+selNonDet = SelNonDetT
 
-min :: Monad m => NonDetC m a -> m (Maybe a)
-min = runNonDet
+runNonDetMin :: Monad m => NonDetC m a -> m (Maybe a)
+runNonDetMin = runNonDet
   (\l r -> l >>= \case
     Nothing -> r
     l' -> pure l')
   (pure . Just)
   (pure Nothing)
 
-max :: Monad m => NonDetC m a -> m (Maybe a)
-max = runNonDet
-  (\l r -> r >>= \case
-    Nothing -> l
-    r' -> pure r')
-  (pure . Just)
-  (pure Nothing)
+reverseNonDet :: NonDetC m a -> NonDetC m a -- Mi amas FP per tuta mia koro.
+reverseNonDet act = NonDetC \choose p n -> runNonDet (flip choose) p n act
+{-# INLINE reverseNonDet #-}
 
+runNonDetMax :: Monad m => NonDetC m a -> m (Maybe a)
+runNonDetMax = runNonDetMin . reverseNonDet
+
+-- For each value produced by the NonDetC m a, run the function.
+-- The function returns whether to continue consuming the NonDet computation.
+forNonDet_ :: Algebra sig m => NonDetC m a -> (a -> m Bool) -> m ()
+forNonDet_ gen f = void $ runNonDetMin do
+  i <- gen
+  lift (f i) >>= \case
+    True -> E.empty -- Mark branch as "failed" and move on to the next one.
+    False -> pure () -- Mark branch as successful, finishing the NonDet.
+
+data family SelEqNonDet k t
+
+data instance SelEqNonDet k STree = SelEqNonDetT ![Chunk] | SelEqNonDetOffT
+data instance SelEqNonDet k SChunk = SelEqNonDetC !Chunk ![Chunk] | SelEqNonDetOffC
+
+selEqChoose :: IsRadixKey k => k -> SelEqNonDet k STree
+selEqChoose k =
+  let k' = toRadixKey k
+  in SelEqNonDetT k'
+
+data ChooseL (m :: Type -> Type) a where -- newtype over Choose
+  ChooseL :: ChooseL m Bool
+data ChooseR (m :: Type -> Type) a where -- newtype over Choose
+  ChooseR :: ChooseR m Bool
+-- We could use labels, but it feels as a war crime for some reason
+type NonDetLR = ChooseL :+: ChooseR :+: Empty
+
+-- Actually, we're quite generous with making it a monad, since we probably could handle everything with just an applicative,
+-- but I don't dare to try.
+newtype NonDetLRC m a = NonDetLRC (forall b. (m b -> m b -> m b) -> (m b -> m b -> m b) -> (a -> m b) -> m b -> m b)
+  deriving Functor
+
+runNonDetLR :: (m b -> m b -> m b) -> (m b -> m b -> m b) -> (a -> m b) -> m b -> NonDetLRC m a -> m b
+runNonDetLR l r p n (NonDetLRC f) = f l r p n
+
+instance Applicative (NonDetLRC m) where
+  pure x = NonDetLRC \_l _r p _n -> p x
+  (NonDetLRC f) <*> (NonDetLRC a) = NonDetLRC \l r p n ->
+    f l r (\f' -> a l r (p . f') n) n
+
+instance Monad (NonDetLRC m) where
+  (NonDetLRC a) >>= f = NonDetLRC \l r p n ->
+    a l r (runNonDetLR l r p n . f) n
+
+instance Algebra sig m => Algebra (NonDetLR :+: sig) (NonDetLRC m) where
+  alg hdl sig ctx = NonDetLRC \l r p n -> case sig of
+    -- Again, I don't like this, but to conform to how NonDet works...
+    L (L ChooseL) -> p (False <$ ctx) `l` p (True <$ ctx)
+    L (R (L ChooseR)) -> p (True <$ ctx) `r` p (False <$ ctx)
+    L (R (R Empty)) -> n
+    -- my brain went out of the chat somewhere here, *I hope* this is correct
+    -- maybe I should patent brainless programming?
+    R other -> thread (dst ~<~ hdl) other (pure ctx) >>= run . runNonDetLR (coerce l) (coerce r) (coerce p) (coerce n)
+    where
+    dst :: Applicative m => NonDetLRC Identity (NonDetLRC m a) -> m (NonDetLRC Identity a)
+    dst = run . runNonDetLR
+      (liftA2 pl)
+      (liftA2 pr)
+      (pure . runNonDetLRTranspose)
+      (pure (pure $ NonDetLRC \_l _r _p n -> n))
+    pl left main = (\(NonDetLRC left') (NonDetLRC main') -> NonDetLRC \l r p n -> left' l r p n `l` main' l r p n) <$> left <*> main
+    pr main right = (\(NonDetLRC main') (NonDetLRC right') -> NonDetLRC \l r p n -> main' l r p n `r` right' l r p n) <$> main <*> right
+    runNonDetLRTranspose :: Applicative f => NonDetLRC f a -> f (NonDetLRC m2 a)
+    runNonDetLRTranspose = runNonDetLR pl pr (pure . pure) (pure $ NonDetLRC \_l _r _p n -> n)
+  {-# INLINE alg #-}
+
+lfork :: Has NonDetLR sig m => m a -> m a -> m a
+lfork left main = send ChooseL >>= bool left main
+
+rfork :: Has NonDetLR sig m => m a -> m a -> m a
+rfork main right = send ChooseR >>= bool right main
+
+-- | Reinterpret NonDetLRC m ~> NonDetC m,
+-- only keeping choices between the main branch and the right branch.
+runNonDetLREAfter :: Has NonDet sig m => NonDetLRC m a -> m a
+runNonDetLREAfter = runNonDetLR
+  (\_left main -> main)
+  (<|>)
+  pure
+  E.empty
+
+instance Has (AppIO :+: Reduce :+: NonDetLR :+: NonDet) sig m => Selector SelEqNonDet m where
+  selTree (SelEqNonDetT k) valM = do
+    main <- selTree (SelEqT k) valM
+    case main of
+      Nothing -> pure Nothing `rfork` pure (Just SelEqNonDetOffC)
+      Just (SelEqC a b) -> pure Nothing `lfork` pure (Just $ SelEqNonDetC a b)
+  selTree SelEqNonDetOffT valM = fmap (\SelNonDetC -> SelEqNonDetOffC) <$> selTree SelNonDetT valM
+
+  selBin (SelEqNonDetC p ps) mask = do
+    main <- selBin (SelEqC p ps) mask
+    case main of
+      Nothing -> E.empty
+      Just (pickRight, (SelEqC p' ps')) -> Just <$> if pickRight
+        then pure (False, SelEqNonDetOffC) `lfork` pure (True, SelEqNonDetC p' ps')
+        else pure (False, SelEqNonDetC p' ps) `rfork` pure (True, SelEqNonDetOffC)
+  selBin SelEqNonDetOffC mask = fmap (fmap \SelNonDetC -> SelEqNonDetOffC) <$> selBin SelNonDetC mask
+
+  selTip (SelEqNonDetC p ps) mask = fmap (\(SelEqT a) -> SelEqNonDetT a) <$> selTip (SelEqC p ps) mask
+  selTip SelEqNonDetOffC mask = fmap (\SelNonDetT -> SelEqNonDetOffT) <$> selTip SelNonDetC mask
+
+  selNil (SelEqNonDetC p ps) = selNil $ SelEqC p ps
+  selNil SelEqNonDetOffC = selNil SelNonDetC
+
+selEqNonDet :: IsRadixKey k => k -> SelEqNonDet k STree
+selEqNonDet = SelEqNonDetT . toRadixKey
+
+{-
 -- range
 
 -- Something's wrong here.
@@ -685,6 +800,7 @@ unconsRange key (Range lM rM) =
         (lM >>= \(inc, l) -> (inc,) <$> snd (NE.uncons l))
         (rM >>= \(r, inc) -> (,inc) <$> snd (NE.uncons r))
     else Left False
+-}
 
 -- construction
 
@@ -695,7 +811,7 @@ fromListM :: forall c sig m k v. (Has AppIO sig m, Container c, IsRadixKey k, Ty
 fromListM = foldM (\t (k, v) -> insert (selEq k) v t) empty
 
 toListM :: forall c sig m k v. (Has AppIO sig m, Container c, IsRadixKey k, Typeable k, Ser v) => RadixTree c k v -> m [(k, v)]
-toListM = fmap catMaybes . runNonDetA . lookupKV selChoose
+toListM = fmap catMaybes . runNonDetA . lookupKV selNonDet
 
 -- data DiffE v = Add !v | Upd !v | Del !v
 

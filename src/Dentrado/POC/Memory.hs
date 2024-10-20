@@ -37,7 +37,7 @@ import Control.Effect.Sum (Member, inj)
 import Unsafe.Coerce (unsafeCoerce)
 import Data.ByteString.Unsafe as B
 import Data.Constraint (Dict(..), withDict)
-import Dentrado.POC.Types (Reducible(..), RadixTree, RadixChunk', readReducible, Dynamic1 (..), Any1 (..), Timestamp, Event, EventId, LocalId, SiteAccessLevel, MapDiffE)
+import Dentrado.POC.Types (Reducible(..), RadixTree, RadixChunk', readReducible, Dynamic1 (..), Any1 (..), Timestamp, Event, EventId, LocalId, SiteAccessLevel, MapDiffE, StateGraphEntry)
 import qualified Type.Reflection as T
 import qualified RIO.List as L
 
@@ -248,6 +248,13 @@ instance (Ser a, Ser b) => Ser (a, b) where
 instance Ser Word8 where
   ser = putWord8
   deser = getWord8
+instance Ser Bool where
+  ser = putWord8 . \case
+    False -> 0
+    True -> 1
+  deser = getWord8 <&> \case
+    0 -> False
+    _1 -> True
 instance Ser Word32 where
   ser = tell . B.word32BE
   deser = do
@@ -299,6 +306,7 @@ instance (Container c, Ser a, Typeable c, Typeable k) => Ser (RadixChunk' c k a)
 instance Ser a => Ser (MapDiffE a)
 
 -- POC stuff
+instance Ser v => Ser (StateGraphEntry v)
 instance Ser Timestamp
 instance Ser LocalId
 instance Ser EventId
@@ -560,6 +568,7 @@ data ValT a where
   ValTWord32 :: ValT Word32
   -- ValTValGear :: ValT ctx -> ValT (ValGear ctx)
   ValTList :: ValT a -> ValT [a]
+  ValTStateGraphEntry :: ValT a -> ValT (StateGraphEntry a)
 
 -- EValT is an ephemeral extension of ValT. It includes types that
 -- cannot be easily serialized.
@@ -603,6 +612,8 @@ instance InferValT Word32 where
 --   inferValT = ValTValGear inferValT
 instance InferValT a => InferValT [a] where
   inferValT = ValTList inferValT
+instance InferValT a => InferValT (StateGraphEntry a) where
+  inferValT = ValTStateGraphEntry inferValT
 
 class InferEValT a where
   inferEValT :: EValT a
@@ -629,6 +640,7 @@ valSerProof = \case
   ValTWord32 -> Dict
   -- ValTValGear (valSerProof -> Dict) -> Dict
   ValTList (valSerProof -> Dict) -> Dict
+  ValTStateGraphEntry (valSerProof -> Dict) -> Dict
 
 evalTypeableProof :: EValT x -> Dict (Typeable x)
 evalTypeableProof = \case
@@ -680,9 +692,12 @@ deserValT = \case
   -- 14 -> do
   --   Any1 ctx <- deser
   --   pure $ Any1 $ ValTValGear ctx
-  _15 -> do
+  15 -> do
     Any1 a <- deser
     pure $ Any1 $ ValTList a
+  _16 -> do
+    Any1 a <- deser
+    pure $ Any1 $ ValTStateGraphEntry a
   -- >= 150 RESERVED FOR EVAL
 
 instance Ser (Any1 ValT) where
@@ -703,6 +718,7 @@ instance Ser (Any1 ValT) where
     ValTWord32 -> putWord8 13
     -- ValTValGear ctx -> putWord8 14 *> ser (Any1 ctx)
     ValTList a -> putWord8 15 *> ser (Any1 a)
+    ValTStateGraphEntry a -> putWord8 16 *> ser (Any1 a)
     -- >= 150 RESERVED FOR EVal
   deser = getWord8 >>= deserValT
 

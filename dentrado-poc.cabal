@@ -16,7 +16,7 @@ common lang
         OverloadedStrings, OverloadedLists, ViewPatterns, TypeFamilies, TemplateHaskell, DerivingVia, DataKinds,
         TupleSections, DeriveGeneric, PolyKinds, PatternSynonyms, DeriveFunctor
     build-depends: base >= 4, rio >= 0.1, mtl >= 2.3, fused-effects >= 1.1, hashable >= 1.4,
-        free >= 5.2, containers >= 0.6, template-haskell >= 2.19, bytestring, constraints >= 0.14
+        free >= 5.2, containers >= 0.6, template-haskell >= 2.19, bytestring, constraints >= 0.14, heaps >= 0.4
 
 library dentrado-poc-lib
     import: lang

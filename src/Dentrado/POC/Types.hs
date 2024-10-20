@@ -32,6 +32,8 @@ data RadixChunk' c (k :: Type) a
 
 data MapDiffE v = MapAdd !v | MapUpd !v !v | MapDel !v
   deriving Generic
+data StateGraphEntry v = EntrySampled | EntryModified !v
+  deriving Generic
 
 newtype Timestamp = Timestamp Word32
   deriving (Eq, Ord, Generic)
@@ -48,15 +50,37 @@ data EventId = EventId !Timestamp !LocalId
 data SiteAccessLevel = SalNone | SalUser | SalModerator | SalAdmin
   deriving Generic
 
-data Event
-  = Register -- #0
-  | Login EventId -- #1: user's registration
-  -- UpdateProfile #2
-  | CreateSite EventId -- #3: user's login
-  | SetSiteAccessLevel EventId EventId EventId SiteAccessLevel -- #4: admin's login, site's creation, user's registration
-  -- Rate #5
-  | CreateMessage EventId EventId -- #6: user's login, site's creation
-  | UpdateMessage EventId EventId Text -- #7: user's login, article's creation, content
-  -- Connect/disconnect messages
-  deriving Generic
+-- let Event =
+--   < Admin:
+--       < SetAccessLevel: { user: UserId, level: SiteAccessLevel }
+--       | Revoke: EventId
+--       >
+--   | User:
+--       < CreateMessage: { owned: Bool } -- Обобщённое создание пустого поста/страницы.
+--       | EditMessage:
+--           { message: MessageId
+--           , update:
+--             < Delete: {} -- удалить сообщение
+--             | Update: -- обновить отдельные поля сообщения
+--               { titleUpdate: Optional Text
+--               , contentUpdate: Optional Text
+--               , subUpdate: Optional (Text :-> Optional MessageId)
+--               }
+--             >
+--           }
+--       | UpdateAttachment:
+--           { what: MessageId
+--           , to: MessageId
+--           , relation: Optional < Like | Info | Dislike >
+--           } 
+--       | Merge: BranchId
+--       >
+--   >
 
+
+data Event
+  = AdminSetAccessLevel !EventId !EventId !SiteAccessLevel -- #0: admin, user, level
+  -- | AdminRevoke !EventId !EventId -- #1: admin, user event
+  | UserCreateMessage !EventId !Bool -- #2: user, owned?
+  | UserEditMessage !EventId !EventId !(Maybe (Maybe Text, (Maybe Text, [(Text, Maybe EventId)]))) -- #3: user, message, new content?: update title?, update content?, update-set subpages
+  deriving Generic

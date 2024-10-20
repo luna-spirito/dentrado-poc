@@ -16,7 +16,7 @@ import Dentrado.POC.TH (moduleId, sFreshI)
 import Control.Carrier.Writer.Church (WriterC, runWriter)
 import Data.Monoid (First(..))
 import qualified Control.Applicative as A
-import Control.Monad.Free
+import Control.Monad.Free (Free)
 import Data.Functor.Compose
 import Control.Effect.NonDet (NonDet)
 import Control.Effect.Labelled (HasLabelled, sendLabelled, Labelled, runLabelled)
@@ -303,52 +303,6 @@ selEq :: RT.IsRadixKey k => k -> RT.SelEq k SZipper
 selEq k = SelEqZ $ RT.toRadixKey k
 
 -- We use two nondets, one to capture turns to the left in Invtree and one to capture turn to the right in Invtree (as well as to search in RT)
-
-data ChooseL (m :: Type -> Type) a where -- newtype over Choose
-  ChooseL :: ChooseL m Bool
-data ChooseR (m :: Type -> Type) a where -- newtype over Choose
-  ChooseR :: ChooseR m Bool
--- We could use labels, but it feels as a war crime for some reason
-type NonDetLR = ChooseL :+: ChooseR :+: Empty
-
--- Actually, we're quite generous with making it a monad, since we probably could handle everything with just an applicative,
--- but I don't dare to try.
-newtype NonDetLRC m a = NonDetLRC (forall b. (m b -> m b -> m b) -> (m b -> m b -> m b) -> (a -> m b) -> m b -> m b)
-  deriving Functor
-
-runNonDetLR :: (m b -> m b -> m b) -> (m b -> m b -> m b) -> (a -> m b) -> m b -> NonDetLRC m a -> m b
-runNonDetLR l r p n (NonDetLRC f) = f l r p n
-
-instance Applicative (NonDetLRC m) where
-  pure x = NonDetLRC \_l _r p _n -> p x
-  (NonDetLRC f) <*> (NonDetLRC a) = NonDetLRC \l r p n ->
-    f l r (\f' -> a l r (p . f') n) n
-
-instance Monad (NonDetLRC m) where
-  (NonDetLRC a) >>= f = NonDetLRC \l r p n ->
-    a l r (runNonDetLR l r p n . f) n
-
-instance Algebra sig m => Algebra (NonDetLR :+: sig) (NonDetLRC m) where
-  alg hdl sig ctx = NonDetLRC \l r p n -> case sig of
-    -- Again, I don't like this, but to conform to how NonDet works...
-    L (L ChooseL) -> p (False <$ ctx) `l` p (True <$ ctx)
-    L (R (L ChooseR)) -> p (True <$ ctx) `r` p (False <$ ctx)
-    L (R (R Empty)) -> n
-    -- my brain went out of the chat somewhere here, *I hope* this is correct
-    -- maybe I should patent brainless programming?
-    R other -> thread (dst ~<~ hdl) other (pure ctx) >>= run . runNonDetLR (coerce l) (coerce r) (coerce p) (coerce n)
-    where
-    dst :: Applicative m => NonDetLRC Identity (NonDetLRC m a) -> m (NonDetLRC Identity a)
-    dst = run . runNonDetLR
-      (liftA2 pl)
-      (liftA2 pr)
-      (pure . runNonDetLRTranspose)
-      (pure (pure $ NonDetLRC \_l _r _p n -> n))
-    pl left main = (\(NonDetLRC left') (NonDetLRC main') -> NonDetLRC \l r p n -> left' l r p n `l` main' l r p n) <$> left <*> main
-    pr main right = (\(NonDetLRC main') (NonDetLRC right') -> NonDetLRC \l r p n -> main' l r p n `r` right' l r p n) <$> main <*> right
-    runNonDetLRTranspose :: Applicative f => NonDetLRC f a -> f (NonDetLRC m2 a)
-    runNonDetLRTranspose = runNonDetLR pl pr (pure . pure) (pure $ NonDetLRC \_l _r _p n -> n)
-  {-# INLINE alg #-}
 
 -- Run NonDeLRC, moving from bottom to top of the tree and collecting result into an alternative
 runNonDetLRInvA :: forall f m a. (Applicative m, Alternative f) => NonDetLRC m a -> Free (Compose m f) a
