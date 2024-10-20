@@ -682,125 +682,78 @@ selEqChoose k =
   let k' = toRadixKey k
   in SelEqNonDetT k'
 
-data ChooseL (m :: Type -> Type) a where -- newtype over Choose
-  ChooseL :: ChooseL m Bool
-data ChooseR (m :: Type -> Type) a where -- newtype over Choose
-  ChooseR :: ChooseR m Bool
--- We could use labels, but it feels as a war crime for some reason
-type NonDetLR = ChooseL :+: ChooseR :+: Empty
-
--- Actually, we're quite generous with making it a monad, since we probably could handle everything with just an applicative,
--- but I don't dare to try.
-newtype NonDetLRC m a = NonDetLRC (forall b. (m b -> m b -> m b) -> (m b -> m b -> m b) -> (a -> m b) -> m b -> m b)
-  deriving Functor
-
-runNonDetLR :: (m b -> m b -> m b) -> (m b -> m b -> m b) -> (a -> m b) -> m b -> NonDetLRC m a -> m b
-runNonDetLR l r p n (NonDetLRC f) = f l r p n
-
-instance Applicative (NonDetLRC m) where
-  pure x = NonDetLRC \_l _r p _n -> p x
-  (NonDetLRC f) <*> (NonDetLRC a) = NonDetLRC \l r p n ->
-    f l r (\f' -> a l r (p . f') n) n
-
-instance Monad (NonDetLRC m) where
-  (NonDetLRC a) >>= f = NonDetLRC \l r p n ->
-    a l r (runNonDetLR l r p n . f) n
-
-instance Algebra sig m => Algebra (NonDetLR :+: sig) (NonDetLRC m) where
-  alg hdl sig ctx = NonDetLRC \l r p n -> case sig of
-    -- Again, I don't like this, but to conform to how NonDet works...
-    L (L ChooseL) -> p (False <$ ctx) `l` p (True <$ ctx)
-    L (R (L ChooseR)) -> p (True <$ ctx) `r` p (False <$ ctx)
-    L (R (R Empty)) -> n
-    -- my brain went out of the chat somewhere here, *I hope* this is correct
-    -- maybe I should patent brainless programming?
-    R other -> thread (dst ~<~ hdl) other (pure ctx) >>= run . runNonDetLR (coerce l) (coerce r) (coerce p) (coerce n)
-    where
-    dst :: Applicative m => NonDetLRC Identity (NonDetLRC m a) -> m (NonDetLRC Identity a)
-    dst = run . runNonDetLR
-      (liftA2 pl)
-      (liftA2 pr)
-      (pure . runNonDetLRTranspose)
-      (pure (pure $ NonDetLRC \_l _r _p n -> n))
-    pl left main = (\(NonDetLRC left') (NonDetLRC main') -> NonDetLRC \l r p n -> left' l r p n `l` main' l r p n) <$> left <*> main
-    pr main right = (\(NonDetLRC main') (NonDetLRC right') -> NonDetLRC \l r p n -> main' l r p n `r` right' l r p n) <$> main <*> right
-    runNonDetLRTranspose :: Applicative f => NonDetLRC f a -> f (NonDetLRC m2 a)
-    runNonDetLRTranspose = runNonDetLR pl pr (pure . pure) (pure $ NonDetLRC \_l _r _p n -> n)
-  {-# INLINE alg #-}
-
-lfork :: Has NonDetLR sig m => m a -> m a -> m a
-lfork left main = send ChooseL >>= bool left main
-
-rfork :: Has NonDetLR sig m => m a -> m a -> m a
-rfork main right = send ChooseR >>= bool right main
-
--- | Reinterpret NonDetLRC m ~> NonDetC m,
--- only keeping choices between the main branch and the right branch.
-runNonDetLREAfter :: Has NonDet sig m => NonDetLRC m a -> m a
-runNonDetLREAfter = runNonDetLR
-  (\_left main -> main)
-  (<|>)
-  pure
-  E.empty
-
-instance Has (AppIO :+: Reduce :+: NonDetLR :+: NonDet) sig m => Selector SelEqNonDet m where
-  selTree (SelEqNonDetT k) valM = do
-    main <- selTree (SelEqT k) valM
-    case main of
-      Nothing -> pure Nothing `rfork` pure (Just SelEqNonDetOffC)
-      Just (SelEqC a b) -> pure Nothing `lfork` pure (Just $ SelEqNonDetC a b)
-  selTree SelEqNonDetOffT valM = fmap (\SelNonDetC -> SelEqNonDetOffC) <$> selTree SelNonDetT valM
-
-  selBin (SelEqNonDetC p ps) mask = do
-    main <- selBin (SelEqC p ps) mask
-    case main of
-      Nothing -> E.empty
-      Just (pickRight, (SelEqC p' ps')) -> Just <$> if pickRight
-        then pure (False, SelEqNonDetOffC) `lfork` pure (True, SelEqNonDetC p' ps')
-        else pure (False, SelEqNonDetC p' ps) `rfork` pure (True, SelEqNonDetOffC)
-  selBin SelEqNonDetOffC mask = fmap (fmap \SelNonDetC -> SelEqNonDetOffC) <$> selBin SelNonDetC mask
-
-  selTip (SelEqNonDetC p ps) mask = fmap (\(SelEqT a) -> SelEqNonDetT a) <$> selTip (SelEqC p ps) mask
-  selTip SelEqNonDetOffC mask = fmap (\SelNonDetT -> SelEqNonDetOffT) <$> selTip SelNonDetC mask
-
-  selNil (SelEqNonDetC p ps) = selNil $ SelEqC p ps
-  selNil SelEqNonDetOffC = selNil SelNonDetC
-
-selEqNonDet :: IsRadixKey k => k -> SelEqNonDet k STree
-selEqNonDet = SelEqNonDetT . toRadixKey
-
-{-
 -- range
 
--- Something's wrong here.
+data RBound f =
+  RBUnrestricted -- Ord-predicate is known to be true on this subrange
+  | RBRestricted { _inclusive :: Bool, _path :: f Chunk } -- Ord-predicate
+type RangeT = (RBound [], RBound [])
+type RangeC = (RBound NonEmpty, RBound NonEmpty)
 
--- `Maybe` stands for Unrestricted.
--- `Bool` stands for inclusive?
-data Range = Range !(Maybe (Bool, NonEmpty Chunk)) !(Maybe (NonEmpty Chunk, Bool))
+-- 
+restrictRBoundC :: (Chunk -> Chunk -> Bool) -> RBound NonEmpty -> Chunk -> Maybe (RBound NonEmpty)
+restrictRBoundC _ RBUnrestricted _ = Just RBUnrestricted
+restrictRBoundC cmp self@(RBRestricted _incl (p :| _ps)) mask = case tryMask mask p of
+  -- TODO: tryMask is used to evaluate whether the key belongs to the subrange. Is this optimal?
+  Nothing -> guard (p `cmp` mask) *> Just RBUnrestricted
+  Just _ -> Just self
 
-splitRange :: Chunk -> Range -> (Maybe Range, Maybe Range)
-splitRange mask (Range lM rM) =
-  let
-    hasLeftSubrange = maybe True (maybe False (== False) . tryMask mask . NE.head . snd) lM
-    hasRightSubrange = maybe True (maybe False (== True) . tryMask mask . NE.head . fst) rM
-  in
-    ( if hasLeftSubrange then Just (Range lM (if hasRightSubrange then Nothing else rM)) else Nothing
-    , if hasRightSubrange then Just (Range (if hasLeftSubrange then Nothing else lM) rM) else Nothing)
+restrictRangeC :: Chunk -> RangeC -> Maybe RangeC
+restrictRangeC mask (lbound, rbound) = (,)
+  <$> restrictRBoundC (<) lbound mask
+  <*> restrictRBoundC (>) rbound mask
 
-unconsRange :: Chunk -> Range -> Either Bool Range
-unconsRange key (Range lM rM) =
-  let
-    isWithinLeft = maybe True ((key >=) . NE.head . snd) lM
-    isWithinRight = maybe True ((key <=) . NE.head . fst) rM
-  in if isWithinLeft && isWithinRight -- uncons shouldn't handle all the Writes since, for example, there is a 
-    then case rM of
-      Just (x :| _, inclusive)
-        | x == key -> Left inclusive
-      _ -> Right $ Range
-        (lM >>= \(inc, l) -> (inc,) <$> snd (NE.uncons l))
-        (rM >>= \(r, inc) -> (,inc) <$> snd (NE.uncons r))
-    else Left False
--}
+unconsRBoundC :: (Chunk -> Chunk -> Bool) -> RBound NonEmpty -> Chunk -> Maybe (RBound [])
+unconsRBoundC _ RBUnrestricted _ = Just RBUnrestricted
+unconsRBoundC cmp (RBRestricted incl (p :| ps)) curr =
+  if p `cmp` curr
+    then Just $
+      if p == curr
+        then RBRestricted incl ps
+        else RBUnrestricted
+    else Nothing
+
+unconsRangeC :: RangeC -> Chunk -> Maybe RangeT
+unconsRangeC (lbound, rbound) chunk = (,)
+  <$> unconsRBoundC (<=) lbound chunk
+  <*> unconsRBoundC (>=) rbound chunk
+
+unconsRangeT :: RangeT -> (Bool, Maybe RangeC)
+unconsRangeT (lbound, rbound) =
+  -- This code is very stupid, but I wanted to capture the logic precisely.
+  let elWithinLeft = case lbound of
+        RBUnrestricted -> True
+        RBRestricted incl path -> (if incl then (<=) else (<)) path []
+      elWithinRight = case rbound of
+        RBUnrestricted -> True
+        RBRestricted incl path -> (if incl then (<=) else (<)) [] path
+      uncons' = \case
+        RBUnrestricted -> Just RBUnrestricted
+        RBRestricted incl (p:ps) -> Just $ RBRestricted incl (p :| ps)
+        RBRestricted _incl [] -> Nothing
+  in (elWithinLeft && elWithinRight, (,) <$> uncons' lbound <*> uncons' rbound)
+
+data family SelNonDetRanged k t
+
+newtype instance SelNonDetRanged k STree = SelNonDetRangedT RangeT
+newtype instance SelNonDetRanged k SChunk = SelNonDetRangedC RangeC
+
+instance Has (AppIO :+: Reduce :+: NonDet) sig m => Selector SelNonDetRanged m where
+  selTree (SelNonDetRangedT range0) valM =
+    let (this, rangeM) = unconsRangeT range0 in
+    (do
+      E.guard this
+      E.guard . isJust =<< fetchC valM
+      pure Nothing)
+    <|> maybe E.empty (pure . Just . SelNonDetRangedC) rangeM
+  selBin (SelNonDetRangedC range0) mask =
+    maybe E.empty (\r -> Just . (, SelNonDetRangedC r) <$> (pure False <|> pure True)) $ restrictRangeC mask range0
+  selTip (SelNonDetRangedC range0) key =
+    maybe E.empty (pure . Just . SelNonDetRangedT) $ unconsRangeC range0 key
+  selNil _ = E.empty
+
+selNonDetRanged :: RangeT -> SelNonDetRanged k STree
+selNonDetRanged = SelNonDetRangedT
 
 -- construction
 

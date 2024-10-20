@@ -18,7 +18,7 @@ import Dentrado.POC.TH (sFreshI)
 import Control.Applicative.Free.Final (Ap, runAp_, runAp, liftAp)
 import qualified RIO.List as L
 import GHC.Exts (IsList(..))
-import Control.Carrier.State.Church (evalState, put, get, execState, StateC, runState)
+import Control.Carrier.State.Church (evalState, put, get, execState, StateC, runState, modify)
 import Data.Functor.Compose (Compose(..))
 import Control.Carrier.Writer.Church (WriterC, runWriter)
 import Control.Carrier.Reader (ReaderC, runReader)
@@ -28,6 +28,7 @@ import Control.Carrier.Empty.Church (runEmpty)
 import Control.Effect.State (State)
 import Data.Heap (Heap)
 import qualified RIO.Set as Set
+import qualified Control.Effect.Empty as E
 
 $(moduleId 3)
 
@@ -280,7 +281,7 @@ depsApplicativeProof = \case
 
 -- data RunWithDeps' m accessed = RunWithDeps' !(forall a. m a -> AppIOC (a, accessed))
 data RunWithDeps m ctx = forall accessed cache. RunWithDeps
-  !(Asm ctx (EventId -> forall a. m a -> AppIOC (a, accessed), ()))--RunWithDeps' m accessed)
+  !(Asm ctx (EventId -> forall a. m a -> AppIOC (a, accessed), ()))
   !(EventId -> accessed -> accessed -> cache -> AppIOC cache)
   !cache
 
@@ -293,11 +294,15 @@ mkStateGraph :: forall ctx c event k v handlerM. (InferValT k, InferValT v, Ser 
   Asm ctx (StateGraph k v)
 mkStateGraph evsA init (depsA, hdl) =
   let
-    affectedReads :: EventId -> RT.MapR EventId v -> (v -> Bool) -> AppIOC (Heap EventId)
-    affectedReads evId rt isWrite =
+    affectedReads :: EventId -> RT.MapR EventId v -> (v -> Maybe Bool) -> AppIOC (Heap EventId)
+    affectedReads evId rt classify =
       execState Heap.empty $ RT.forNonDet_
-        (RT.runNonDetLREAfter $ RT.lookupKV (RT.selEqNonDet evId) rt)
-        $ maybe E.empty _ -- \(affId, aff) -> _
+        (RT.lookupKV (RT.selNonDetRanged (RT.RBRestricted False $ RT.toRadixKey evId, RT.RBUnrestricted)) rt)
+        $ P.fromJust >>> \(affId, aff) -> case classify aff of
+            Nothing -> pure True
+            Just isWrite -> do
+              modify (Heap.insert affId)
+              pure $ not isWrite -- continue if not overwritten
     
     runWithDeps :: StateGraphDeps ctx m -> RunWithDeps m ctx
     runWithDeps = \case
@@ -306,7 +311,9 @@ mkStateGraph evsA init (depsA, hdl) =
         | RunWithDeps otherRunA otherUpd otherCache0 <- runWithDeps deps
         , Dict <- depsApplicativeProof deps ->
         RunWithDeps @_ @_ @(Set k2, _) @(RT.MapR k2 (RT.SetR EventId), _)
-          ((\(old, new) (otherRun, _) -> (\evId (StateGraphQueryC act) -> fmap (\((a, b), c) -> (b, (a, c))) $ otherRun evId $ runReader (StateGraph new) $ runState (curry pure) Set.empty act, ()))
+          ((\(old, new) (otherRun, _) ->
+            (\evId (StateGraphQueryC act) ->
+              fmap (\((a, b), c) -> (b, (a, c))) $ otherRun evId $ runReader (StateGraph new) $ runState (curry pure) Set.empty act, ()))
             <$> buffered RT.empty (unStateGraph <$> dep)
             <*> otherRunA)
           (\evId (acc1, otherAcc1) (acc2, otherAcc2) (cache0, otherCache) -> (,)
