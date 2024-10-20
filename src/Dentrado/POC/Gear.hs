@@ -23,10 +23,8 @@ import Data.Functor.Compose (Compose(..))
 import Control.Carrier.Writer.Church (WriterC, runWriter)
 import Control.Carrier.Reader (ReaderC, runReader)
 import Data.Coerce (coerce)
-import qualified Data.Heap as Heap
 import Control.Carrier.Empty.Church (runEmpty)
 import Control.Effect.State (State)
-import Data.Heap (Heap)
 import qualified RIO.Set as Set
 import qualified Control.Effect.Empty as E
 
@@ -212,10 +210,10 @@ type LoginId = EventId
 
 -- newtype StateGraphUpdateC k v m a = StateGraphUpdateC (WriterC (RevList (k, AppIOC (StateGraphEntry v))) (ReaderC (EventId, StateGraph k v) m) a)
 
-whilePop :: Has (State (Heap v)) sig m => (v -> m ()) -> m ()
+whilePop :: Has (State (Set v)) sig m => (v -> m ()) -> m ()
 whilePop f = do
   h0 <- get
-  case Heap.viewMin h0 of
+  case Set.minView h0 of
     Nothing -> pure ()
     Just (next, h) -> put h *> f next
 
@@ -229,8 +227,8 @@ mkStateGraph inpM def fn = asmCached
   (RT.empty, RT.empty) -- (old input, result)
   $ inpM <&> \newInp (oldInp, oldRes) -> do
     diffInp0List <- (RT.toListM @Res =<< RT.diffId AppForce oldInp newInp)
-    let diffInp0 = Heap.fromList $ (\(evId, diff) -> Heap.Entry evId $ Just diff) <$> diffInp0List
-    newRes <- execState oldRes $ execState diffInp0 $ whilePop \(Heap.Entry evId diffM0) -> do
+    let diffInp0 = Set.fromList $ (\(evId, diff) -> Set.Entry evId $ Just diff) <$> diffInp0List
+    newRes <- execState oldRes $ execState diffInp0 $ whilePop \(Set.Entry evId diffM0) -> do
       diffM <- diffM0 & maybe (RT.mkMapDiffE <$> RT.lookup (RT.selEq evId) oldInp <*> RT.lookup (RT.selEq evId) newInp) (pure . Just)
       let runFn ev ctx = do
             UnsafeRevList r <- fn ev & \(StateGraphUpdateC m) -> lift $ lift $ runReader (evId, StateGraph ctx) $ runWriter (\a _ -> pure a) m
@@ -281,7 +279,7 @@ depsApplicativeProof = \case
 
 -- data RunWithDeps' m accessed = RunWithDeps' !(forall a. m a -> AppIOC (a, accessed))
 data RunWithDeps m ctx = forall accessed cache. RunWithDeps
-  !(Asm ctx (EventId -> forall a. m a -> AppIOC (a, accessed), ()))
+  !(Asm ctx (EventId -> forall a. m a -> AppIOC (a, accessed), AppIOC (Set EventId)))
   !(EventId -> accessed -> accessed -> cache -> AppIOC cache)
   !cache
 
@@ -294,26 +292,29 @@ mkStateGraph :: forall ctx c event k v handlerM. (InferValT k, InferValT v, Ser 
   Asm ctx (StateGraph k v)
 mkStateGraph evsA init (depsA, hdl) =
   let
-    affectedReads :: EventId -> RT.MapR EventId v -> (v -> Maybe Bool) -> AppIOC (Heap EventId)
+    affectedReads :: EventId -> RT.MapR EventId v -> (v -> Maybe Bool) -> StateC (Set EventId) AppIOC ()
     affectedReads evId rt classify =
-      execState Heap.empty $ RT.forNonDet_
+      RT.forNonDet_
         (RT.lookupKV (RT.selNonDetRanged (RT.RBRestricted False $ RT.toRadixKey evId, RT.RBUnrestricted)) rt)
         $ P.fromJust >>> \(affId, aff) -> case classify aff of
             Nothing -> pure True
             Just isWrite -> do
-              modify (Heap.insert affId)
+              modify (Set.insert affId)
               pure $ not isWrite -- continue if not overwritten
     
     runWithDeps :: StateGraphDeps ctx m -> RunWithDeps m ctx
     runWithDeps = \case
-      StateGraphDepsNil -> RunWithDeps (pure (const $ fmap (, ()), ())) (const $ const $ const $ const $ pure ()) ()
+      StateGraphDepsNil -> RunWithDeps (pure (const $ fmap (, ()), pure Set.empty)) (const $ const $ const $ const $ pure ()) ()
       StateGraphDepsCons @k2 dep deps
         | RunWithDeps otherRunA otherUpd otherCache0 <- runWithDeps deps
         , Dict <- depsApplicativeProof deps ->
         RunWithDeps @_ @_ @(Set k2, _) @(RT.MapR k2 (RT.SetR EventId), _)
-          ((\(old, new) (otherRun, _) ->
+          ((\(old, new) (otherRun, otherAff) ->
             (\evId (StateGraphQueryC act) ->
-              fmap (\((a, b), c) -> (b, (a, c))) $ otherRun evId $ runReader (StateGraph new) $ runState (curry pure) Set.empty act, ()))
+              fmap (\((a, b), c) -> (b, (a, c))) $ otherRun evId $ runReader (StateGraph new) $ runState (curry pure) Set.empty act
+            , otherAff >>= flip execState (
+              _
+            )))
             <$> buffered RT.empty (unStateGraph <$> dep)
             <*> otherRunA)
           (\evId (acc1, otherAcc1) (acc2, otherAcc2) (cache0, otherCache) -> (,)
@@ -338,7 +339,7 @@ mkStateGraph evsA init (depsA, hdl) =
   --   withQueue xA = asmAppIO $
   --     (\(oldEvs, newEvs) x -> do
   --       diffEvsList <- RT.toListM @Res =<< RT.diffId AppForce oldEvs newEvs
-  --       let queue = Heap.fromList $ (\(evId, diff) -> Heap.Entry evId $ Just diff) <$> diffEvsList
+  --       let queue = Set.fromList $ (\(evId, diff) -> Set.Entry evId $ Just diff) <$> diffEvsList
   --       evalState queue x)
   --     <$> buffered RT.empty evsA
   --     <*> xA
