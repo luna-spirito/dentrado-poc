@@ -529,19 +529,27 @@ monadTypeableProof = \case
 
 data ContainerT a where
   ContainerTRes :: ContainerT Res
+  ContainerTDelay :: ContainerT Delay
 
 class InferContainerT a where
   inferContainerT :: ContainerT a
 instance InferContainerT Res where
   inferContainerT = ContainerTRes
+instance InferContainerT Delay where
+  inferContainerT = ContainerTDelay
 
 instance Ser (Any1 ContainerT) where
-  ser (Any1 ContainerTRes) = pure ()
-  deser = pure $ Any1 ContainerTRes
+  ser (Any1 c) = case c of
+    ContainerTRes -> putWord8 0
+    ContainerTDelay -> putWord8 1
+  deser = getWord8 <&> \case
+    0 -> Any1 ContainerTRes
+    _1 -> Any1 ContainerTDelay
 
 containerContainerProof :: ContainerT a -> Dict (Container a)
 containerContainerProof = \case
   ContainerTRes -> Dict
+  ContainerTDelay -> Dict
 
 --
 
@@ -809,6 +817,9 @@ data AppForce = AppForce
 
 data Delay a where
   DelayPin :: !(Res a) -> Delay a
+  DelayLazy :: !(IORef (Either (Delay a) (AppIOC (Delay a)))) -> Delay a
+    -- ^ TODO: ?, also, it's additional undesirable indirection.
+    -- Probably should get moved? Delay a --> Delay' a, Delay a = DelayLazy a + Delay' a
   DelayCache :: !(DelayApp (M AppIOC (C Res a))) -> !(IORef (Maybe (Res a))) -> Delay a -- TODO: when some Delay is duplicated into `a` and `b`,
 
 data DelayApp a where
@@ -843,13 +854,30 @@ delayAppVal proxy = fmap (\(EVal _ x) -> x) . delayAppVal' where
       EVal (EValT (ValTFun aT@(valSerProof -> Dict) bT)) f' ->
         EVal bT . funApp' aT f' . C <$> unwrap' proxy a
 
+mkDelayLazy :: AppIOC (Delay a) -> Delay a
+mkDelayLazy = DelayLazy . unsafePerformIO . newIORef . Right
+
+unDelayLazy :: Has (AppIO :+: Reduce' s) sig m => Proxy s -> IORef (Either (Delay a) (AppIOC (Delay a))) -> m (Delay a)
+unDelayLazy (Proxy @s) ref =
+  sendAI (readIORef ref) >>= \case
+    Left a -> pure a
+    Right aM -> do
+      reduce' (Proxy @s)
+      a <- sendAI aM
+      sendAI $ writeIORef ref (Left a)
+      pure a
+
 instance Container Delay where
   wrap = DelayPin
   unwrap' proxy = \case
     DelayPin x -> pure x
+    DelayLazy x -> unDelayLazy proxy x >>= unwrap' proxy
     DelayCache actM memo -> delayCache proxy actM memo
   tryUnwrap = \case
     DelayPin x -> Just x
+    DelayLazy ref -> unsafePerformIO (readIORef ref) & \case
+      Left v -> tryUnwrap v
+      Right _ -> Nothing
     DelayCache _actM memo -> unsafePerformIO (readIORef memo)
     -- DelayApp _ _  -> Nothing
   same = curry \case
@@ -873,6 +901,7 @@ data AppDelay = AppDelay
 instance Typeable a => Ser (Delay a) where
   ser = \case
     DelayPin a -> putWord8 0 *> ser a
+    DelayLazy x -> runReduce (unDelayLazy (Proxy @"") x) >>= ser
     DelayCache app _memo -> putWord8 1 *> ser app
   deser = getWord8 >>= \case
     0 -> DelayPin <$> deser
@@ -903,7 +932,7 @@ instance Typeable a => Ser (DelayApp a) where -- Actually, this task is mostly a
         a <- deser
         deser' (args - 1) (DelayApp d a) bT
       deser' _args _d _nonFun = empty
-  
+
 builtin :: Has Fresh sig m => a -> m (ResB a)
 builtin v = do
   i <- fromIntegral <$> fresh

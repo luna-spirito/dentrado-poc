@@ -18,7 +18,7 @@ import Control.Effect.Fresh (Fresh)
 import Language.Haskell.TH (Q, Exp, lamE, varE, appE, newName, varP)
 import Control.Carrier.Reader (runReader)
 import Data.Kind (Type)
-import Dentrado.POC.Memory (Res (..), Cast (..), Container (..), AppIO, Reduce' (..), Delay (..), ReduceC, AppIOC, AppForce(..), Reduce, RevList, AppDelay(..), Reduce'C (..), allocC, mkReducible, tryFetchC, reduce', runReduce, fetchC, reducible, revSnoc, sNothing, fetch, unwrap, mkDelayCache, runReduce', alloc, reducible', builtin, Ser, ResB (..), wrapB, (:->) (..), delayAppBuiltinFun, DelayApp (..), M (..), C (..), InferValT, InferContainerT, Serialized (..), SerializedGearFn (..))
+import Dentrado.POC.Memory (Res (..), Cast (..), Container (..), AppIO, Reduce' (..), Delay (..), ReduceC, AppIOC, AppForce(..), Reduce, RevList, AppDelay(..), Reduce'C (..), allocC, mkReducible, tryFetchC, reduce', runReduce, fetchC, reducible, revSnoc, sNothing, fetch, unwrap, mkDelayCache, runReduce', alloc, reducible', builtin, Ser, ResB (..), wrapB, (:->) (..), delayAppBuiltinFun, DelayApp (..), M (..), C (..), InferValT, InferContainerT, Serialized (..), SerializedGearFn (..), mkDelayLazy)
 import Control.Effect.Writer (tell)
 import Dentrado.POC.Types (Chunk, RadixTree (..), RadixChunk, RadixChunk' (..), readReducible, EventId (EventId), Timestamp (..), LocalId (..), MapDiffE (..))
 import qualified Data.ByteString as B
@@ -34,6 +34,9 @@ $(moduleId 1)
 
 -- TODO: path compression for really long unique keys
 -- TODO: proper church encoding.
+-- TODO: is fusion (merge-filter-map) possible? with delays?..
+-- TODO: Oh my god, this is so bad. `join` violates the behaviour of Reducible. This urgently needs to be
+-- church/zipper made.
 
 class IsRadixKey key where
   toRadixKey :: key -> [Chunk]
@@ -111,11 +114,20 @@ type MapR = Map Res
 type Set = RadixTree
 type SetR k = MapR k ()
 
+unMapDiffE :: MapDiffE v -> (Maybe v, Maybe v)
+unMapDiffE = \case
+  MapDel v -> (Just v, Nothing)
+  MapUpd v1 v2 -> (Just v1, Just v2)
+  MapAdd v -> (Nothing, Just v)
+{-# INLINE unMapDiffE #-}
+
+fromMapDiffE :: v -> MapDiffE v -> (v, v)
+fromMapDiffE def = bimap (fromMaybe def) (fromMaybe def) . unMapDiffE
+{-# INLINE fromMapDiffE #-}
+
 hdlMapDiffE :: Monad m => (v -> a -> m a) -> (v -> a -> m a) -> MapDiffE v -> a -> m a
-hdlMapDiffE onDel onAdd = \case
-  MapDel v -> onDel v
-  MapUpd v1 v2 -> onAdd v2 <=< onDel v1
-  MapAdd v -> onAdd v
+hdlMapDiffE onDel onAdd (unMapDiffE -> (del, add)) =
+  maybe pure onAdd add <=< maybe pure onDel del
 {-# INLINE hdlMapDiffE #-}
 
 mkMapDiffE :: Maybe a -> Maybe a -> Maybe (MapDiffE a)
@@ -236,9 +248,8 @@ lookupKV k tr = runReduce $ join $ snd internalLookup [] k tr
 lookup :: (Has AppIO sig m, Selector sel (ReduceC m), Container c, IsRadixKey k, Ser a, Typeable k) => sel k STree -> RadixTree c k a -> m (Maybe a)
 lookup k tr = fmap snd <$> lookupKV k tr
 
-internalNested :: (Ser a, Container c, Algebra sig m, Has AppIO sig m, Typeable k) => a -> [Chunk] -> m (c (RadixChunk c k a))
-internalNested val ks = do
-  finalVal <- allocC $ Just val
+internalNested :: (Ser a, Container c, Algebra sig m, Has AppIO sig m, Typeable k) => c (Maybe a) -> [Chunk] -> m (c (RadixChunk c k a))
+internalNested finalVal ks = do
   (_state, res) <- foldrM
     (\key (subval, subchunk) ->
       (wrapB sNothing,) <$> allocC (mkReducible $ mkTipNonRe key $ RadixTree subval subchunk)) -- unlikely reduced
@@ -250,7 +261,7 @@ internalInsert :: forall sel c k sig m a. (Selector sel m, Container c, Has (App
 internalInsert val = accessRadix
   (\a b -> RadixTree a <$> b)
   (\_ (RadixTree _oldVal b) -> (`RadixTree` b) <$> allocC (Just val))
-  (\key1 keys2 _ -> internalNested val (key1:keys2))
+  (\key1 keys2 _ -> (`internalNested` (key1:keys2)) =<< allocC (Just val))
   (\k v -> allocC . mkReducible . mkTipNonRe k =<< v)
   (\k r a b -> allocC . mkReducible . mkBinNonRe k r a =<< b)
 {-# INLINE internalInsert #-}
@@ -266,7 +277,12 @@ internalUpdate :: (Selector sel m, Container c, Has (AppIO :+: Reduce) sig m, Se
 internalUpdate f = accessRadix
   (\a b -> RadixTree a <$> b) -- on sub, tree
   (\_ (RadixTree updated sub) -> (`RadixTree` sub) <$> f updated) -- on found, tree
-  (\_ _ _ -> pure $ wrapB sNil) -- on missing, chunk
+  (\key1 keys2 _ -> do
+    val <- f $ wrapB sNothing
+    if (val `same` (wrapB sNothing))
+      then pure $ wrapB sNil
+      else internalNested val (key1:keys2)
+    )
   (\key tree -> mkTip pure key =<< tree) -- on Tip, chunk
   (\k r a b -> mkBin pure k r a =<< b) -- on branch, chunk
 {-# INLINE internalUpdate #-}
@@ -296,7 +312,7 @@ upsertChurchInternal ::
 upsertChurchInternal = accessRadix
   (\a (lookRes, ins) -> (lookRes, \newVal -> RadixTree a <$> ins newVal)) -- on sub, tree
   (\(FinalPath k) (RadixTree exVal sub) -> (fmap (fromRadixKey k,) <$> fetchC exVal, \newVal -> (`RadixTree` sub) <$> allocC (Just newVal))) -- on found, tree
-  (\k1 ks _ -> (pure Nothing, \newVal -> internalNested newVal (k1:ks))) -- on missing, chunk
+  (\k1 ks _ -> (pure Nothing, (`internalNested` (k1:ks)) <=< allocC . Just)) -- on missing, chunk
   (\key (lookRes, ins) -> (lookRes, \newVal -> mkTip pure key =<< ins newVal)) -- on Tip, chunk
   (\k r a (lookRes, ins) -> (lookRes, \newVal -> mkBin pure k r a =<< ins newVal)) -- on branch, chunk
 {-# INLINE upsertChurchInternal #-}
@@ -557,17 +573,24 @@ onOneWitherM :: (Has Fresh sig m, MonadFix m, Container c, Has AppIO sig2 m2, Ap
   => strat -> (Res (Maybe this) -> this -> m2 (Res (Maybe fin))) -> m (OnOne (RadixChunk cfin k fin) m2 c k this fin)
 onOneWitherM = onOneWitherFM (\a b -> pure $ RadixTree a b) (mkBin unwrap) (mkTip unwrap) (pure $ wrapB sNil)
 
-mergeWithUpdate :: forall c sig1 m1 sig2 m2 k fin upd.
-  (Container c, Has Fresh sig1 m1, MonadFix m1, Has AppIO sig2 m2, Ser fin, InferValT k, InferValT upd, InferValT fin, InferContainerT c, Ser upd, Typeable k)
-  => (Maybe fin -> upd -> fin)
-  -> m1 (RadixTree c k fin
-    -> RadixTree c k upd
-    -> m2 (RadixTree c k fin))
-mergeWithUpdate f = do
-    w <- onOneWitherM AppForce $ const $ alloc . Just . f Nothing
-    merge AppForce onOneKeep w
-      (OnBoth \_ fin _ upd -> allocC $ Just $ f (Just fin) upd)
-      Nothing
+-- mergeWithUpdate :: forall c sig1 m1 sig2 m2 k fin upd.
+--   (Container c, Has Fresh sig1 m1, MonadFix m1, Has AppIO sig2 m2, Ser fin, InferValT k, InferValT upd, InferValT fin, InferContainerT c, Ser upd, Typeable k)
+--   => (Maybe fin -> upd -> fin)
+--   -> m1 (RadixTree c k fin
+--     -> RadixTree c k upd
+--     -> m2 (RadixTree c k fin))
+-- mergeWithUpdate f = do
+--     w <- onOneWitherM AppForce $ const $ alloc . Just . f Nothing
+--     merge AppForce onOneKeep w
+--       (OnBoth \_ fin _ upd -> allocC $ Just $ f (Just fin) upd)
+--       Nothing
+
+mergeId :: (Ser a, Ser this, InferValT k, InferValT this, InferValT a,  InferContainerT cfin, InferContainerT c, AppWither p m2 c cfin,  AppMerge p m2 c cfin, Has AppIO sig m2, Typeable k) =>
+  p -> RadixTree c k this -> RadixTree c k a -> m2 (RadixTree cfin k (Maybe this, Maybe a))
+mergeId strat = $sFreshI do
+  o1 <- onOneWitherM strat \_ -> allocC . Just . (, Nothing) . Just
+  o2 <- onOneWitherM strat \_ -> allocC . Just . (Nothing,) . Just
+  merge strat o1 o2 (OnBoth \_ a _ b -> allocC $ Just (Just a, Just b)) Nothing
 
 -- diff
 
@@ -766,7 +789,13 @@ fromListM = foldM (\t (k, v) -> insert (selEq k) v t) empty
 toListM :: forall c sig m k v. (Has AppIO sig m, Container c, IsRadixKey k, Typeable k, Ser v) => RadixTree c k v -> m [(k, v)]
 toListM = fmap catMaybes . runNonDetA . lookupKV selNonDet
 
--- data DiffE v = Add !v | Upd !v | Del !v
+toDelayed :: forall k v. (Typeable k, Ser v) => RadixTree Res k v -> RadixTree Delay k v
+toDelayed (RadixTree valM subM) = RadixTree (DelayPin valM) (toDelayedC subM) where
+  toDelayedC :: Res (RadixChunk Res k v) -> Delay (RadixChunk Delay k v)
+  toDelayedC x = mkDelayLazy $ fetch x >>= (readReducible >>> \case
+    Nil -> pure $ wrapB sNil
+    Tip k rt -> allocC $ mkReducible $ Tip k $ toDelayed rt
+    Bin k a b -> allocC $ mkReducible $ Bin k (toDelayedC a) (toDelayedC b))
 
 -- debug
 
