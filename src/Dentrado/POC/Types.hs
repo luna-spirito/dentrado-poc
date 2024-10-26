@@ -4,6 +4,8 @@ import RIO
 import System.IO.Unsafe (unsafePerformIO)
 import qualified Type.Reflection as T
 import Data.Kind (Type)
+import Control.Carrier.Empty.Church (EmptyC, runEmpty, Empty, empty)
+import Control.Algebra
 
 data Dynamic1 f = forall a. Dynamic1 !(T.TypeRep a) !(f a)
 data Any1 f = forall a. Any1 !(f a)
@@ -32,7 +34,7 @@ data RadixChunk' c (k :: Type) a
 
 data MapDiffE v = MapAdd !v | MapUpd !v !v | MapDel !v
   deriving Generic
-data StateGraphEntry v = EntrySampled | EntryModified !v
+data StateGraphEntry v = StateGraphEntrySampled | StateGraphEntryModified !v
   deriving Generic
 
 newtype Timestamp = Timestamp Word32
@@ -84,3 +86,15 @@ data Event
   | UserCreateMessage !EventId !Bool -- #2: user, owned?
   | UserEditMessage !EventId !EventId !(Maybe (Maybe Text, (Maybe Text, [(Text, Maybe EventId)]))) -- #3: user, message, new content?: update title?, update content?, update-set subpages
   deriving Generic
+
+-- Util functions
+-- TODO: Move them.
+
+-- Just like from maye
+fromEmpty :: Applicative m => a -> EmptyC m a -> m a
+fromEmpty def = runEmpty (pure def) pure
+{-# INLINE fromEmpty #-}
+
+maybeToEmpty :: Has Empty sig m => Maybe a -> m a
+maybeToEmpty = maybe empty pure
+{-# INLINE maybeToEmpty #-}

@@ -20,15 +20,10 @@ import Control.Carrier.Reader (runReader)
 import Data.Kind (Type)
 import Dentrado.POC.Memory (Res (..), Cast (..), Container (..), AppIO, Reduce' (..), Delay (..), ReduceC, AppIOC, AppForce(..), Reduce, RevList, AppDelay(..), Reduce'C (..), allocC, mkReducible, tryFetchC, reduce', runReduce, fetchC, reducible, revSnoc, sNothing, fetch, unwrap, mkDelayCache, runReduce', alloc, reducible', builtin, Ser, ResB (..), wrapB, (:->) (..), delayAppBuiltinFun, DelayApp (..), M (..), C (..), InferValT, InferContainerT, Serialized (..), SerializedGearFn (..), mkDelayLazy)
 import Control.Effect.Writer (tell)
-import Dentrado.POC.Types (Chunk, RadixTree (..), RadixChunk, RadixChunk' (..), readReducible, EventId (EventId), Timestamp (..), LocalId (..), MapDiffE (..))
+import Dentrado.POC.Types (Chunk, RadixTree (..), RadixChunk, RadixChunk' (..), readReducible, EventId (EventId), Timestamp (..), LocalId (..), MapDiffE (..), maybeToEmpty)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Unsafe as B
 import qualified Data.ByteString.Builder as B
-import qualified RIO.NonEmpty as NE
-import Control.Effect.Empty (Empty (..))
-import Data.Coerce (coerce)
-import Control.Monad.Free (Free (..))
-import Data.Functor.Compose (Compose (..))
 
 $(moduleId 1)
 
@@ -768,11 +763,13 @@ instance Has (AppIO :+: Reduce :+: NonDet) sig m => Selector SelNonDetRanged m w
       E.guard this
       E.guard . isJust =<< fetchC valM
       pure Nothing)
-    <|> maybe E.empty (pure . Just . SelNonDetRangedC) rangeM
-  selBin (SelNonDetRangedC range0) mask =
-    maybe E.empty (\r -> Just . (, SelNonDetRangedC r) <$> (pure False <|> pure True)) $ restrictRangeC mask range0
-  selTip (SelNonDetRangedC range0) key =
-    maybe E.empty (pure . Just . SelNonDetRangedT) $ unconsRangeC range0 key
+    <|> Just . SelNonDetRangedC <$> maybeToEmpty rangeM
+  selBin (SelNonDetRangedC range0) mask = do
+    restricted <- maybeToEmpty $ restrictRangeC mask range0
+    Just . (, SelNonDetRangedC restricted) <$> (pure False <|> pure True)
+  selTip (SelNonDetRangedC range0) key = do
+    unconsed <- maybeToEmpty $ unconsRangeC range0 key
+    pure $ Just $ SelNonDetRangedT unconsed
   selNil _ = E.empty
 
 selNonDetRanged :: RangeT -> SelNonDetRanged k STree

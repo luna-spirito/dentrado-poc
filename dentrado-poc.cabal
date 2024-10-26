@@ -27,7 +27,7 @@ library dentrado-poc-lib
         Dentrado.POC.Data.RadixTree,
         -- Dentrado.POC.Data.RadixZipper,
         Dentrado.POC.Gear,
-        -- Dentrado.POC.StateGraph,
+        Dentrado.POC.StateGraph,
         Dentrado.POC.TH
 
 executable dentrado-poc-exe

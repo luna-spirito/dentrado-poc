@@ -37,7 +37,7 @@ import Control.Effect.Sum (Member, inj)
 import Unsafe.Coerce (unsafeCoerce)
 import Data.ByteString.Unsafe as B
 import Data.Constraint (Dict(..), withDict)
-import Dentrado.POC.Types (Reducible(..), RadixTree, RadixChunk', readReducible, Dynamic1 (..), Any1 (..), Timestamp, Event, EventId, LocalId, SiteAccessLevel, MapDiffE, StateGraphEntry)
+import Dentrado.POC.Types (Reducible(..), RadixTree, RadixChunk', readReducible, Dynamic1 (..), Any1 (..), Timestamp, Event, EventId, LocalId, SiteAccessLevel, MapDiffE, StateGraphEntry, maybeToEmpty, fromEmpty)
 import qualified Type.Reflection as T
 import qualified RIO.List as L
 
@@ -160,7 +160,7 @@ instance (Algebra sig m, Member Empty sig) => Algebra (Consume e :+: sig) (Consu
   alg hdl sig ctx = ConsumeC case sig of
     L Consume -> do
       oldList <- get
-      (x, xs) <- maybe empty pure $ uncons oldList
+      (x, xs) <- maybeToEmpty $ uncons oldList
       put xs
       pure $ ctx $> x
     R other -> alg (unConsumeC . hdl) (R other) ctx
@@ -200,7 +200,7 @@ putWord8 = tell . B.word8
 getWord8 :: Has (State ByteString :+: Empty) sig m => m Word8
 getWord8 = do
   old <- get
-  (x, new) <- maybe empty pure $ B.uncons old
+  (x, new) <- maybeToEmpty $ B.uncons old
   put new
   pure x
 
@@ -883,9 +883,9 @@ instance Container Delay where
   same = curry \case
       (DelayPin a, DelayPin b) -> a `same` b
       (DelayCache valM1 memo1, DelayCache valM2 memo2) ->
-        unsafePerformIO (runEmpty (pure False) pure do
-         m1 <- maybe empty pure =<< readIORef memo1
-         m2 <- maybe empty pure =<< readIORef memo2
+        unsafePerformIO (fromEmpty False do
+         m1 <- maybeToEmpty =<< readIORef memo1
+         m2 <- maybeToEmpty =<< readIORef memo2
          pure $ m1 `same` m2)
         || (valM1 `sameDelayApp` valM2)
       _nonMatching -> False
@@ -926,7 +926,7 @@ instance Typeable a => Ser (DelayApp a) where -- Actually, this task is mostly a
     where
       deser' :: forall a1. Word8 -> DelayApp a1 -> EValT a1 -> ConsumeC (Obj Word64) DeserM (DelayApp a)
       deser' 0 d (evalTypeableProof -> Dict) = do
-        HRefl <- maybe empty pure $ eqTypeRep (TypeRep @a1) (TypeRep @a)
+        HRefl <- maybeToEmpty $ eqTypeRep (TypeRep @a1) (TypeRep @a)
         pure d
       deser' args d (EValT (ValTFun (ValTContainer ContainerTRes (valSerProof -> Dict)) bT)) = do
         a <- deser
