@@ -17,6 +17,7 @@ import qualified Dentrado.POC.Types as RT
 import Control.Carrier.Reader (runReader)
 import Dentrado.POC.Memory (Env(..))
 import Dentrado.POC.Memory (EnvLoad(..))
+import Control.Carrier.NonDet.Church (runNonDetA)
 
 $(moduleId 101)
 
@@ -124,11 +125,7 @@ processScriptRadixTree = processScript processCommandRadixTree (\case
 prop_script_same :: MapLikeScript Int -> Bool
 prop_script_same cmds = fst (runIdentity $ processScriptMap @Int cmds) == fst (unsafeRunAppIO $ processScriptRadixTree @_ @_ @Int cmds)
 
--- from/to list
-
-prop_from_to_list_rt :: Property
-prop_from_to_list_rt = withMaxSuccess 50 \(kv :: [([Chunk], Int)]) -> unsafeRunAppIO (RT.toListM =<< RT.fromListM @Res kv) == (Map.toList $ Map.fromList kv)
-
+-- PROP: from/to list
 data RadixTreeInp v = RadixTreeInp ![([Chunk], v)]
   deriving Show
 
@@ -139,12 +136,10 @@ instance Arbitrary v => Arbitrary (RadixTreeInp v) where
     pure $ RadixTreeInp kvs
   shrink (RadixTreeInp vals) = RadixTreeInp <$> shrinkList shrinkNothing vals
 
-prop_from_to_list_rz :: Property
-prop_from_to_list_rz = withMaxSuccess 50 \(RadixTreeInp @Int kvs) -> unsafeRunAppIO (RT.toListM @Res =<< RT.fromListM kvs) == kvs
+prop_from_to_list_rt :: Property
+prop_from_to_list_rt = withMaxSuccess 50 \(RadixTreeInp @Int kvs) -> unsafeRunAppIO (RT.toListM =<< RT.fromListM @Res kvs) == (Map.toAscList $ Map.fromList kvs)
 
--- merge test
--- TODO: upgrade to RadixTree
-
+-- PROP: merge
 data MergeInput v = MergeInput ![([Chunk], v)] ![([Chunk], v)]
   deriving Show
 
@@ -180,10 +175,41 @@ merge_same (MergeInput kvs1 kvs2) = do
   t2 <- RT.fromListM kvs2
   mergeSubRT t1 t2
 
--- prop_merge_same :: MergeInput Int -> Bool
-prop_merge_same = withMaxSuccess 10000 \inp@(MergeInput kvs1 kvs2) ->
+prop_merge_same :: MergeInput Int -> Bool
+prop_merge_same = \inp@(MergeInput kvs1 kvs2) ->
     let r2 = Map.toList $ mergeSubMap (Map.fromList kvs1) (Map.fromList kvs2)
-    in unsafeRunAppIO (RT.toListM =<< merge_same inp) == r2 -- unsafeRunAppIO (RT.toListM =<< mergeSubRT =<< RT.fromListM kvs) == Map.toList (mergeSubMap )
+    in unsafeRunAppIO (RT.toListM =<< merge_same inp) == r2
+
+-- PROP: inverse ranged iteration
+data RadixTreeRangeInp v = RadixTreeRangeInp !(RadixTreeInp v) !RT.RangeT
+  deriving Show
+
+instance Arbitrary v => Arbitrary (RadixTreeRangeInp v) where
+  arbitrary = do
+    inp@(RadixTreeInp kvs) <- arbitrary
+    let mkBound = oneof [pure RT.RBUnrestricted, RT.RBRestricted <$> arbitrary <*> (fst <$> elements kvs)]
+    RadixTreeRangeInp inp <$> ((,) <$> mkBound <*> mkBound)
+
+inv_ranged_sel_rt :: Ser v => RadixTreeRangeInp v -> [([Chunk], v)]
+inv_ranged_sel_rt (RadixTreeRangeInp (RadixTreeInp kvs) range) =
+  unsafeRunAppIO do
+    rt <- RT.fromListM @Res kvs
+    fmap catMaybes $ runNonDetA @[] $ RT.reverseNonDet $ RT.lookupKV (RT.selNonDetRanged range) rt
+
+inv_ranged_sel_stupid :: RadixTreeRangeInp a -> [([Chunk], a)]
+inv_ranged_sel_stupid (RadixTreeRangeInp (RadixTreeInp kvs) (lbound, rbound)) =
+  let withinLeft = \case
+        RT.RBUnrestricted -> const True
+        RT.RBRestricted True y -> \x -> y <= x
+        RT.RBRestricted False y -> \x -> y < x
+      withinRight = \case
+        RT.RBUnrestricted -> const True
+        RT.RBRestricted True y -> \x -> x <= y
+        RT.RBRestricted False y -> \x -> x < y
+  in Map.toDescList $ Map.filterWithKey (\k _ -> withinLeft lbound k && withinRight rbound k) $ Map.fromList kvs
+
+prop_inv_ranged_sel_same :: RadixTreeRangeInp Int -> Bool
+prop_inv_ranged_sel_same = \(a :: RadixTreeRangeInp Int) -> inv_ranged_sel_rt a == inv_ranged_sel_stupid a
 
 -- TODO: test NonDetLRC, upgrade to radix zipper in merge test
 

@@ -704,6 +704,12 @@ selEqChoose k =
 data RBound f =
   RBUnrestricted -- Ord-predicate is known to be true on this subrange
   | RBRestricted { _inclusive :: Bool, _path :: f Chunk } -- Ord-predicate
+
+instance Show (f Chunk) => Show (RBound f) where
+  show = \case
+    RBUnrestricted -> "RBUnrestricted"
+    RBRestricted a b -> "RBRestricted " <> show a <> " " <> show b <> ""
+
 type RangeT = (RBound [], RBound [])
 type RangeC = (RBound NonEmpty, RBound NonEmpty)
 
@@ -744,11 +750,15 @@ unconsRangeT (lbound, rbound) =
       elWithinRight = case rbound of
         RBUnrestricted -> True
         RBRestricted incl path -> (if incl then (<=) else (<)) [] path
-      uncons' = \case
+      unconsLeft = case lbound of
+        RBUnrestricted -> RBUnrestricted
+        RBRestricted incl (p:ps) -> RBRestricted incl (p :| ps)
+        RBRestricted _incl [] -> RBUnrestricted
+      unconsRightM = case rbound of
         RBUnrestricted -> Just RBUnrestricted
         RBRestricted incl (p:ps) -> Just $ RBRestricted incl (p :| ps)
         RBRestricted _incl [] -> Nothing
-  in (elWithinLeft && elWithinRight, (,) <$> uncons' lbound <*> uncons' rbound)
+  in (elWithinLeft && elWithinRight, (unconsLeft,) <$> unconsRightM)
 
 data family SelNonDetRanged k t
 
