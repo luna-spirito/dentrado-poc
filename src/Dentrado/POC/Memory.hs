@@ -17,7 +17,7 @@ import Type.Reflection (pattern TypeRep, type (:~~:) (..), eqTypeRep)
 import Control.Carrier.Writer.Church (WriterC, Writer, runWriter)
 import qualified Data.ByteString.Builder as B
 import Control.Effect.Writer (tell)
-import Control.Carrier.Empty.Church (EmptyC, runEmpty)
+import Control.Carrier.Empty.Church (EmptyC)
 import qualified Data.ByteString as B
 import Control.Effect.Empty (Empty, empty)
 import qualified Control.Effect.Empty as E

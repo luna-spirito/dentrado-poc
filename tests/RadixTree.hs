@@ -1,24 +1,26 @@
 {-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
 {-# HLINT ignore "Use camelCase" #-}
-import RIO
+import RIO hiding (runReader)
 import Control.Algebra
 import Test.QuickCheck
 import qualified RIO.Set as Set
 import qualified RIO.Map as Map
 import Control.Monad.State (StateT, get, put, execStateT)
-import Dentrado.POC.Data.Container ( Res, runFreshIO, FreshIOC, FreshIO, allocC, ReduceC, AppForce(..) )
-import Dentrado.POC.Data.RadixZipper (RadixZipper)
-import Dentrado.POC.Data.RadixTree (Chunk)
-import qualified Dentrado.POC.Data.RadixZipper as RZ
 import System.IO.Unsafe (unsafePerformIO)
 import Language.Haskell.TH (newDeclarationGroup)
 import qualified Dentrado.POC.Data.RadixTree as RT
 import Dentrado.POC.TH (moduleId, sFreshI)
 import qualified Data.Map.Merge.Strict as Map
+import Dentrado.POC.Types (Chunk, RadixTree)
+import Dentrado.POC.Memory (Res, AppIOC, AppIO, AppForce (..), allocC, ReduceC, unAppIOC, Ser, EnvStore(..), InferValT)
+import qualified Dentrado.POC.Types as RT
+import Control.Carrier.Reader (runReader)
+import Dentrado.POC.Memory (Env(..))
+import Dentrado.POC.Memory (EnvLoad(..))
 
 $(moduleId 101)
 
-data MapLikeCommand v = Insert !v | Delete | Focus -- todo: Pop
+data MapLikeCommand v = Insert !v | Delete -- | Focus -- todo: Pop
   deriving Show
 data MapLikeSel = SelEq ![Chunk] | SelMin | SelMax
   deriving Show
@@ -26,7 +28,7 @@ data MapLikeScript v = MapLikeScript !(Set [Chunk]) ![(MapLikeSel, MapLikeComman
   deriving Show
 
 instance Arbitrary v => Arbitrary (MapLikeCommand v) where
-  arbitrary = frequency [ (2, Insert <$> arbitrary), (2, pure Delete), (1, pure Focus) ]
+  arbitrary = frequency [ (2, Insert <$> arbitrary), (2, pure Delete) ]
   shrink _ = []
 
 chunkKeys :: Gen (Set [Chunk])
@@ -79,7 +81,7 @@ processCommandMap (k1, v1) m =
     Just k2 -> case v1 of
       Insert v -> pure $ Map.insert k2 v m
       Delete -> pure $ Map.delete k2 m
-      Focus -> pure m
+      -- Focus -> pure m
 
 processScriptMap :: MapLikeScript a -> Identity (([Maybe a], [Maybe a]), Map [Chunk] a)
 processScriptMap = processScript processCommandMap (\case
@@ -87,55 +89,61 @@ processScriptMap = processScript processCommandMap (\case
   SelMin -> pure . fmap snd . Map.lookupMin
   SelMax -> pure . fmap snd . Map.lookupMax) Map.empty
 
-processCommandRadixZipper :: forall sig m v. Has FreshIO sig m => (MapLikeSel, MapLikeCommand v) -> RadixZipper Res [Chunk] v -> m (RadixZipper Res [Chunk] v)
-processCommandRadixZipper (k, v) m =
+processCommandRadixTree :: forall sig m v. (Has AppIO sig m, Ser v) => (MapLikeSel, MapLikeCommand v) -> RadixTree Res [Chunk] v -> m (RadixTree Res [Chunk] v)
+processCommandRadixTree (k, v) m =
     case k of
-      SelEq k2 -> hdl $ RZ.selEq k2
-      SelMin -> fmap (fromMaybe m) $ RZ.min $ hdl RZ.selChoose
-      SelMax -> fmap (fromMaybe m) $ RZ.max $ hdl RZ.selChoose
+      SelEq k2 -> hdl $ RT.selEq k2
+      SelMin -> fmap (fromMaybe m) $ RT.runNonDetMin $ hdl RT.selNonDet
+      SelMax -> fmap (fromMaybe m) $ RT.runNonDetMax $ hdl RT.selNonDet
   where
-    hdl :: (Has FreshIO sig2 m2, RZ.SelectorZipper sel (ReduceC m2)) => sel [Chunk] RZ.SZipper -> m2 (RadixZipper Res [Chunk] v)
+    hdl :: (Has AppIO sig2 m2, RT.Selector sel (ReduceC m2)) => sel [Chunk] RT.STree -> m2 (RadixTree Res [Chunk] v)
     hdl sel = case v of
-      Insert v2 -> RZ.insert sel v2 m
-      Delete -> RZ.delete sel m
-      Focus -> RZ.focus sel m
+      Insert v2 -> RT.insert sel v2 m
+      Delete -> RT.delete sel m
+      -- Focus -> RT.focus sel m
 
-unsafeRunFreshIO :: FreshIOC a -> a
-unsafeRunFreshIO = unsafePerformIO . runFreshIO
+unsafeRunAppIO :: AppIOC a -> a
+unsafeRunAppIO = unsafePerformIO . runReader env . unAppIOC
+  where
+    env = Env
+      (unsafePerformIO $ newIORef 0)
+      mempty
+      (unsafePerformIO $ newMVar mempty)
+      (EnvLoad \_ -> fail "not available")
+      (EnvStore \_ -> fail "not available")
+      (unsafePerformIO $ newMVar RT.empty)
+      (unsafePerformIO $ newMVar mempty)
+      (unsafePerformIO $ newMVar ([], 0))
 
-processScriptRadixZipper :: Has FreshIO sig m => MapLikeScript a -> m (([Maybe a], [Maybe a]), RadixZipper Res [Chunk] a)
-processScriptRadixZipper = processScript processCommandRadixZipper (\case
-  SelEq k -> RZ.lookup (RZ.selEq k)
-  SelMin -> fmap join . RZ.min . RZ.lookup RZ.selChoose
-  SelMax -> fmap join . RZ.max . RZ.lookup RZ.selChoose) RZ.empty
+processScriptRadixTree :: (Has AppIO sig m, Ser a) => MapLikeScript a -> m (([Maybe a], [Maybe a]), RadixTree Res [Chunk] a)
+processScriptRadixTree = processScript processCommandRadixTree (\case
+  SelEq k -> RT.lookup (RT.selEq k)
+  SelMin -> fmap join . RT.runNonDetMin . RT.lookup RT.selNonDet
+  SelMax -> fmap join . RT.runNonDetMax . RT.lookup RT.selNonDet) RT.empty
 
 prop_script_same :: MapLikeScript Int -> Bool
-prop_script_same cmds = fst (runIdentity $ processScriptMap @Int cmds) == fst (unsafeRunFreshIO $ processScriptRadixZipper @_ @_ @Int cmds)
+prop_script_same cmds = fst (runIdentity $ processScriptMap @Int cmds) == fst (unsafeRunAppIO $ processScriptRadixTree @_ @_ @Int cmds)
 
 -- from/to list
 
 prop_from_to_list_rt :: Property
-prop_from_to_list_rt = withMaxSuccess 50 \(kv :: [([Chunk], Int)]) -> unsafeRunFreshIO (RT.toListM =<< RT.fromListM @Res kv) == (Map.toList $ Map.fromList kv)
+prop_from_to_list_rt = withMaxSuccess 50 \(kv :: [([Chunk], Int)]) -> unsafeRunAppIO (RT.toListM =<< RT.fromListM @Res kv) == (Map.toList $ Map.fromList kv)
 
-data RadixZipperInp v = RadixZipperInp ![Chunk] ![([Chunk], v)]
+data RadixTreeInp v = RadixTreeInp ![([Chunk], v)]
   deriving Show
 
-instance Arbitrary v => Arbitrary (RadixZipperInp v) where
+instance Arbitrary v => Arbitrary (RadixTreeInp v) where
   arbitrary = do
     ks <- Set.toList <$> chunkKeys
     kvs <- for ks \k -> (k,) <$> arbitrary
-    focus <- elements ks
-    pure $ RadixZipperInp focus kvs
-  shrink (RadixZipperInp focus vals) = RadixZipperInp focus <$> shrinkList shrinkNothing vals
-
-mkRadixZipper :: Has FreshIO sig m => RadixZipperInp v -> m (RadixZipper Res [Chunk] v)
-mkRadixZipper (RadixZipperInp focus kvs) = RZ.focus (RZ.selEq focus) =<< RZ.fromListM kvs
+    pure $ RadixTreeInp kvs
+  shrink (RadixTreeInp vals) = RadixTreeInp <$> shrinkList shrinkNothing vals
 
 prop_from_to_list_rz :: Property
-prop_from_to_list_rz = withMaxSuccess 50 \inp@(RadixZipperInp @Int _ kvs) -> unsafeRunFreshIO (RZ.toAscListM =<< mkRadixZipper inp) == kvs
+prop_from_to_list_rz = withMaxSuccess 50 \(RadixTreeInp @Int kvs) -> unsafeRunAppIO (RT.toListM @Res =<< RT.fromListM kvs) == kvs
 
 -- merge test
--- TODO: upgrade to RadixZipper
+-- TODO: upgrade to RadixTree
 
 data MergeInput v = MergeInput ![([Chunk], v)] ![([Chunk], v)]
   deriving Show
@@ -154,7 +162,7 @@ instance Arbitrary v => Arbitrary (MergeInput v) where
     pure $ MergeInput (fil fst) (fil snd)
   shrink (MergeInput a b) = uncurry MergeInput <$> shrink (a, b)
 
-mergeSubRT :: RT.RadixTree Res k Int -> RT.RadixTree Res k Int -> FreshIOC (RT.RadixTree Res k Int)
+mergeSubRT :: (InferValT k, Typeable k) => RT.RadixTree Res k Int -> RT.RadixTree Res k Int -> AppIOC (RT.RadixTree Res k Int)
 mergeSubRT =
   $sFreshI $ RT.merge
     AppForce
@@ -166,7 +174,7 @@ mergeSubRT =
 mergeSubMap :: Ord k => Map k Int -> Map k Int -> Map k Int
 mergeSubMap = Map.merge (Map.mapMissing $ const id) (Map.mapMissing \_ a -> -a) (Map.zipWithMatched \_ a b -> a - b)
 
-merge_same :: MergeInput Int -> FreshIOC (RT.RadixTree Res [Chunk] Int)
+merge_same :: MergeInput Int -> AppIOC (RT.RadixTree Res [Chunk] Int)
 merge_same (MergeInput kvs1 kvs2) = do
   t1 <- RT.fromListM kvs1
   t2 <- RT.fromListM kvs2
@@ -175,7 +183,7 @@ merge_same (MergeInput kvs1 kvs2) = do
 -- prop_merge_same :: MergeInput Int -> Bool
 prop_merge_same = withMaxSuccess 10000 \inp@(MergeInput kvs1 kvs2) ->
     let r2 = Map.toList $ mergeSubMap (Map.fromList kvs1) (Map.fromList kvs2)
-    in unsafeRunFreshIO (RT.toListM =<< merge_same inp) == r2 -- unsafeRunFreshIO (RT.toListM =<< mergeSubRT =<< RT.fromListM kvs) == Map.toList (mergeSubMap )
+    in unsafeRunAppIO (RT.toListM =<< merge_same inp) == r2 -- unsafeRunAppIO (RT.toListM =<< mergeSubRT =<< RT.fromListM kvs) == Map.toList (mergeSubMap )
 
 -- TODO: test NonDetLRC, upgrade to radix zipper in merge test
 

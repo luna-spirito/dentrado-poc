@@ -101,7 +101,6 @@ makeMask l r =
 -- is "there's nothing here in this continuous region".
 -- But this could be repurposed to store more cases.
 
-
 -- aliases
 
 type Map = RadixTree

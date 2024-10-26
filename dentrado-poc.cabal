@@ -43,9 +43,9 @@ test-suite th
     main-is: TH.hs
     build-depends: dentrado-poc-lib, QuickCheck >= 2
 
--- test-suite radix-tree
---     import: lang
---     type: exitcode-stdio-1.0
---     hs-source-dirs: tests
---     main-is: RadixTree.hs
---     build-depends: dentrado-poc-lib, QuickCheck >= 2
+test-suite radix-tree
+    import: lang
+    type: exitcode-stdio-1.0
+    hs-source-dirs: tests
+    main-is: RadixTree.hs
+    build-depends: dentrado-poc-lib, QuickCheck >= 2
