@@ -4,3 +4,4 @@
 3: Dentrado.POC.Db
 
 101: Tests.RadixTree
+102: Tests.Model

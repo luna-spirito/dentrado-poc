@@ -4,13 +4,12 @@ import RIO hiding (runReader, ask)
 import qualified Dentrado.POC.Data.RadixTree as RT
 import Control.Algebra
 import qualified RIO.Partial as P
-import Dentrado.POC.Memory (AppIOC, Res, InferValT (..), Ser, sendAI, AppForce (..), Container, InferContainerT, Delay, fetch, alloc, AppDelay (..), AppIO)
-import Dentrado.POC.Types (EventId (..), StateGraphEntry (..), maybeToEmpty)
+import Dentrado.POC.Memory (AppIOC, Res, InferValT (..), Ser, sendAI, AppForce (..), Container, InferContainerT, Delay, fetch, alloc, AppDelay (..), AppIO, tryFetch)
+import Dentrado.POC.Types (EventId (..), StateGraphEntry (..), maybeToEmpty, SiteAccessLevel, fromEmpty)
 import Data.Constraint (Dict(..))
-import Control.Carrier.State.Church (evalState, put, get, execState, StateC, runState, modify)
+import Control.Carrier.State.Church (evalState, execState, StateC, runState)
 import Control.Carrier.Reader (ReaderC, runReader)
-import Control.Carrier.Empty.Church (runEmpty)
-import Control.Effect.State (State)
+import Control.Effect.State (State (..), modify, get, put)
 import qualified RIO.Set as Set
 import qualified Control.Effect.Empty as E
 import qualified RIO.Map as Map
@@ -27,11 +26,11 @@ import Control.Effect.Reader (ask)
 -- Notice: StateGraph updates could modify multiple objects at the same time.
 newtype StateGraph k v = StateGraph { unStateGraph :: RT.Map Res k (RT.Map Res EventId (StateGraphEntry v)) }
 
-type UserId = EventId
-type LoginId = EventId
-
-class Same a where -- TODO: temporary
+class Same a where -- TODO: temporary, POC
   same :: a -> a -> Bool
+
+instance Same SiteAccessLevel where
+  same = (==)
 
 instance Same v => Same (StateGraphEntry v) where
   same StateGraphEntrySampled StateGraphEntrySampled = True
@@ -139,7 +138,7 @@ mkStateGraph evsA (depsA, hdl) =
       h0 <- get
       case Set.minView h0 of
         Nothing -> pure ()
-        Just (next, h) -> put h *> f next
+        Just (next, h) -> put h *> f next *> whilePop f
 
     process :: forall depsCache depsAccessed.
       (RT.Map c EventId event, RT.Map c EventId event) ->
@@ -191,11 +190,15 @@ mkStateGraph evsA (depsA, hdl) =
                     when (isWriteEntryMaybe oldVal || isWriteEntry newVal) $
                       lift $ lift $ lift $ lift $ lift $ markChanged oldUpdateFrom
                     alloc $ Just newVal
-          runEmpty (pure False) (const $ pure True) $ RT.update
-            (\oldUpdateFromM -> do
-              oldUpdateFrom <- fromMaybe RT.empty <$> fetch oldUpdateFromM
-              alloc . Just =<< RT.update (updateIfNeeded oldUpdateFrom) (RT.selEq evId) oldUpdateFrom)
-            (RT.selEq updateFromK) =<< get @(RT.MapR k (RT.MapR EventId (StateGraphEntry v)))
+          fromEmpty () $
+            get @(RT.MapR k (RT.MapR EventId (StateGraphEntry v))) >>=
+            RT.update
+              (\oldUpdateFromM -> do
+                oldUpdateFrom <- fromMaybe RT.empty <$> fetch oldUpdateFromM
+                alloc . Just =<< RT.update (updateIfNeeded oldUpdateFrom) (RT.selEq evId) oldUpdateFrom
+               )
+              (RT.selEq updateFromK) >>=
+            put
 
         -- deps
         put . DepsCache =<< sendAI . updDepsCache evId oldDeps newDeps . unDepsCache =<< get
@@ -219,8 +222,16 @@ data GetNowEventId m a where
 data Query k v m a where
   Query :: k -> Query k v m (Maybe v)
 
+query :: Has (Query k v) sig m => k -> m (Maybe v)
+query = send . Query
+{-# INLINE query #-}
+
 data Update k v m a where
   Update :: k -> AppIOC v -> Update k v m ()
+
+update :: Has (Update k v) sig m => k -> AppIOC v -> m ()
+update k = send . Update k
+{-# INLINE update #-}
 
 hdlQuery :: (Has AppIO sig m, Ser v, Typeable k, RT.IsRadixKey k) => EventId -> k -> StateGraph k v -> m (Maybe v)
 hdlQuery nowEvId k (StateGraph queriedSG) = RT.runNonDetMax do
@@ -257,4 +268,16 @@ instance (Has AppIO sig m, Typeable k, Ord k, RT.IsRadixKey k, Ser v) => Algebra
       pure $ ctx $> ()
     R other -> alg (unUpdateC . hdl) (R (R other)) ctx
   {-# INLINE alg #-}
+
+-- debug
+
+toLists :: (Has AppIO sig m, RT.IsRadixKey k, Ser v, Typeable k) => StateGraph k v -> m [(k, [(EventId, v)])]
+toLists (StateGraph perKeyRT) = do
+  perKey <- RT.toListM perKeyRT
+  for perKey \(k, perTimeRT) -> (k,) <$>do
+    perTime <- RT.toListM perTimeRT
+    let perTimeFiltered = perTime & mapMaybe \(evId, entry) -> (evId,) <$> case entry of
+          StateGraphEntrySampled -> Nothing
+          StateGraphEntryModified v -> Just v
+    pure perTimeFiltered
 

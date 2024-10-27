@@ -87,7 +87,7 @@ tryMask mask key =
   else Nothing
   where
     prefixBits = complement $ mask - 1 `xor` mask
-{-# INLINE tryMask #-}
+{-# INLINABLE tryMask #-}
 
 makeMask :: Chunk -> Chunk -> (Chunk, Bool)
 makeMask l r =
@@ -113,16 +113,16 @@ unMapDiffE = \case
   MapDel v -> (Just v, Nothing)
   MapUpd v1 v2 -> (Just v1, Just v2)
   MapAdd v -> (Nothing, Just v)
-{-# INLINE unMapDiffE #-}
+{-# INLINABLE unMapDiffE #-}
 
 fromMapDiffE :: v -> MapDiffE v -> (v, v)
 fromMapDiffE def = bimap (fromMaybe def) (fromMaybe def) . unMapDiffE
-{-# INLINE fromMapDiffE #-}
+{-# INLINABLE fromMapDiffE #-}
 
 hdlMapDiffE :: Monad m => (v -> a -> m a) -> (v -> a -> m a) -> MapDiffE v -> a -> m a
 hdlMapDiffE onDel onAdd (unMapDiffE -> (del, add)) =
   maybe pure onAdd add <=< maybe pure onDel del
-{-# INLINE hdlMapDiffE #-}
+{-# INLINABLE hdlMapDiffE #-}
 
 mkMapDiffE :: Maybe a -> Maybe a -> Maybe (MapDiffE a)
 mkMapDiffE a b = case (a, b) of
@@ -150,21 +150,21 @@ reduceChunk'' (Proxy @s) = \case
     | Nil <- left -> reduce' (Proxy @s) $> (right, Just right') -- hopefully no need to reduceChunk left/right
     | Nil <- right -> reduce' (Proxy @s) $> (left, Just left')
   nonReducible -> pure (nonReducible, Nothing)
-{-# INLINE reduceChunk'' #-}
+{-# INLINABLE reduceChunk'' #-}
 
 reduceChunk' :: (Container c, Has (AppIO :+: Reduce' s) sig m) => Proxy s -> RadixChunk' c k a -> m (RadixChunk' c k a)
 reduceChunk' p v = fst <$> reduceChunk'' p v
-{-# INLINE reduceChunk' #-}
+{-# INLINABLE reduceChunk' #-}
 
 reduceChunk :: (Container c, Has (AppIO :+: Reduce) sig m) => RadixChunk' c k a -> m (RadixChunk' c k a)
 reduceChunk = reduceChunk' (Proxy @"")
-{-# INLINE reduceChunk #-}
+{-# INLINABLE reduceChunk #-}
 
 allocReducedChunk :: (Container c1, Container c2, Has AppIO sig m, Ser a, Typeable k) => (forall b. c2 b -> ReduceC m (c1 b)) -> RadixChunk' c2 k a -> m (c1 (RadixChunk c2 k a))
 allocReducedChunk f c = runReduce $ reduceChunk'' (Proxy @"") c >>= \case
   (v, Nothing) -> allocC $ mkReducible v
   (_, Just v) -> f v
-{-# INLINE allocReducedChunk #-}
+{-# INLINABLE allocReducedChunk #-}
 
 data SChunk
 data STree
@@ -214,11 +214,11 @@ accessRadix onSubT onFoundT onMissingC onTipC onBranchC =
 
 mkBinNonRe :: Container c => Bool -> Chunk -> c (RadixChunk c k a) -> c (RadixChunk c k a) -> RadixChunk' c k a
 mkBinNonRe right mask a b = Bin mask (if right then a else b) (if right then b else a)
-{-# INLINE mkBinNonRe #-}
+{-# INLINABLE mkBinNonRe #-}
 
 mkBin :: (Container c1, Container c2, Has AppIO sig m, Ser a, Typeable k)  => (forall b. c2 b -> ReduceC m (c1 b)) -> Bool -> Chunk -> c2 (RadixChunk c2 k a) -> c2 (RadixChunk c2 k a) -> m (c1 (RadixChunk c2 k a))
 mkBin f a b c d = allocReducedChunk f $ mkBinNonRe a b c d
-{-# INLINE mkBin #-}
+{-# INLINABLE mkBin #-}
 
 mkTipNonRe :: Chunk -> RadixTree c k a -> RadixChunk' c k a
 mkTipNonRe = Tip
@@ -238,9 +238,11 @@ internalLookup = accessRadix
 
 lookupKV :: (Has AppIO sig m, Selector sel (ReduceC m), Container c, IsRadixKey k, Ser a, Typeable k) => sel k STree -> RadixTree c k a -> m (Maybe (k, a))
 lookupKV k tr = runReduce $ join $ snd internalLookup [] k tr
+{-# INLINE lookupKV #-}
 
 lookup :: (Has AppIO sig m, Selector sel (ReduceC m), Container c, IsRadixKey k, Ser a, Typeable k) => sel k STree -> RadixTree c k a -> m (Maybe a)
 lookup k tr = fmap snd <$> lookupKV k tr
+{-# INLINE lookup #-}
 
 internalNested :: (Ser a, Container c, Algebra sig m, Has AppIO sig m, Typeable k) => c (Maybe a) -> [Chunk] -> m (c (RadixChunk c k a))
 internalNested finalVal ks = do
@@ -284,6 +286,7 @@ internalUpdate f = accessRadix
 -- short-circuit?
 update :: (Selector sel (ReduceC m), Container c, Has AppIO sig m, Ser a, Typeable k) => (c (Maybe a) -> ReduceC m (c (Maybe a))) -> sel k STree -> RadixTree c k a -> m (RadixTree c k a)
 update f k tr = runReduce $ join $ snd (internalUpdate f) [] k tr
+{-# INLINE update #-}
 
 -- short-circuit
 delete :: (Selector sel (ReduceC m), Container c, Has AppIO sig m, Ser a, Typeable k) => sel k STree -> RadixTree c k a -> m (RadixTree c k a)
@@ -446,7 +449,7 @@ mergeF onTree onBin onTip strat one1 one2 both sameM = mdo
           then h hdl
           else o
         Nothing -> \_ _ _ o -> o
-    checkSameMergeChunk a b = checkSame a a (\s -> lift $ lift $ onSameSubtree s a b) (mergeChunk a b)
+    checkSameMergeChunk a b = checkSame a b (\s -> lift $ lift $ onSameSubtree s a b) (mergeChunk a b)
   mergeVal <- stratMergeLift strat \r1 r2 -> do
     checkSame r1 r2
       (\s -> lift $ lift $ onSameValR s r1 r2)
@@ -602,7 +605,8 @@ diffF onTree onBin onTip onNil strat f = do
   w2 <- onOneWitherFM onTree onBin onTip onNil strat \_ x -> f (MapAdd x)
   mergeF onTree onBin onTip strat w1 w2
     (OnBoth \_ a _ b -> f (MapUpd a b))
-    (Just $ OnSame (\_ _ -> pure $ wrapB sNothing) (\_ _ -> pure $ wrapB sNothing) (\_ _ -> wrap <$> onNil) (\_ _ -> onNil))
+    Nothing
+    -- (Just $ OnSame (\_ _ -> pure $ wrapB sNothing) (\_ _ -> pure $ wrapB sNothing) (\_ _ -> wrap <$> onNil) (\_ _ -> onNil))
 
 diff :: (Has Fresh sig1 m1, MonadFix m1, AppMerge strat m2 c cfin, AppWither strat m2 c cfin, Has AppIO sig2 m2, Ser a, InferContainerT c, InferContainerT cfin, InferValT fin, InferValT a, InferValT k, Typeable k, Ser fin)
   => strat
@@ -672,6 +676,7 @@ runNonDetMin = runNonDet
     l' -> pure l')
   (pure . Just)
   (pure Nothing)
+{-# INLINE runNonDetMin #-}
 
 reverseNonDet :: NonDetC m a -> NonDetC m a -- Mi amas FP per tuta mia koro.
 reverseNonDet act = NonDetC \choose p n -> runNonDet (flip choose) p n act
@@ -679,6 +684,7 @@ reverseNonDet act = NonDetC \choose p n -> runNonDet (flip choose) p n act
 
 runNonDetMax :: Monad m => NonDetC m a -> m (Maybe a)
 runNonDetMax = runNonDetMin . reverseNonDet
+{-# INLINE runNonDetMax #-}
 
 -- For each value produced by the NonDetC m a, run the function.
 -- The function returns whether to continue consuming the NonDet computation.
@@ -806,8 +812,8 @@ toDelayed (RadixTree valM subM) = RadixTree (DelayPin valM) (toDelayedC subM) wh
 -- debug
 
 -- Stupid String-based show for debug
-tryFetchShow :: (Container c, Show a) => c a -> String
-tryFetchShow = maybe "<>" show . tryFetchC
+-- tryFetchShow :: (Container c, Show a) => c a -> String
+-- tryFetchShow = maybe "<>" show . tryFetchC
 
 -- instance (Container c, Show a) => Show (RadixTree c k a) where
 --   show (RadixTree val chunk) = "(RadixTree (" <> tryFetchShow val <> ") " <> tryFetchShow chunk <> ")"

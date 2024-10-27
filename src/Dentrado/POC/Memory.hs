@@ -47,7 +47,7 @@ $(moduleId 0)
 
 -- Misc
 
-newtype RevList a = UnsafeRevList [a]
+newtype RevList a = UnsafeRevList [a] deriving Functor
 
 instance Semigroup (RevList a) where
   UnsafeRevList a <> UnsafeRevList b = UnsafeRevList $ b <> a
@@ -63,9 +63,7 @@ revUnsnoc (UnsafeRevList x) = (\(v, l) -> (UnsafeRevList l, v)) <$> uncons x
 instance IsList (RevList a) where
   type Item (RevList a) = a
   fromList ls = UnsafeRevList $ reverse ls
-  {-# INLINE fromList #-}
   toList (UnsafeRevList ls) = reverse ls
-  {-# INLINE toList #-}
 
 -- TODO: SecureIO instead of IO, a top-level monad that catches IO errors
 -- TODO: cleanup funcs
@@ -122,7 +120,7 @@ data Env = Env
   , envGearsIndex :: !(MVar (RadixTree Res SerializedGearFn Int))
   , envGears :: !(MVar (IntMap Dynamic))
 
-  , envEvents :: !(MVar ([(EventId, Any1 Val)], Int))
+  , envEvents :: !(MVar (RevList (EventId, Any1 Val), Int))
   }
 
 newtype AppIOC a = AppIOC { unAppIOC :: ReaderC Env IO a }
@@ -403,9 +401,11 @@ runReduce' :: forall s sig m a. Has AppIO sig m => Reduce'C s m a -> m a
 runReduce' (Reduce'C act) = do
   flag <- sendAI $ newIORef False
   runReader flag act
+{-# INLINE runReduce' #-}
 
 runReduce :: forall sig m a. Has AppIO sig m => ReduceC m a -> m a
 runReduce = runReduce' @""
+{-# INLINE runReduce #-}
 
 catchReduce :: Has (AppIO :+: Reduce' s) sig m => Proxy s -> m a -> Reduce'C s AppIOC () -> m a
 catchReduce (Proxy @s) act onReduce = do
@@ -421,6 +421,7 @@ catchReduce (Proxy @s) act onReduce = do
       let (Reduce'C redAct) = onReduce
       in runReader flag redAct
     pure res
+{-# INLINE catchReduce #-}
 
 reduce' :: Has (AppIO :+: Reduce' s) sig m => Proxy s -> m ()
 reduce' (Proxy @s) = do
@@ -442,9 +443,11 @@ reducible' proxy reductor (Reducible red) f = do
     do
       newValue <- reductor orig
       sendAI $ writeIORef red newValue
+{-# INLINE reducible' #-}
 
 reducible :: Has (AppIO :+: Reduce) sig m => (a -> ReduceC AppIOC a) -> Reducible a -> (a -> m b) -> m b
 reducible = reducible' (Proxy @"")
+{-# INLINE reducible #-}
 
 -- Values and functions
 
@@ -577,6 +580,7 @@ data ValT a where
   -- ValTValGear :: ValT ctx -> ValT (ValGear ctx)
   ValTList :: ValT a -> ValT [a]
   ValTStateGraphEntry :: ValT a -> ValT (StateGraphEntry a)
+  ValTSiteAccessLevel :: ValT SiteAccessLevel
 
 -- EValT is an ephemeral extension of ValT. It includes types that
 -- cannot be easily serialized.
@@ -622,6 +626,8 @@ instance InferValT a => InferValT [a] where
   inferValT = ValTList inferValT
 instance InferValT a => InferValT (StateGraphEntry a) where
   inferValT = ValTStateGraphEntry inferValT
+instance InferValT SiteAccessLevel where
+  inferValT = ValTSiteAccessLevel
 
 class InferEValT a where
   inferEValT :: EValT a
@@ -649,6 +655,7 @@ valSerProof = \case
   -- ValTValGear (valSerProof -> Dict) -> Dict
   ValTList (valSerProof -> Dict) -> Dict
   ValTStateGraphEntry (valSerProof -> Dict) -> Dict
+  ValTSiteAccessLevel -> Dict
 
 evalTypeableProof :: EValT x -> Dict (Typeable x)
 evalTypeableProof = \case
@@ -703,9 +710,11 @@ deserValT = \case
   15 -> do
     Any1 a <- deser
     pure $ Any1 $ ValTList a
-  _16 -> do
+  16 -> do
     Any1 a <- deser
     pure $ Any1 $ ValTStateGraphEntry a
+  _17 -> do
+    pure $ Any1 ValTSiteAccessLevel
   -- >= 150 RESERVED FOR EVAL
 
 instance Ser (Any1 ValT) where
@@ -727,6 +736,7 @@ instance Ser (Any1 ValT) where
     -- ValTValGear ctx -> putWord8 14 *> ser (Any1 ctx)
     ValTList a -> putWord8 15 *> ser (Any1 a)
     ValTStateGraphEntry a -> putWord8 16 *> ser (Any1 a)
+    ValTSiteAccessLevel -> putWord8 17
     -- >= 150 RESERVED FOR EVal
   deser = getWord8 >>= deserValT
 
@@ -776,6 +786,7 @@ fetch = \case
       ResUnloaded k -> Right do
         v <- liftIO $ load @a k
         pure (ResLoaded k v, v)
+{-# INLINE fetch #-}
 
 tryFetch :: Res a -> Maybe a
 tryFetch = \case
@@ -802,9 +813,11 @@ tryFetchC c = tryUnwrap c >>= tryFetch
 
 fetchC' :: (Container c, Has (AppIO :+: Reduce' s) sig m, Ser a) => Proxy s -> c a -> m a
 fetchC' proxy x = fetch =<< unwrap' proxy x
+{-# INLINE fetchC' #-}
 
 fetchC :: (Container c, Has (AppIO :+: Reduce) sig m, Ser a) => c a -> m a
 fetchC = fetchC' (Proxy @"")
+{-# INLINE fetchC #-}
 
 instance Container Res where
   wrap = id

@@ -38,19 +38,22 @@ data StateGraphEntry v = StateGraphEntrySampled | StateGraphEntryModified !v
   deriving Generic
 
 newtype Timestamp = Timestamp Word32
-  deriving (Eq, Ord, Generic)
+  deriving (Eq, Ord, Show, Generic)
 
 -- | Event id, local to the timestamp.
 -- 8 highest bits represent id of the source cluster server.
 -- 24 lowest bit represent "epoch", monotonic id of event within the source cluster server within the second.
 newtype LocalId = LocalId Word32
-  deriving (Eq, Ord, Generic)
+  deriving (Eq, Ord, Show, Generic)
 -- | Full Event ID
 data EventId = EventId !Timestamp !LocalId
   deriving (Eq, Ord, Generic)
 
+instance Show EventId where
+  show (EventId (Timestamp a) (LocalId b)) = "#" <> show a <> "-" <> show b
+
 data SiteAccessLevel = SalNone | SalUser | SalModerator | SalAdmin
-  deriving Generic
+  deriving (Eq, Show, Generic)
 
 -- let Event =
 --   < Admin:
@@ -81,11 +84,12 @@ data SiteAccessLevel = SalNone | SalUser | SalModerator | SalAdmin
 
 
 data Event
-  = AdminSetAccessLevel !EventId !EventId !SiteAccessLevel -- #0: admin, user, level
-  -- | AdminRevoke !EventId !EventId -- #1: admin, user event
-  | UserCreateMessage !EventId !Bool -- #2: user, owned?
+  = CreateUser
+  | AdminSetAccessLevel !(Maybe EventId) !EventId !SiteAccessLevel -- #1: admin, user, level
+  -- | AdminRevoke !EventId !EventId -- #2: admin, user event
+  | UserCreateMessage !EventId !Bool -- #3: user, owned?
   | UserEditMessage !EventId !EventId !(Maybe (Maybe Text, (Maybe Text, [(Text, Maybe EventId)]))) -- #3: user, message, new content?: update title?, update content?, update-set subpages
-  deriving Generic
+  deriving (Show, Generic)
 
 -- Util functions
 -- TODO: Move them.

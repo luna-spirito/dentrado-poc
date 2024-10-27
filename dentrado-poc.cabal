@@ -8,6 +8,8 @@ build-type:      Simple
 
 common lang
     ghc-options: -Wall
+    -- -fspecialise-aggressively -fexpose-all-unfoldings
+    -- -fllvm
     default-language: Haskell2010
     default-extensions: NoImplicitPrelude, BangPatterns, ExistentialQuantification,
         GADTs, ScopedTypeVariables, TypeApplications, ImpredicativeTypes, BlockArguments,
@@ -48,4 +50,11 @@ test-suite radix-tree
     type: exitcode-stdio-1.0
     hs-source-dirs: tests
     main-is: RadixTree.hs
+    build-depends: dentrado-poc-lib, QuickCheck >= 2
+
+test-suite model
+    import: lang
+    type: exitcode-stdio-1.0
+    hs-source-dirs: tests
+    main-is: Model.hs
     build-depends: dentrado-poc-lib, QuickCheck >= 2

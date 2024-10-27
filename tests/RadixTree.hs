@@ -12,11 +12,9 @@ import qualified Dentrado.POC.Data.RadixTree as RT
 import Dentrado.POC.TH (moduleId, sFreshI)
 import qualified Data.Map.Merge.Strict as Map
 import Dentrado.POC.Types (Chunk, RadixTree)
-import Dentrado.POC.Memory (Res, AppIOC, AppIO, AppForce (..), allocC, ReduceC, unAppIOC, Ser, EnvStore(..), InferValT)
+import Dentrado.POC.Memory (Res, AppIOC, AppIO, AppForce (..), allocC, ReduceC, unAppIOC, Ser, EnvStore(..), InferValT, EnvLoad(..), Env(..), sNothing, wrapB)
 import qualified Dentrado.POC.Types as RT
 import Control.Carrier.Reader (runReader)
-import Dentrado.POC.Memory (Env(..))
-import Dentrado.POC.Memory (EnvLoad(..))
 import Control.Carrier.NonDet.Church (runNonDetA)
 
 $(moduleId 101)
@@ -164,7 +162,7 @@ mergeSubRT =
     RT.onOneKeep
     ($sFreshI $ RT.onOneWitherM AppForce \_ b -> allocC $ Just (- b))
     (RT.OnBoth \_ a _ b -> allocC $ Just $ a - b)
-    Nothing
+    (Just $ RT.OnSame (\_ _ -> pure $ wrapB sNothing) (\_ _ -> pure $ wrapB sNothing) (\_ _ -> pure $ wrapB RT.sNil) (\_ _ -> pure $ wrapB RT.sNil))
 
 mergeSubMap :: Ord k => Map k Int -> Map k Int -> Map k Int
 mergeSubMap = Map.merge (Map.mapMissing $ const id) (Map.mapMissing \_ a -> -a) (Map.zipWithMatched \_ a b -> a - b)

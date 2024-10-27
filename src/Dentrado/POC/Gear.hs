@@ -7,8 +7,8 @@ import Control.Algebra
 import Control.Effect.Fresh (Fresh)
 import qualified RIO.Partial as P
 import Dentrado.POC.TH (moduleId)
-import Dentrado.POC.Memory (AppIOC, (:->) (..), Res, ValT (..), M (..), Gear (..), InferValT (..), Env (..), unstableSerialized, tryLazy, GearTemplate (..), GearFn (..), SerializedGearFn (..), Ser, sendAI, funApp', valSerProof, builtin, tryFromVal, AppForce (..), Container, InferContainerT, InferEValT (..))
-import Dentrado.POC.Types (EventId (..), Event (..), SiteAccessLevel (..), LocalId (..), Timestamp (..))
+import Dentrado.POC.Memory (AppIOC, (:->) (..), Res, ValT (..), M (..), Gear (..), InferValT (..), Env (..), unstableSerialized, tryLazy, GearTemplate (..), GearFn (..), SerializedGearFn (..), Ser, sendAI, funApp', valSerProof, builtin, tryFromVal, AppForce (..), Container, InferContainerT, InferEValT (..), RevList (..))
+import Dentrado.POC.Types (EventId (..), Event (..))
 import Data.Dynamic (Dynamic (..), fromDynamic)
 import Control.Effect.Reader (asks)
 import qualified Data.IntMap.Strict as IMap
@@ -61,7 +61,7 @@ confGear :: (InferValT ctx, {-InferValT cfg, InferValT cache, Ser cache,-} Typea
 confGear template exGearM ctx = case exGearM of
   Nothing -> confNewGear template ctx
   Just exGear -> reconfGear exGear ctx
-{-# INLINE confGear #-}
+{-# INLINABLE confGear #-}
 
 runGear :: Gear ctx out -> AppIOC out
 runGear (UnsafeGear cacheT@(valSerProof -> Dict) (GearFn cfgT cfg (UnsafeGearTemplate _ _ fn)) cacheInd) = do
@@ -83,7 +83,7 @@ builtinGearTemplate' cfgT cacheT cache cfgM fnM = do
   cfg <- builtinFunM cfgM
   fn <- builtinFunM fnM
   pure $ GearTemplate' cfgT cacheT $ UnsafeGearTemplate cache cfg fn
-{-# INLINE builtinGearTemplate #-}
+{-# INLINABLE builtinGearTemplate #-}
 
 builtinGearTemplate :: (Has Fresh sig m, InferValT cfg, InferValT cache) => cache -> ((ctx, Maybe cfg) -> AppIOC cfg) -> ((cfg, cache) -> AppIOC (out, cache)) -> m (GearTemplate' ctx out)
 builtinGearTemplate = builtinGearTemplate' inferValT inferValT
@@ -111,23 +111,22 @@ instance Applicative (Asm ctx) where
 
 asmGear :: (InferValT a, InferEValT out, Typeable a, Typeable out) => GearTemplate' a out -> Asm a out
 asmGear template = Asm (ValTGear inferValT inferEValT) ValTUnit () {-_Unit-} (\(ctx, gearM) -> confGear template gearM ctx) \(gear, _) -> (,()) <$> runGear gear
-{-# INLINE asmGear #-}
+{-# INLINABLE asmGear #-}
 
 asmCached :: InferValT cache => cache -> Asm ctx (cache -> AppIOC (out, cache)) -> Asm ctx out
 asmCached initial1 (Asm cfgT cacheT initial configure fn) = Asm cfgT (ValTTuple inferValT cacheT) (initial1, initial) configure
   \(cfg, (thisCache, otherCache)) -> fn (cfg, otherCache) >>= \(fn', outOtherCache) -> fmap (, outOtherCache) <$> fn' thisCache
-{-# INLINE asmCached #-}
 
 -- TODO: I *really* don't like this, but this thing relates to the question of how applicative/selective functors can be
 -- embedded into algebraic effects.
 -- asmBind :: Asm ctx a -> (a -> AppIOC b) -> Asm ctx b
 -- asmBind (Asm cfgT cacheT initial configure fn) f = Asm cfgT cacheT initial configure $ fn >=> \(a, cache) -> (, cache) <$> f a
--- {-# INLINE asmBind #-}
+-- {-# INLINABLE asmBind #-}
 
 asmAppIO :: Asm ctx (AppIOC a) -> Asm ctx a
 asmAppIO (Asm cfgT cacheT initial configure fn) = Asm cfgT cacheT initial configure $
   fn >=> \(val, cache) -> (, cache) <$> val
-{-# INLINE asmAppIO #-}
+{-# INLINABLE asmAppIO #-}
 
 builtinAsmGearTemplate :: (Has Fresh sig m, InferValT ctx, Typeable ctx) => Asm ctx out -> m (GearTemplate' ctx out)
 builtinAsmGearTemplate (Asm cfgT cacheT initial configure fn) =
@@ -135,20 +134,21 @@ builtinAsmGearTemplate (Asm cfgT cacheT initial configure fn) =
 
 lookupBucket :: (Container c1, Container c2, RT.IsRadixKey k1, Ser v, Typeable k1, Typeable k2) => k1 -> RT.Map c1 k1 (RT.Map c2 k2 v) -> AppIOC (RT.Map c2 k2 v)
 lookupBucket k1 = fmap (fromMaybe RT.empty) . RT.lookup (RT.selEq k1)
-{-# INLINE lookupBucket #-}
+{-# INLINABLE lookupBucket #-}
 
 buffered :: InferValT out => out -> Asm ctx out -> Asm ctx (out, out)
 buffered cache0 outA = asmCached cache0 do
   out <- outA
   pure \old -> pure ((old, out), out)
-{-# INLINE buffered #-}
+{-# INLINABLE buffered #-}
 
 -- TODO: Temp
 events :: GearTemplate' () (RT.MapR EventId Event)
 events = $sFreshI $ builtinAsmGearTemplate $ asmCached
   (0, RT.empty @Res)
   $ pure \(oldLen, oldRes) -> do
-      (evs, newLen) <- readMVar =<< asks envEvents
+      (UnsafeRevList evs, newLen) <- readMVar =<< asks envEvents
+      -- traceM $ "processing " <> tshow (newLen - oldLen)
       newRes <- foldM
         (\rt (t, ev) ->
         tryFromVal @Event ev & maybe (pure rt) \v ->
@@ -190,22 +190,3 @@ bucket inputAsm semaphore = builtinAsmGearTemplate $ asmCached
         oldBuckets
         =<< RT.toListM @Res =<< RT.diffId AppForce oldInp newInp
       pure (newBuckets, (newInp, newBuckets))
-
-
--- data MultiGet
-
--- mkStateGraph
-
--- sal :: GearTemplate' UserId (StateGraph UserId SiteAccessLevel)
--- sal = $sFreshI $ builtinAsmGearTemplate $ mkStateGraph
---   _
---   _
---   _
-
-testSuite :: [Event]
-testSuite =
-  [ (AdminSetAccessLevel (e 0) (e 1) SalModerator)
-  , (AdminSetAccessLevel (e 1) (e 1) SalAdmin)
-  , (AdminSetAccessLevel (e 0) (e 2) SalAdmin)
-  ]
-  where e = EventId (Timestamp 0) . LocalId
