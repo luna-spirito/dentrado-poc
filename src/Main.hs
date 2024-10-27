@@ -1,7 +1,9 @@
-{-# LANGUAGE ApplicativeDo             #-}
+{-# LANGUAGE ApplicativeDo #-}
+
 module Main where
 
 import RIO
+
 {-
 import Dentrado.POC.Db
 import RIO
@@ -65,8 +67,6 @@ type Events = Map EventId EventData
 
 -- boilerplate instances
 
-
-
 -- utils
 
 newtype Comb f k v = Comb { unComb :: f k v }
@@ -97,12 +97,11 @@ groupSetUpd f (SetUpd added removed) =
 mapKVDiff :: Map k v -> Map k v -> SetUpd (k, v)
 mapKVDiff = _
 
-
 -- setToMap :: Set a -> Map a ()
 -- setToMap = Map.fromSet $ const ()
 
 {-
-TimeState — непустой список состояний. Тупо хранит состояния в разные точки времени.  
+TimeState — непустой список состояний. Тупо хранит состояния в разные точки времени.
 -}
 newtype TimeState a = TimeState (Map EventId a)
 
@@ -138,7 +137,7 @@ reagg oldInput newInputOr (AggTree oldCache) = AggTree $ f newInputOr where
   top = \case
     Map.In.Tip -> mempty
     Map.In.Bin _ _ v _ _ -> v
-  
+
   f newInput = case newInput of
     Map.In.Tip -> newInput
     Map.In.Bin s k _ l r
@@ -207,34 +206,26 @@ userByLogin = (getConst <$>) <$> withCache (mempty, mempty) do
 --   queryEvents <- events
 --   pure \(oldInput, oldOutput) -> do
 --     newInput <- queryEvents
---     let updInput 
+--     let updInput
 
 -- userByLogin/identify user by login: HashMap <Login> (TimeState <User>)
---  <- events 
+--  <- events
 -- actsByUser/acts per user: HashMap <User> (Set EventId)
 --  <- events + userByLogin
 -- profileByUser
 --  <- actsByUser + events
--- 
-    
-    
+--
 
-
-
-
-  
 {-
 Проблема в том, что Patch, в своём ядре, является штукой,
-которую можно применить 1 раз 
+которую можно применить 1 раз
 -}
 
 -- newtype Stateful a = Stateful (Map EventId )
-
-
 
 -- users :: Assembly Events m (m (HashMap EventId (TimeState EventId AccountData)))
 -- users = _
 -}
 
-main :: IO ()
+main ∷ IO ()
 main = pure ()
