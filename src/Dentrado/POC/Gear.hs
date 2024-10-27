@@ -9,7 +9,7 @@ import Data.Constraint (Dict (..))
 import Data.Dynamic (Dynamic (..), fromDynamic)
 import qualified Data.IntMap.Strict as IMap
 import qualified Dentrado.POC.Data.RadixTree as RT
-import Dentrado.POC.Memory (AppForce (..), AppIOC, Container, Env (..), Gear (..), GearFn (..), GearTemplate (..), InferContainerT, InferEValT (..), InferValT (..), M (..), Res, RevList (..), Ser, SerializedGearFn (..), ValT (..), builtin, funApp', sendAI, tryFromVal, tryLazy, unstableSerialized, valSerProof, (:->) (..))
+import Dentrado.POC.Memory (AppForce (..), AppIOC, Container, Env (..), Gear (..), GearFn (..), GearTemplate (..), InferContainerT, InferEValT (..), InferValT (..), M (..), Res, RevList (..), Ser, SerializedGearFn (..), ValT (..), builtinFunM, funApp', sendAI, tryFromVal, tryLazy, unstableSerialized, valSerProof)
 import Dentrado.POC.TH (moduleId, sFreshI)
 import Dentrado.POC.Types (Event (..), EventId (..))
 import RIO hiding (asks, runReader, toList)
@@ -18,11 +18,14 @@ import Type.Reflection (pattern TypeRep)
 
 $(moduleId 3)
 
+-- | Type alias for GearTemplate.
 data GearTemplate' ctx out = ∀ cache cfg. GearTemplate' !(ValT cfg) !(ValT cache) !(GearTemplate ctx out cache cfg)
 
--- TODO: Separate current inputs from AppIOC into a separate monad.
--- TODO: USE RES FOR GEARS!!!
--- Slow operation.
+{- | Internal function. Construct GearFn from a Gear.
+TODO: Separate current inputs from AppIOC into a separate monad.
+TODO: USE RES FOR GEARS!!!
+Slow operation.
+-}
 gearFromFn ∷
   (Typeable ctx, InferValT ctx, Ser cache, Typeable out) ⇒
   ValT cache →
@@ -43,11 +46,13 @@ gearFromFn cacheT forkedCache gearFn = do
         (,ind) <$> ins ind
   pure $ UnsafeGear cacheT gearFn cache
 
+-- | Configure new Gear from a GearTemplate' by providing the context.
 confNewGear ∷ (Typeable ctx, InferValT ctx {-InferValT cfg, InferValT cache, Ser cache,-}, Typeable out) ⇒ GearTemplate' ctx out → ctx → AppIOC (Gear ctx out)
 confNewGear (GearTemplate' cfgT cacheT@(valSerProof → Dict) template@(UnsafeGearTemplate initCache conf _fn)) ctx = do
   cfg ← unM $ funApp' (ValTTuple inferValT (ValTMaybe cfgT)) conf (ctx, Nothing)
   gearFromFn cacheT initCache $ GearFn cfgT cfg template
 
+-- | Reconfigure the Gear by providing new context. Attempts to transfer the old cache to the new Gear.
 reconfGear ∷ (Typeable ctx, InferValT ctx, Typeable out) ⇒ Gear ctx out → ctx → AppIOC (Gear ctx out)
 reconfGear (UnsafeGear cacheT@(valSerProof → Dict) (GearFn cfgT oldCfg template@(UnsafeGearTemplate _ conf _)) oldCacheInd) newCtx = do
   gearsV ← asks envGears
@@ -56,7 +61,7 @@ reconfGear (UnsafeGear cacheT@(valSerProof → Dict) (GearFn cfgT oldCfg templat
   -- TODO: optimization: early return if oldCfg == newCfg.
   gearFromFn cacheT oldCache $ GearFn cfgT newCfg template
 
--- Generalized confNewGear and reconfGear
+-- | Generalized confNewGear and reconfGear
 confGear ∷
   (InferValT ctx {-InferValT cfg, InferValT cache, Ser cache,-}, Typeable ctx, Typeable out) ⇒
   GearTemplate' ctx out →
@@ -68,6 +73,7 @@ confGear template exGearM ctx = case exGearM of
   Just exGear → reconfGear exGear ctx
 {-# INLINEABLE confGear #-}
 
+-- | Run configured Gear, returning its result.
 runGear ∷ Gear ctx out → AppIOC out
 runGear (UnsafeGear cacheT@(valSerProof → Dict) (GearFn cfgT cfg (UnsafeGearTemplate _ _ fn)) cacheInd) = do
   gearsV ← asks envGears
@@ -76,23 +82,22 @@ runGear (UnsafeGear cacheT@(valSerProof → Dict) (GearFn cfgT cfg (UnsafeGearTe
   sendAI $ modifyMVar_ gearsV \gears → pure $ IMap.insert cacheInd (Dynamic TypeRep newCache) gears -- TODO: better merging mechanisms to avoid rewrites
   pure out
 
-builtinFun ∷ (Has Fresh sig m) ⇒ (a → b) → m (a :-> b)
-builtinFun f = FunBuiltin <$> builtin f
-
-builtinFunM ∷ (Has Fresh sig m) ⇒ (a → f b) → m (a :-> M f b)
-builtinFunM f = builtinFun (M . f)
-
--- still unsafe
+-- | Make a GearTemplate out of static Haskell functions.
 builtinGearTemplate' ∷ (Has Fresh sig m) ⇒ ValT cfg → ValT cache → cache → ((ctx, Maybe cfg) → AppIOC cfg) → ((cfg, cache) → AppIOC (out, cache)) → m (GearTemplate' ctx out)
 builtinGearTemplate' cfgT cacheT cache cfgM fnM = do
   cfg ← builtinFunM cfgM
   fn ← builtinFunM fnM
   pure $ GearTemplate' cfgT cacheT $ UnsafeGearTemplate cache cfg fn
+
 {-# INLINEABLE builtinGearTemplate #-}
+
+-- | Make a GearTemplate out of static Haskell functions.
 builtinGearTemplate ∷ (Has Fresh sig m, InferValT cfg, InferValT cache) ⇒ cache → ((ctx, Maybe cfg) → AppIOC cfg) → ((cfg, cache) → AppIOC (out, cache)) → m (GearTemplate' ctx out)
 builtinGearTemplate = builtinGearTemplate' inferValT inferValT
 
--- TODO: to other module?
+{- | Abstraction to simplify construction of new Gears.
+Asm allows to create new Gears by composition of parts.
+-}
 data Asm ctx out = ∀ cfg cache. Asm !(ValT cfg) !(ValT cache) !cache !((ctx, Maybe cfg) → AppIOC cfg) !((cfg, cache) → AppIOC (out, cache))
 
 instance Functor (Asm ctx) where
@@ -115,10 +120,12 @@ instance Applicative (Asm ctx) where
   -- TODO: optimize for Units, removing unnecessary indirection
   {-# INLINE (<*>) #-}
 
+-- | `GearTemplate'`` can be converted into `Asm`. This is analogous to "subscribing" to the result of the Gear.
 asmGear ∷ (InferValT a, InferEValT out, Typeable a, Typeable out) ⇒ GearTemplate' a out → Asm a out
 asmGear template = Asm (ValTGear inferValT inferEValT) ValTUnit () {-_Unit-} (\(ctx, gearM) → confGear template gearM ctx) \(gear, _) → (,()) <$> runGear gear
 {-# INLINEABLE asmGear #-}
 
+-- | Cached computation can be embedded into `Asm`.
 asmCached ∷ (InferValT cache) ⇒ cache → Asm ctx (cache → AppIOC (out, cache)) → Asm ctx out
 asmCached initial1 (Asm cfgT cacheT initial configure fn) = Asm
   cfgT
@@ -127,34 +134,28 @@ asmCached initial1 (Asm cfgT cacheT initial configure fn) = Asm
   configure
   \(cfg, (thisCache, otherCache)) → fn (cfg, otherCache) >>= \(fn', outOtherCache) → fmap (,outOtherCache) <$> fn' thisCache
 
--- TODO: I *really* don't like this, but this thing relates to the question of how applicative/selective functors can be
--- embedded into algebraic effects.
--- asmBind :: Asm ctx a -> (a -> AppIOC b) -> Asm ctx b
--- asmBind (Asm cfgT cacheT initial configure fn) f = Asm cfgT cacheT initial configure $ fn >=> \(a, cache) -> (, cache) <$> f a
--- {-# INLINABLE asmBind #-}
-
-asmAppIO ∷ Asm ctx (AppIOC a) → Asm ctx a
-asmAppIO (Asm cfgT cacheT initial configure fn) =
-  Asm cfgT cacheT initial configure
-    $ fn
-    >=> \(val, cache) → (,cache) <$> val
-{-# INLINEABLE asmAppIO #-}
-
+-- | Construct `GearTemplate'` from constant `Asm`.
 builtinAsmGearTemplate ∷ (Has Fresh sig m, InferValT ctx, Typeable ctx) ⇒ Asm ctx out → m (GearTemplate' ctx out)
 builtinAsmGearTemplate (Asm cfgT cacheT initial configure fn) =
   builtinGearTemplate' cfgT cacheT initial configure fn
 
-lookupBucket ∷ (Container c1, Container c2, RT.IsRadixKey k1, Ser v, Typeable k1, Typeable k2) ⇒ k1 → RT.Map c1 k1 (RT.Map c2 k2 v) → AppIOC (RT.Map c2 k2 v)
-lookupBucket k1 = fmap (fromMaybe RT.empty) . RT.lookup (RT.selEq k1)
-{-# INLINEABLE lookupBucket #-}
-
+{- | Buffered `Asm` computation: returns current result along with the result returned on previous invocation.
+Useful to track changes.
+-}
 buffered ∷ (InferValT out) ⇒ out → Asm ctx out → Asm ctx (out, out)
 buffered cache0 outA = asmCached cache0 do
   out ← outA
   pure \old → pure ((old, out), out)
 {-# INLINEABLE buffered #-}
 
--- TODO: Temp
+-- Sample:
+
+{- | A Gear that accesses envEvents from Dentrado.POC.Memory's Env and collects them into a Radix Tree.
+Explicitly does not handle deletion of events: it's assumed that events are never deleted from the log.
+If some event needs to be cancelled, this should be another event.
+Obviously this is subject to change.
+TODO: POC: Temp
+-}
 events ∷ GearTemplate' () (RT.MapR EventId Event)
 events = $sFreshI
   $ builtinAsmGearTemplate
@@ -177,17 +178,18 @@ events = $sFreshI
 
 -- object or event -based? Both!
 
--- Bad oversimplified implementation
--- Actual one should maximise use of immutable data structures.
--- How? Select maximal subtree
+{- | Bucket partitioner.
+Processes incoming RadixTree, partitioning the key-value pairs into many buckets (also RadixTree's).
+TODO: Bad oversimplified implementation. Actual one should maximise use of immutable data structures.
+How? Select maximal subtree
+-}
 bucket ∷
-  (Has Fresh sig m, RT.IsRadixKey k, RT.IsRadixKey bucketK, Foldable t, InferContainerT c1, InferContainerT c2, InferContainerT c3, InferValT bucketK, InferValT v, InferValT k, InferValT ctx, Ser v, Container c2, Container c3, Container c1, Typeable k, Typeable ctx, Typeable bucketK) ⇒
+  (RT.IsRadixKey k, RT.IsRadixKey bucketK, Foldable t, InferContainerT c1, InferContainerT c2, InferContainerT c3, InferValT bucketK, InferValT v, InferValT k, InferValT ctx, Ser v, Container c2, Container c3, Container c1, Typeable k, Typeable ctx, Typeable bucketK) ⇒
   Asm ctx (RT.Map c3 k v) →
   (v → t bucketK) →
-  m (GearTemplate' ctx (RT.Map c2 bucketK (RT.Map c1 k v)))
-bucket inputAsm semaphore = builtinAsmGearTemplate
-  $ asmCached
-    (RT.empty, RT.empty) -- (old input, old index)
+  Asm ctx (RT.Map c2 bucketK (RT.Map c1 k v))
+bucket inputAsm semaphore = asmCached
+  (RT.empty, RT.empty) -- (old input, old index)
   $ do
     newInp ← inputAsm
     pure \(oldInp, oldBuckets) → do
@@ -212,3 +214,7 @@ bucket inputAsm semaphore = builtinAsmGearTemplate
           =<< RT.toListM @Res
           =<< RT.diffId AppForce oldInp newInp
       pure (newBuckets, (newInp, newBuckets))
+
+lookupBucket ∷ (Container c1, Container c2, RT.IsRadixKey k1, Ser v, Typeable k1, Typeable k2) ⇒ k1 → RT.Map c1 k1 (RT.Map c2 k2 v) → AppIOC (RT.Map c2 k2 v)
+lookupBucket k1 = fmap (fromMaybe RT.empty) . RT.lookup (RT.selEq k1)
+{-# INLINEABLE lookupBucket #-}

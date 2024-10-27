@@ -1,12 +1,11 @@
 import Control.Carrier.Reader (ask, runReader)
-import Data.List (head)
 import qualified Dentrado.POC.Data.RadixTree as RT
 import Dentrado.POC.Gear (GearTemplate', asmGear, builtinAsmGearTemplate, confNewGear, events, runGear)
 import Dentrado.POC.Memory (AppIOC (..), Env (..), EnvLoad (..), EnvStore (..), Val (..), ValT (..), sendAI)
 import Dentrado.POC.StateGraph (StateGraphDeps (..))
 import qualified Dentrado.POC.StateGraph as SG
 import Dentrado.POC.TH (moduleId, sFreshI)
-import Dentrado.POC.Types (Any1 (..), Event (..), EventId (..), LocalId (..), SiteAccessLevel (..), Timestamp (..))
+import Dentrado.POC.Types (Any1 (..), Event (..), EventId (..), LocalEventId (..), SiteAccessLevel (..), Timestamp (..), UserId)
 import GHC.Exts (IsList (..))
 import Language.Haskell.TH (newDeclarationGroup)
 import RIO hiding (ask, runReader)
@@ -36,8 +35,11 @@ putEventList evs = do
   sendAI $ void $ swapMVar evsM (fmap (Any1 . Val ValTEvent) <$> fromList evs, length evs)
 
 e ∷ Word32 → EventId
-e = EventId (Timestamp 0) . LocalId
+e = EventId (Timestamp 0) . LocalEventId
 
+{- | Test input: set of events, modeling the site with the concept of user access level.
+Admin users can change the level of other users, including other admins.
+-}
 test1 ∷ [(EventId, Event)]
 test1 =
   zipWith
@@ -56,9 +58,9 @@ test1 =
     , AdminSetAccessLevel (Just $ e 2) (e 4) SalModerator -- 4 is now moderator
     ]
 
-type UserId = EventId
-type LoginId = EventId
-
+{- | The Gear that processes the test input, returning the StateGraph
+which associates SiteAccessLevel to each UserId throughout all points of time.
+-}
 status ∷ GearTemplate' () (SG.StateGraph UserId SiteAccessLevel)
 status =
   $sFreshI
@@ -78,6 +80,7 @@ status =
           _ → pure ()
       )
 
+-- | Test expected result.
 test1Res ∷ [(UserId, [(EventId, SiteAccessLevel)])]
 test1Res =
   [ (e 0, [(e 4, SalAdmin)])
@@ -94,21 +97,21 @@ prop_test1_oneshot_correct =
       putEventList test1
       SG.toLists =<< runGear status'
 
+{- | This test shuffles the list of events and provides events to Dentrado one by one.
+It is expected that any shuffle of the input events yields the same result, since
+all events are associated with some point in time.
+Dentrado, being reactive, processes these events incrementally, but might
+perform expensive history rewrites to keep the result consistent.
+-}
 prop_test1_multishot_correct = withMaxSuccess 100 $ forAll
-  (shuffle test1) -- TODO: SHUFFLE!!!
+  (shuffle test1)
   \test1' →
     test1Res == unsafeRunAppIO do
-      -- traceM "running new"
       status' ← confNewGear status ()
       for_ @[] (inits test1') \curr → do
         _ ← runGear status'
         putEventList curr
-      res ← SG.toLists =<< runGear status'
-      -- traceShowM res
-      pure res
-
--- prop_
--- unsafeRunAppIO testSuite (runGear =<< confNewGear status ())
+      SG.toLists =<< runGear status'
 
 $(newDeclarationGroup)
 main ∷ IO ()

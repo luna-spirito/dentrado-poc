@@ -8,8 +8,7 @@ build-type:      Simple
 
 common lang
     ghc-options: -Wall
-    -- -fspecialise-aggressively -fexpose-all-unfoldings
-    -- -fllvm
+    -- -fspecialise-aggressively -fexpose-all-unfoldings -fllvm
     default-language: Haskell2010
     default-extensions: NoImplicitPrelude, BangPatterns, ExistentialQuantification,
         GADTs, ScopedTypeVariables, TypeApplications, ImpredicativeTypes, BlockArguments,

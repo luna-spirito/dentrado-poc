@@ -7,6 +7,18 @@ import Language.Haskell.TH (Exp (..), Lit (..), Q, appE, varE)
 import Language.Haskell.TH.Syntax (getQ, putQ)
 import RIO
 
+{-
+This module is used to generate static identifiers for constant objects.
+It is absolutely critical to only give out identifiers to constant objects.
+
+If $sFreshI is used with a non-constant value, it will result in catastrophe
+since Dentrado assumes that two objects with the same identifier are in fact equal and
+interchangeable.
+
+Identifiers for static & non-static objects are encoded in the same 64-bits, but runtime identifiers
+start from 0 and go up, and static identifiers start from 2^64-1 an go down.
+-}
+
 -- Current limit: 128 modules and 256 sFresh per module
 data StaticFresh = StaticFresh !Word8 !Word8
 

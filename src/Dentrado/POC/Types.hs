@@ -1,4 +1,4 @@
-module Dentrado.POC.Types where -- probably should be moved to Dentrado.POC.Data.Types?
+module Dentrado.POC.Types where
 
 import Control.Algebra
 import Control.Carrier.Empty.Church (Empty, EmptyC, empty, runEmpty)
@@ -7,14 +7,31 @@ import RIO
 import System.IO.Unsafe (unsafePerformIO)
 import qualified Type.Reflection as T
 
+{-
+This module exists due to the fact that Haskell disallows circular imports.
+It defines basic some basic types used in the Dentrado.
+-}
+
+-- Types for dynamically typed & untyped values. Needed to type operations related to external memory (disk).
 data Dynamic1 f = ∀ a. Dynamic1 !(T.TypeRep a) !(f a)
 data Any1 f = ∀ a. Any1 !(f a)
 
+-- Type alias to 4-byte unsigned integer.
+-- This type alias is related to the RadixTree, which splits each binary key in a series of Chunk's.
 type Chunk = Word32 -- WARNING: `Serialized a` & IsRadixKey assumes 4 bytes.
 
-{- | Presence of Delay fields in some types interferes with construction of the most optimal spine.
-Reducible is a potential fix that allows to "reduce" the spine as more Delayed computations
-are resolved.
+{-
+Dentrado contains laziness functionality, meaning that it can operate with data structure which are not
+fully evaluated.
+
+Reducible is a transparent (and omittable) wrapper that allows to possibly automatically reduce the spine of the
+reduced data structure. Related to `Delay`.
+
+TODO: This idea is not so bad in concept, but such reduction may not fire in non-linear context.
+At the same time, if linear access is enforced, there's no need for such wrapper to perform the optimisation
+(example: Higher Order Virtual Machine: Bend: Map/get)
+However, Haskell does not support linear types*.
+(* it actually does, but this will instantly get unbearable, since all the constructs in Haskell are not designed for linearity)
 -}
 newtype Reducible a = Reducible (IORef a)
 
@@ -24,8 +41,26 @@ readReducible (Reducible x) = unsafePerformIO $ readIORef x
 instance (Show a) ⇒ Show (Reducible a) where
   show = show . readReducible
 
+{-
+In Dentrado, the border between memory and disk data is blurred.
+Some data structures could be so large that they are only partially loaded into RAM, while the rest stays on disk.
+Current iteration of Dentrado uses special data type — Res — which is union/enum that is used to describe both disk and RAM data.
+Conventional huge data structures (lists, dictionaries, ...) need to be revised to support Res.
+
+Other possible implementation is to avoid defining such structures in Haskell and store objects directly in memory-mapped regions.
+-}
+
+{- |
+RadixTree is hypothesized to be the best general dictionary/map implementation for the needs of an immutable reactive database.
+It features:
+1) Stable structure, which allows to efficiently perform merge/diff operations and quickly identify changed subparts of the tree.
+2) Ordering, which allows to perform scan operations, relevant to the time-based operations.
+
+`c` stands for the generalized container type: either Res (regular container) or Delay (lazy container, which holds possibly non-evaluated values).
+-}
 data RadixTree c (k ∷ Type) a = RadixTree !(c (Maybe a)) !(c (RadixChunk c k a)) -- both element and next is containerized, both can be left unwrapped.
   deriving (Generic)
+
 type RadixChunk c (k ∷ Type) a = Reducible (RadixChunk' c k a)
 data RadixChunk' c (k ∷ Type) a
   = Nil
@@ -33,11 +68,20 @@ data RadixChunk' c (k ∷ Type) a
   | Bin !Chunk !(c (RadixChunk c k a)) !(c (RadixChunk c k a)) -- Either branch can be accessed, so containerization
   deriving (Generic)
 
+{- |
+`MapDiffE v` is used to capture the difference between the old value of type `v` and new value of type `v`.
+It appears, for example, when calculating the difference between old RadixTree and new RadixTree.
+-}
 data MapDiffE v = MapAdd !v | MapUpd !v !v | MapDel !v
   deriving (Generic)
+
+{- |
+Type use in the the StateGraph's internal implementation.
+-}
 data StateGraphEntry v = StateGraphEntrySampled | StateGraphEntryModified !v
   deriving (Generic)
 
+-- | Timestamp is 4 unsigned bytes.
 newtype Timestamp = Timestamp Word32
   deriving (Eq, Ord, Show, Generic)
 
@@ -45,58 +89,45 @@ newtype Timestamp = Timestamp Word32
 8 highest bits represent id of the source cluster server.
 24 lowest bit represent "epoch", monotonic id of event within the source cluster server within the second.
 -}
-newtype LocalId = LocalId Word32
+newtype LocalEventId = LocalEventId Word32
   deriving (Eq, Ord, Show, Generic)
 
--- | Full Event ID
-data EventId = EventId !Timestamp !LocalId
+-- | Full Event ID is a combination of timestamp and local event id.
+data EventId = EventId !Timestamp !LocalEventId
   deriving (Eq, Ord, Generic)
 
 instance Show EventId where
-  show (EventId (Timestamp a) (LocalId b)) = "#" <> show a <> "-" <> show b
+  show (EventId (Timestamp a) (LocalEventId b)) = "#" <> show a <> "-" <> show b
 
+{-
+The rest of the file should be moved as soon as possible, but this requires to invent the functionality for
+Dentrado to work with custom type.
+Currently, we just hardcode all the types used in tests.
+-}
+
+{- | Model: SiteAccessLevel: enum that defines priviliges of the site's user.
+Either user is an admin, or a moderator, or a regular user, or is simply banned (None).
+-}
 data SiteAccessLevel = SalNone | SalUser | SalModerator | SalAdmin
   deriving (Eq, Show, Generic)
 
--- let Event =
---   < Admin:
---       < SetAccessLevel: { user: UserId, level: SiteAccessLevel }
---       | Revoke: EventId
---       >
---   | User:
---       < CreateMessage: { owned: Bool } -- Обобщённое создание пустого поста/страницы.
---       | EditMessage:
---           { message: MessageId
---           , update:
---             < Delete: {} -- удалить сообщение
---             | Update: -- обновить отдельные поля сообщения
---               { titleUpdate: Optional Text
---               , contentUpdate: Optional Text
---               , subUpdate: Optional (Text :-> Optional MessageId)
---               }
---             >
---           }
---       | UpdateAttachment:
---           { what: MessageId
---           , to: MessageId
---           , relation: Optional < Like | Info | Dislike >
---           }
---       | Merge: BranchId
---       >
---   >
+type UserId = EventId -- Users/other entities could be represnted as events that created them.
+type LoginId = EventId
 
+-- | Model: Event: enum that defines list of events that are being processed to construct a site.
 data Event
-  = CreateUser
-  | AdminSetAccessLevel !(Maybe EventId) !EventId !SiteAccessLevel -- #1: admin, user, level
-  | -- | AdminRevoke !EventId !EventId -- #2: admin, user event
-    UserCreateMessage !EventId !Bool -- #3: user, owned?
-  | UserEditMessage !EventId !EventId !(Maybe (Maybe Text, (Maybe Text, [(Text, Maybe EventId)]))) -- #3: user, message, new content?: update title?, update content?, update-set subpages
+  = CreateUser -- #0: Marker. Is sent when a new user is created.
+  | -- | admin?, user, level
+    -- UNUSED: | | AdminRevoke !EventId !EventId -- #2: admin, user event
+    -- UNUSED: | UserCreateMessage !EventId !Bool -- #3: user, owned?
+    -- UNUSED: | UserEditMessage !EventId !EventId !(Maybe (Maybe Text, (Maybe Text, [(Text, Maybe EventId)]))) -- #3: user, message, new content?: update title?, update content?, update-set subpages
+    AdminSetAccessLevel !(Maybe UserId) !UserId !SiteAccessLevel -- #1: Is sent when some admin (or superuser) assignes new SiteAccessLevel to the user.
   deriving (Show, Generic)
 
 -- Util functions
 -- TODO: Move them.
 
--- Just like from maye
+-- Just like from maybe
 fromEmpty ∷ (Applicative m) ⇒ a → EmptyC m a → m a
 fromEmpty def = runEmpty (pure def) pure
 {-# INLINE fromEmpty #-}

@@ -9,7 +9,7 @@ import Control.Effect.State (State (..), get, modify, put)
 import Data.Constraint (Dict (..))
 import qualified Dentrado.POC.Data.RadixTree as RT
 import Dentrado.POC.Gear
-import Dentrado.POC.Memory (AppDelay (..), AppForce (..), AppIO, AppIOC, Container, Delay, InferContainerT, InferValT (..), Res, Ser, alloc, fetch, sendAI, tryFetch)
+import Dentrado.POC.Memory (AppDelay (..), AppForce (..), AppIO, AppIOC, Container, Delay, InferContainerT, InferValT (..), Res, Ser, alloc, fetch, sendAI)
 import Dentrado.POC.Types (EventId (..), SiteAccessLevel, StateGraphEntry (..), fromEmpty, maybeToEmpty)
 import RIO hiding (ask, runReader)
 import qualified RIO.Map as Map
@@ -17,16 +17,21 @@ import qualified RIO.Partial as P
 import qualified RIO.Set as Set
 
 {-
-Например. Пусть есть сайт. Администратор сайта — неизменяемая сущность, и задаётся она уровнем выше
-всего Userspace, так что любые модификации Userspace не смогут изменить изначального администратора.
+StateGraph (temporary? name) is a O(n^2) sledgehammer, powerful enough to emulate any* stateful tranformations within Dentrado.
+The core idea behind the StateGraph is presented in /stategraph.png in the root of the repository.
 
-? Можем и мы в таком случае считать, что администратор не привязан к конкретному событию?
+StateGraph conserves the state history for a group of objects, and how state of each one affected the state of another.
+State updates are performed by incoming events, which are interpreted in some way by the StateGraph.
+Whenever some past state of any object is rewritten, StateGraph re-evaluates the state of the updated object
+and all objects depending on it from the point of change to the present day.
 -}
 
--- Notice: StateGraph updates could modify multiple objects at the same time.
+{- | `StateGraph k v` stores state timeline for each `k`, where timeline is a relation between the point in time and the state.
+StateGraph also stores whenever the state of some object by key `k` is accessed by some other object to track all the dependencies.
+-}
 newtype StateGraph k v = StateGraph {unStateGraph ∷ RT.Map Res k (RT.Map Res EventId (StateGraphEntry v))}
 
-class Same a where -- TODO: temporary, POC
+class Same a where -- TODO: POC: temporary. A crutch to ensure short-circuiting when update doesn't need to be propagated.
   same ∷ a → a → Bool
 
 instance Same SiteAccessLevel where
@@ -37,12 +42,9 @@ instance (Same v) ⇒ Same (StateGraphEntry v) where
   same (StateGraphEntryModified x) (StateGraphEntryModified y) = x `same` y
   same _ _ = False
 
--- Dependent types is too much to represent this, this must be MUCH easier, although I believe that we'll have to
--- For querying extra dependencies.
 newtype QueryC k v m a = QueryC {unQueryC ∷ StateC (Set k) (ReaderC (StateGraph k v) m) a}
   deriving (Functor, Applicative, Monad)
 
--- For updating the StateGraph itself.
 newtype UpdateC k v m a = UpdateC {unUpdateC ∷ StateC (Map k (StateGraphEntry (AppIOC v))) (ReaderC (EventId, StateGraph k v) m) a}
   deriving (Functor, Applicative, Monad)
 
@@ -61,7 +63,6 @@ depsApplicativeProof = \case
 
 newtype DepsCache a = DepsCache {unDepsCache ∷ a} -- newtype to simplify inference
 
--- data RunWithDeps' m accessed = RunWithDeps' !(forall a. m a -> AppIOC (a, accessed))
 data RunWithDeps m ctx
   = ∀ depsAccessed depsCache.
     (InferValT depsCache) ⇒
@@ -71,13 +72,15 @@ data RunWithDeps m ctx
       !depsAccessed
       !depsCache
 
+-- | The core function: constructs new StateGraph.
 mkStateGraph ∷
   ∀ ctx c event k v handlerM.
   (InferValT k, InferValT v, Ser event, InferValT event, InferContainerT c, Container c, RT.IsRadixKey k, Ser v, Typeable k, Ord k, Same v) ⇒
-  Asm ctx (RT.Map c EventId event) → -- Events. They form the base of the stategraph.
-  -- Every StateGraph is event-based, and works by interpreting events.
+  -- | Events. They form the base of the stategraph.
+  Asm ctx (RT.Map c EventId event) →
+  -- | Every StateGraph is event-based, and works by interpreting events. Handler function for the event must be provided, along
+  -- with list of other StateGraph's that act as dependencies for this one and could be queried.
   (StateGraphDeps ctx handlerM, event → UpdateC k v handlerM ()) →
-  -- (event -> UpdateC k v AppIOC ()) ->
   Asm ctx (StateGraph k v)
 mkStateGraph evsA (depsA, hdl) =
   let
