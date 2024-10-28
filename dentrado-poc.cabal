@@ -7,8 +7,8 @@ maintainer:      guardspirit@protonmail.com
 build-type:      Simple
 
 common lang
-    ghc-options: -Wall
-    -- -fspecialise-aggressively -fexpose-all-unfoldings -fllvm
+    ghc-options: -Wall -fspecialise-aggressively -fexpose-all-unfoldings -funbox-strict-fields
+    -- -fllvm
     default-language: Haskell2010
     default-extensions: NoImplicitPrelude, BangPatterns, ExistentialQuantification,
         GADTs, ScopedTypeVariables, TypeApplications, ImpredicativeTypes, BlockArguments,

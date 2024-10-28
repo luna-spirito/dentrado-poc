@@ -2,7 +2,7 @@ module Dentrado.POC.TH where
 
 import Control.Algebra (run)
 import Control.Carrier.Fresh.Church (FreshC, evalFresh)
-import Data.Bits (unsafeShiftL)
+import Data.Bits (unsafeShiftL, complement)
 import Language.Haskell.TH (Exp (..), Lit (..), Q, appE, varE)
 import Language.Haskell.TH.Syntax (getQ, putQ)
 import RIO
@@ -38,7 +38,7 @@ sFresh =
       let newI = i + 1
       when (newI == 0) $ fail "Out of indexes"
       putQ $ StaticFresh modId newI
-      pure $ LitE $ IntegerL $ negate $ (fromIntegral modId `unsafeShiftL` 55) + (fromIntegral i `unsafeShiftL` 47)
+      pure $ LitE $ IntegerL $ complement $ (fromIntegral modId `unsafeShiftL` 55) + (fromIntegral i `unsafeShiftL` 47)
 
 freshI ∷ Int → FreshC Identity a → a
 freshI x y = run $ evalFresh x y

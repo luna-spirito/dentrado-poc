@@ -103,7 +103,7 @@ all events are associated with some point in time.
 Dentrado, being reactive, processes these events incrementally, but might
 perform expensive history rewrites to keep the result consistent.
 -}
-prop_test1_multishot_correct = withMaxSuccess 100 $ forAll
+prop_test1_multishot_correct = withMaxSuccess 1000 $ forAll
   (shuffle test1)
   \test1' →
     test1Res == unsafeRunAppIO do

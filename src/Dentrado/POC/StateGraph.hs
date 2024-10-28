@@ -97,6 +97,8 @@ mkStateGraph evsA (depsA, hdl) =
         >>> \(affId, aff) → do
           when (isRelevant aff) $ modify (Set.insert affId)
           pure $ not $ isWrite aff -- continue if not overwritten
+    {-# SCC affectedReads #-}
+
     mkRunWithDeps ∷ StateGraphDeps ctx m → RunWithDeps m ctx
     mkRunWithDeps = \case
       StateGraphDepsNil → RunWithDeps (pure (const $ fmap (,()), \_ → pure Set.empty)) (\_ _ _ _ → pure ()) () ()
@@ -181,7 +183,7 @@ mkStateGraph evsA (depsA, hdl) =
         prevStateGraph ← get @(RT.MapR k _)
         let runStateGraphUpdate (UpdateC a) =
               runReader (evId, StateGraph prevStateGraph)
-                $ runState (\res _ → pure res) Map.empty a
+                $ execState Map.empty a
             hdlEvFrom evSet = do
               evM ← RT.lookup (RT.selEq evId) evSet
               res ← for evM \ev →
@@ -233,6 +235,7 @@ mkStateGraph evsA (depsA, hdl) =
 
         -- deps
         put . DepsCache =<< sendAI . updDepsCache evId oldDeps newDeps . unDepsCache =<< get
+    {-# SCC process #-}
    in
     mkRunWithDeps depsA & \(RunWithDeps runWithDepsA updDepsCache emptyDepsAccessed initDepsCache) →
       asmCached (initDepsCache, RT.empty)
