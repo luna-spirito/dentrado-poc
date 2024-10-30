@@ -1,11 +1,10 @@
 module Shared.Model where
 
-import RIO
-import Dentrado.POC.Gear (GearTemplate', asmGear, events, builtinAsmGearTemplate)
+import Dentrado.POC.Gear (GearTemplate', asmGear, builtinAsmGearTemplate, events)
 import qualified Dentrado.POC.StateGraph as SG
-import Dentrado.POC.Types (UserId, SiteAccessLevel (..), Event (..))
-import Dentrado.POC.TH (sFreshI)
-import Dentrado.POC.TH (moduleId)
+import Dentrado.POC.TH (moduleId, sFreshI)
+import Dentrado.POC.Types (Event (..), SiteAccessLevel (..), UserId)
+import RIO
 
 $(moduleId 102)
 
@@ -30,4 +29,3 @@ status =
             when hasAccess $ SG.update target $ pure level
           _ → pure ()
       )
-

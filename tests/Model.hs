@@ -1,13 +1,13 @@
 import Dentrado.POC.Gear (confNewGear, runGear)
+import Dentrado.POC.Memory (AppIOC)
 import qualified Dentrado.POC.StateGraph as SG
 import Dentrado.POC.Types (Event (..), EventId (..), SiteAccessLevel (..), UserId)
 import Language.Haskell.TH (newDeclarationGroup)
 import RIO hiding (ask, runReader)
 import RIO.List (inits)
-import Test.QuickCheck
 import Shared.Model
 import Shared.Util
-import Dentrado.POC.Memory (AppIOC)
+import Test.QuickCheck
 
 {- | Test input: set of events, modeling the site with the concept of user access level.
 Admin users can change the level of other users, including other admins.
@@ -39,9 +39,9 @@ test1Res =
   , (e 4, [(e 10, SalModerator)])
   ]
 
-oneshot :: [(EventId, Event)] -> (SG.StateGraph EventId SiteAccessLevel -> AppIOC r) -> r --[(UserId, [(EventId, SiteAccessLevel)])]
+oneshot ∷ [(EventId, Event)] → (SG.StateGraph EventId SiteAccessLevel → AppIOC r) → r -- [(UserId, [(EventId, SiteAccessLevel)])]
 oneshot t renderer = unsafeRunAppIO do
-  status' <- confNewGear status ()
+  status' ← confNewGear status ()
   putEventList t
   renderer =<< runGear status'
 
@@ -50,7 +50,7 @@ prop_test1_oneshot_correct =
     $ test1Res
     == oneshot test1 SG.toLists
 
-multishot :: [(EventId, Event)] -> (SG.StateGraph UserId SiteAccessLevel -> AppIOC a) -> a
+multishot ∷ [(EventId, Event)] → (SG.StateGraph UserId SiteAccessLevel → AppIOC a) → a
 multishot t renderer = unsafeRunAppIO do
   status' ← confNewGear status ()
   for_ @[] (inits t) \curr → do

@@ -6,17 +6,17 @@ import Control.Carrier.State.Church (StateC, evalState, execState, runState)
 import qualified Control.Effect.Empty as E
 import Control.Effect.Reader (ask)
 import Control.Effect.State (State (..), get, modify, put)
+import Data.Bitraversable (bimapM)
 import Data.Constraint (Dict (..))
 import qualified Dentrado.POC.Data.RadixTree as RT
 import Dentrado.POC.Gear
-import Dentrado.POC.Memory (AppForce (..), AppIO, AppIOC, Container, InferContainerT, InferValT (..), Res, Ser, alloc, fetch, sendAI, ReduceC)
+import Dentrado.POC.Memory (AppForce (..), AppIO, AppIOC, Container, InferContainerT, InferValT (..), ReduceC, Res, Ser, alloc, fetch, sendAI)
 import Dentrado.POC.Types (EventId (..), SiteAccessLevel, StateGraphEntry (..), fromEmpty)
 import RIO hiding (ask, runReader)
+import RIO.List (sortBy)
 import qualified RIO.Map as Map
 import qualified RIO.Partial as P
 import qualified RIO.Set as Set
-import Data.Bitraversable (bimapM)
-import RIO.List (sortBy)
 
 {-
 StateGraph (temporary? name) is a O(n^2) sledgehammer, powerful enough to emulate any* stateful tranformations within Dentrado.
@@ -91,12 +91,13 @@ mkStateGraph evsA (depsA, hdl) =
     affectedReads ∷ (Ser a) ⇒ EventId → (RT.SetR EventId, RT.MapR EventId a) → StateC (Set EventId) AppIOC ()
     affectedReads evId (reads, writes) = do
       let lbound = RT.RBRestricted False $ RT.toRadixKey evId
-      upto <- join <$> RT.runNonDetMin (RT.lookup' (RT.selNonDetRanged (lbound, RT.RBUnrestricted)) writes)
+      upto ← join <$> RT.runNonDetMin (RT.lookup' (RT.selNonDetRanged (lbound, RT.RBUnrestricted)) writes)
       let rbound = case upto of
-            Just (RT.FinalPath xs, _) -> RT.RBRestricted True xs
-            _ -> RT.RBUnrestricted
-      void $ RT.forNonDet_ (P.fromJust <$> RT.lookupKV (RT.selNonDetRanged (lbound, rbound)) reads)
-        \(affId, _) -> modify (Set.insert affId)
+            Just (RT.FinalPath xs, _) → RT.RBRestricted True xs
+            _ → RT.RBUnrestricted
+      void $ RT.forNonDet_
+        (P.fromJust <$> RT.lookupKV (RT.selNonDetRanged (lbound, rbound)) reads)
+        \(affId, _) → modify (Set.insert affId)
     {-# SCC affectedReads #-}
 
     mkRunWithDeps ∷ StateGraphDeps ctx m → RunWithDeps m ctx
@@ -110,10 +111,10 @@ mkStateGraph evsA (depsA, hdl) =
                     ( \evId (QueryC act) →
                         fmap (\((a, b), c) → (b, (a, c))) $ otherRun evId $ runReader (StateGraph new) $ runState (curry pure) Set.empty act
                     , \(cache, otherCache) → do
-                        otherAff <- otherAffM otherCache
+                        otherAff ← otherAffM otherCache
                         execState otherAff do
-                          changedKeys <- RT.toListM =<< RT.diffId @_ @_ @Res AppForce old new
-                          for changedKeys \(k, RT.fromMapDiffE (RT.empty, RT.empty) -> (snd -> oldTimeline, snd -> newTimeline)) -> do
+                          changedKeys ← RT.toListM =<< RT.diffId @_ @_ @Res AppForce old new
+                          for changedKeys \(k, RT.fromMapDiffE (RT.empty, RT.empty) → (snd → oldTimeline, snd → newTimeline)) → do
                             cacheT ← fromMaybe RT.empty <$> RT.lookup (RT.selEq k) cache
                             updatedEvs ← RT.diffId AppForce oldTimeline newTimeline >>= RT.toListM @Res
                             for updatedEvs \(evId, _) →
@@ -183,10 +184,14 @@ mkStateGraph evsA (depsA, hdl) =
         ((newReads, newWrites), newDeps) ← hdlEvFrom newEvs
 
         let
-          updater :: forall sig2 m2. Has (State (RT.MapR k (RT.SetR EventId, RT.MapR EventId v)) :+: AppIO) sig2 m2 ⇒
-            (Maybe (RT.SetR EventId, RT.MapR EventId v) -> ReduceC m2 (RT.SetR EventId, RT.MapR EventId v)) -> k -> m2 ()
+          updater ∷
+            ∀ sig2 m2.
+            (Has (State (RT.MapR k (RT.SetR EventId, RT.MapR EventId v)) :+: AppIO) sig2 m2) ⇒
+            (Maybe (RT.SetR EventId, RT.MapR EventId v) → ReduceC m2 (RT.SetR EventId, RT.MapR EventId v)) →
+            k →
+            m2 ()
           updater cont delFromK =
-              get @(RT.MapR k (RT.SetR EventId, RT.MapR EventId v))
+            get @(RT.MapR k (RT.SetR EventId, RT.MapR EventId v))
               >>= RT.update
                 ( \oldDelFromM →
                     alloc . Just =<< cont =<< fetch oldDelFromM
@@ -194,19 +199,23 @@ mkStateGraph evsA (depsA, hdl) =
                 (RT.selEq delFromK)
               >>= put
           {-# INLINE updater #-}
-        
+
         -- Delete reads
-        for_ (Set.toList (oldReads `Set.difference` newReads)) $
-          updater $ bimapM (RT.delete (RT.selEq evId)) pure . P.fromJust
+        for_ (Set.toList (oldReads `Set.difference` newReads))
+          $ updater
+          $ bimapM (RT.delete (RT.selEq evId)) pure
+          . P.fromJust
 
         -- Create reads
-        for_ (Set.toList (newReads `Set.difference` oldReads)) $
-          updater $ bimapM (RT.insert (RT.selEq evId) ()) pure . fromMaybe (RT.empty, RT.empty)
+        for_ (Set.toList (newReads `Set.difference` oldReads))
+          $ updater
+          $ bimapM (RT.insert (RT.selEq evId) ()) pure
+          . fromMaybe (RT.empty, RT.empty)
 
         -- Remove deleted writes
         let fullyDeleted = oldWrites `Map.difference` newWrites
-        for_ (Map.keys fullyDeleted) $
-          updater \(P.fromJust -> timeline) -> do
+        for_ (Map.keys fullyDeleted)
+          $ updater \(P.fromJust → timeline) → do
             lift $ lift $ lift $ markChanged timeline
             bimapM pure (RT.delete $ RT.selEq evId) timeline
 
@@ -226,10 +235,12 @@ mkStateGraph evsA (depsA, hdl) =
                       $ lift
                       $ markChanged oldUpdateFrom
                     alloc $ Just newVal
-          fromEmpty () $ updater
-            (\(fromMaybe (RT.empty, RT.empty) → (oldUpdateReads, oldUpdateWrites)) →
-              (oldUpdateReads,) <$> RT.update (updateIfNeeded (oldUpdateReads, oldUpdateWrites)) (RT.selEq evId) oldUpdateWrites)
-            updateFromK
+          fromEmpty ()
+            $ updater
+              ( \(fromMaybe (RT.empty, RT.empty) → (oldUpdateReads, oldUpdateWrites)) →
+                  (oldUpdateReads,) <$> RT.update (updateIfNeeded (oldUpdateReads, oldUpdateWrites)) (RT.selEq evId) oldUpdateWrites
+              )
+              updateFromK
 
         -- deps
         put . DepsCache =<< sendAI . updDepsCache evId oldDeps newDeps . unDepsCache =<< get
@@ -268,13 +279,14 @@ update k = send . Update k
 {-# INLINE update #-}
 
 hdlQuery ∷ (Has AppIO sig m, Ser v, Typeable k, RT.IsRadixKey k) ⇒ EventId → k → StateGraph k v → m (Maybe v)
-hdlQuery nowEvId k (StateGraph queriedSG) = 
+hdlQuery nowEvId k (StateGraph queriedSG) =
   RT.lookup (RT.selEq k) queriedSG >>= \case
-    Nothing -> pure Nothing
-    Just (_, queriedTimeline) ->
-      let prevRange = (RT.RBUnrestricted, RT.RBRestricted False $ RT.toRadixKey nowEvId) in
-      RT.runNonDetMax $
-        P.fromJust <$> RT.lookup (RT.selNonDetRanged prevRange) queriedTimeline
+    Nothing → pure Nothing
+    Just (_, queriedTimeline) →
+      let prevRange = (RT.RBUnrestricted, RT.RBRestricted False $ RT.toRadixKey nowEvId)
+       in RT.runNonDetMax
+            $ P.fromJust
+            <$> RT.lookup (RT.selNonDetRanged prevRange) queriedTimeline
 {-# INLINE hdlQuery #-}
 
 instance (Has (GetNowEventId :+: AppIO) sig m, Typeable k, Ord k, RT.IsRadixKey k, Ser v) ⇒ Algebra (Query k v :+: sig) (QueryC k v m) where
@@ -314,6 +326,6 @@ toListsFull ∷ (Has AppIO sig m, RT.IsRadixKey k, Ser v, Typeable k) ⇒ StateG
 toListsFull (StateGraph perKeyRT) = do
   perKey ← RT.toListM perKeyRT
   for perKey \(k, (perTimeRT1, perTimeRT2)) → do
-    a <- RT.toListM perTimeRT1
-    b <- RT.toListM perTimeRT2
-    pure (k, sortBy (\(a', _) (b', _) -> compare b' a') (fmap Left <$> a) <> (fmap Right <$> b))
+    a ← RT.toListM perTimeRT1
+    b ← RT.toListM perTimeRT2
+    pure (k, sortBy (\(a', _) (b', _) → compare b' a') (fmap Left <$> a) <> (fmap Right <$> b))

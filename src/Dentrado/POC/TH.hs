@@ -2,7 +2,7 @@ module Dentrado.POC.TH where
 
 import Control.Algebra (run)
 import Control.Carrier.Fresh.Church (FreshC, evalFresh)
-import Data.Bits (unsafeShiftL, complement)
+import Data.Bits (complement, unsafeShiftL)
 import Language.Haskell.TH (Exp (..), Lit (..), Q, appE, varE)
 import Language.Haskell.TH.Syntax (getQ, putQ)
 import RIO

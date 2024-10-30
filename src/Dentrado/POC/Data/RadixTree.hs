@@ -282,7 +282,7 @@ lookup' k tr = runReduce $ join $ snd internalLookup [] k tr
 
 -- | Lookup with key.
 lookupKV ∷ (Has AppIO sig m, Selector sel (ReduceC m), Container c, IsRadixKey k, Ser a, Typeable k) ⇒ sel k STree → RadixTree c k a → m (Maybe (k, a))
-lookupKV k tr = fmap ((bimap (\(FinalPath fk) -> fromRadixKey fk)) id) <$> lookup' k tr
+lookupKV k tr = fmap ((bimap (\(FinalPath fk) → fromRadixKey fk)) id) <$> lookup' k tr
 {-# INLINE lookupKV #-}
 
 -- | Lookup.
@@ -865,7 +865,6 @@ forNonDet_ gen f = void $ runNonDetMin do
   lift (f i)
   E.empty
 {-# INLINE forNonDet_ #-}
-
 
 -- range
 
