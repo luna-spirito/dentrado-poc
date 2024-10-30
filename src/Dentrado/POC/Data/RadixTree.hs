@@ -21,7 +21,7 @@ import qualified Data.ByteString.Unsafe as B
 import Data.Foldable (foldrM)
 import Data.Kind (Type)
 import Data.Monoid (First (..))
-import Dentrado.POC.Memory (AppDelay (..), AppForce (..), AppIO, AppIOC, C (..), Container (..), Delay (..), DelayApp (..), InferContainerT, InferValT, M (..), Reduce, Reduce' (..), Reduce'C (..), ReduceC, Res (..), ResB (..), RevList, Ser, Serialized (..), SerializedGearFn (..), alloc, allocC, builtin, builtinFunM, delayAppBuiltinFun, fetch, fetchC, mkDelayCache, mkDelayLazy, mkReducible, reduce', reducible, reducible', revSnoc, runReduce, runReduce', sNothing, tryFetchC, unwrap, wrapB, (:->) (..))
+import Dentrado.POC.Memory (AppDelay (..), AppForce (..), AppIO, AppIOC, C (..), Container (..), Delay (..), DelayApp (..), InferContainerT, InferValT, Reduce, Reduce' (..), Reduce'C (..), ReduceC, Res (..), ResB (..), RevList, Ser, Serialized (..), SerializedGearFn (..), alloc, allocC, builtin, builtinFunM, delayAppBuiltinFun, fetch, fetchC, mkDelayCache, mkDelayLazy, mkReducible, reduce', reducible, reducible', revSnoc, runReduce, runReduce', sNothing, tryFetchC, unwrap, wrapB, (:->) (..))
 import Dentrado.POC.TH (moduleId, sFreshI)
 import Dentrado.POC.Types (Chunk, EventId (EventId), LocalEventId (..), MapDiffE (..), RadixChunk, RadixChunk' (..), RadixTree (..), Timestamp (..), maybeToEmpty, readReducible)
 import GHC.Exts (IsList (..))
@@ -148,8 +148,6 @@ mkMapDiffE a b = case (a, b) of
   (Just a', Nothing) → Just $ MapDel a'
   (Just a', Just b') → Just $ MapUpd a' b'
 
-data SetDiffE = SetAdd | SetDel
-
 -- Builtin empty chunk
 sNil ∷ ResB (RadixChunk c2 k a)
 sNil = $sFreshI $ builtin $ mkReducible Nil
@@ -268,24 +266,28 @@ mkTip f k v = allocReducedChunk f $ mkTipNonRe k v
 {-# INLINE mkTip #-}
 
 -- | Internal lookup functionality.
-internalLookup ∷ (Has (AppIO :+: Reduce) sig m, Selector sel m, Container c, IsRadixKey k, Ser a, Typeable k) ⇒ (RevList Chunk → sel k SChunk → c (RadixChunk c k a) → m (m (Maybe (k, a))), RevList Chunk → sel k STree → RadixTree c k a → m (m (Maybe (k, a))))
+internalLookup ∷ (Has (AppIO :+: Reduce) sig m, Selector sel m, Container c, IsRadixKey k, Ser a, Typeable k) ⇒ (RevList Chunk → sel k SChunk → c (RadixChunk c k a) → m (m (Maybe (FinalPath, a))), RevList Chunk → sel k STree → RadixTree c k a → m (m (Maybe (FinalPath, a))))
 internalLookup =
   accessRadix
     (\_ → id)
-    (\(FinalPath k) (RadixTree a _) → ((fromRadixKey k,) <$>) <$> fetchC a)
+    (\k (RadixTree a _) → ((k,) <$>) <$> fetchC a)
     (\_ _ _ → pure Nothing)
     (\_ → id)
     (\_ _ _ → id)
 {-# INLINE internalLookup #-}
 
+lookup' ∷ (Has AppIO sig m, Selector sel (ReduceC m), Container c, IsRadixKey k, Ser a, Typeable k) ⇒ sel k STree → RadixTree c k a → m (Maybe (FinalPath, a))
+lookup' k tr = runReduce $ join $ snd internalLookup [] k tr
+{-# INLINE lookup' #-}
+
 -- | Lookup with key.
 lookupKV ∷ (Has AppIO sig m, Selector sel (ReduceC m), Container c, IsRadixKey k, Ser a, Typeable k) ⇒ sel k STree → RadixTree c k a → m (Maybe (k, a))
-lookupKV k tr = runReduce $ join $ snd internalLookup [] k tr
+lookupKV k tr = fmap ((bimap (\(FinalPath fk) -> fromRadixKey fk)) id) <$> lookup' k tr
 {-# INLINE lookupKV #-}
 
 -- | Lookup.
 lookup ∷ (Has AppIO sig m, Selector sel (ReduceC m), Container c, IsRadixKey k, Ser a, Typeable k) ⇒ sel k STree → RadixTree c k a → m (Maybe a)
-lookup k tr = fmap snd <$> lookupKV k tr
+lookup k tr = fmap snd <$> lookup' k tr
 {-# INLINE lookup #-}
 
 -- | Create a new RadixTree of one element placed at some key.
@@ -856,16 +858,14 @@ runNonDetMax ∷ (Monad m) ⇒ NonDetC m a → m (Maybe a)
 runNonDetMax = runNonDetMin . reverseNonDet
 {-# INLINE runNonDetMax #-}
 
-{- | For each value produced by the NonDetC m a, run the function.
-The function returns whether to continue consuming the NonDet computation.
--}
-forNonDet_ ∷ (Algebra sig m) ⇒ NonDetC m a → (a → m Bool) → m ()
+-- | For each value produced by the NonDetC m a, run the function.
+forNonDet_ ∷ (Algebra sig m) ⇒ NonDetC m a → (a → m ()) → m ()
 forNonDet_ gen f = void $ runNonDetMin do
   i ← gen
-  lift (f i) >>= \case
-    True → E.empty -- Mark branch as "failed" and move on to the next one.
-    False → pure () -- Mark branch as successful, finishing the NonDet.
+  lift (f i)
+  E.empty
 {-# INLINE forNonDet_ #-}
+
 
 -- range
 

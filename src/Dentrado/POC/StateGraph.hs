@@ -9,12 +9,14 @@ import Control.Effect.State (State (..), get, modify, put)
 import Data.Constraint (Dict (..))
 import qualified Dentrado.POC.Data.RadixTree as RT
 import Dentrado.POC.Gear
-import Dentrado.POC.Memory (AppDelay (..), AppForce (..), AppIO, AppIOC, Container, Delay, InferContainerT, InferValT (..), Res, Ser, alloc, fetch, sendAI)
-import Dentrado.POC.Types (EventId (..), SiteAccessLevel, StateGraphEntry (..), fromEmpty, maybeToEmpty)
+import Dentrado.POC.Memory (AppForce (..), AppIO, AppIOC, Container, InferContainerT, InferValT (..), Res, Ser, alloc, fetch, sendAI, ReduceC)
+import Dentrado.POC.Types (EventId (..), SiteAccessLevel, StateGraphEntry (..), fromEmpty)
 import RIO hiding (ask, runReader)
 import qualified RIO.Map as Map
 import qualified RIO.Partial as P
 import qualified RIO.Set as Set
+import Data.Bitraversable (bimapM)
+import RIO.List (sortBy)
 
 {-
 StateGraph (temporary? name) is a O(n^2) sledgehammer, powerful enough to emulate any* stateful tranformations within Dentrado.
@@ -29,7 +31,7 @@ and all objects depending on it from the point of change to the present day.
 {- | `StateGraph k v` stores state timeline for each `k`, where timeline is a relation between the point in time and the state.
 StateGraph also stores whenever the state of some object by key `k` is accessed by some other object to track all the dependencies.
 -}
-newtype StateGraph k v = StateGraph {unStateGraph ∷ RT.Map Res k (RT.Map Res EventId (StateGraphEntry v))}
+newtype StateGraph k v = StateGraph {unStateGraph ∷ RT.Map Res k (RT.SetR EventId, RT.MapR EventId v)}
 
 class Same a where -- TODO: POC: temporary. A crutch to ensure short-circuiting when update doesn't need to be propagated.
   same ∷ a → a → Bool
@@ -45,7 +47,7 @@ instance (Same v) ⇒ Same (StateGraphEntry v) where
 newtype QueryC k v m a = QueryC {unQueryC ∷ StateC (Set k) (ReaderC (StateGraph k v) m) a}
   deriving (Functor, Applicative, Monad)
 
-newtype UpdateC k v m a = UpdateC {unUpdateC ∷ StateC (Map k (StateGraphEntry (AppIOC v))) (ReaderC (EventId, StateGraph k v) m) a}
+newtype UpdateC k v m a = UpdateC {unUpdateC ∷ StateC (Set k, Map k (AppIOC v)) (ReaderC (EventId, StateGraph k v) m) a}
   deriving (Functor, Applicative, Monad)
 
 data StateGraphDeps ctx m where
@@ -72,6 +74,8 @@ data RunWithDeps m ctx
       !depsAccessed
       !depsCache
 
+-- TODO: Same check!
+
 -- | The core function: constructs new StateGraph.
 mkStateGraph ∷
   ∀ ctx c event k v handlerM.
@@ -84,19 +88,15 @@ mkStateGraph ∷
   Asm ctx (StateGraph k v)
 mkStateGraph evsA (depsA, hdl) =
   let
-    isWriteEntry = \case
-      StateGraphEntryModified _ → True
-      _ → False
-    isWriteEntryMaybe = maybe False isWriteEntry
-
-    affectedReads ∷ (Container c2, Ser e) ⇒ EventId → RT.Map c2 EventId e → (e → Bool) → (e → Bool) → StateC (Set EventId) AppIOC ()
-    affectedReads evId rt isWrite isRelevant =
-      RT.forNonDet_
-        (RT.lookupKV (RT.selNonDetRanged (RT.RBRestricted False $ RT.toRadixKey evId, RT.RBUnrestricted)) rt)
-        $ P.fromJust
-        >>> \(affId, aff) → do
-          when (isRelevant aff) $ modify (Set.insert affId)
-          pure $ not $ isWrite aff -- continue if not overwritten
+    affectedReads ∷ (Ser a) ⇒ EventId → (RT.SetR EventId, RT.MapR EventId a) → StateC (Set EventId) AppIOC ()
+    affectedReads evId (reads, writes) = do
+      let lbound = RT.RBRestricted False $ RT.toRadixKey evId
+      upto <- join <$> RT.runNonDetMin (RT.lookup' (RT.selNonDetRanged (lbound, RT.RBUnrestricted)) writes)
+      let rbound = case upto of
+            Just (RT.FinalPath xs, _) -> RT.RBRestricted True xs
+            _ -> RT.RBUnrestricted
+      void $ RT.forNonDet_ (P.fromJust <$> RT.lookupKV (RT.selNonDetRanged (lbound, rbound)) reads)
+        \(affId, _) -> modify (Set.insert affId)
     {-# SCC affectedReads #-}
 
     mkRunWithDeps ∷ StateGraphDeps ctx m → RunWithDeps m ctx
@@ -106,30 +106,20 @@ mkStateGraph evsA (depsA, hdl) =
         | RunWithDeps otherRunA otherUpd otherEmptyAccessed otherCache0 ← mkRunWithDeps deps
         , Dict ← depsApplicativeProof deps →
             RunWithDeps @_ @_ @(Set k2, _) @(RT.MapR k2 (RT.SetR EventId), _)
-              ( ( \(old, new) (otherRun, otherAff) →
+              ( ( \(old, new) (otherRun, otherAffM) →
                     ( \evId (QueryC act) →
                         fmap (\((a, b), c) → (b, (a, c))) $ otherRun evId $ runReader (StateGraph new) $ runState (curry pure) Set.empty act
-                    , \(cache, otherCache) →
-                        otherAff otherCache
-                          >>= flip
-                            execState
-                            ( RT.diffId @_ @_ @Res AppForce old new >>= RT.toListM >>= traverse_ \(k, RT.fromMapDiffE RT.empty → (oldT, newT)) → do
-                                cacheT ← fromMaybe RT.empty <$> RT.lookup (RT.selEq k) cache
-                                unified ← lift $ RT.mergeId AppDelay (RT.toDelayed newT) (RT.toDelayed cacheT)
-                                updatedEvs ←
-                                  lift
-                                    $ mapMaybe (\(affId, RT.unMapDiffE → (oldEv, newEv)) → guard (isWriteEntryMaybe oldEv || isWriteEntryMaybe newEv) *> Just affId)
-                                    <$> (RT.diffId AppForce oldT newT >>= RT.toListM @Res)
-                                for_ updatedEvs \evId →
-                                  affectedReads @Delay
-                                    evId
-                                    unified
-                                    (fst >>> isWriteEntryMaybe)
-                                    ( snd >>> \case
-                                        Just () → True
-                                        Nothing → False
-                                    )
-                            )
+                    , \(cache, otherCache) → do
+                        otherAff <- otherAffM otherCache
+                        execState otherAff do
+                          changedKeys <- RT.toListM =<< RT.diffId @_ @_ @Res AppForce old new
+                          for changedKeys \(k, RT.fromMapDiffE (RT.empty, RT.empty) -> (snd -> oldTimeline, snd -> newTimeline)) -> do
+                            cacheT ← fromMaybe RT.empty <$> RT.lookup (RT.selEq k) cache
+                            updatedEvs ← RT.diffId AppForce oldTimeline newTimeline >>= RT.toListM @Res
+                            for updatedEvs \(evId, _) →
+                              affectedReads
+                                evId
+                                (cacheT, newTimeline)
                     )
                 )
                   <$> buffered RT.empty (unStateGraph <$> dep)
@@ -169,7 +159,7 @@ mkStateGraph evsA (depsA, hdl) =
       (EventId → depsAccessed → depsAccessed → depsCache → AppIOC depsCache) →
       depsAccessed →
       StateC
-        (RT.MapR k (RT.Map Res EventId (StateGraphEntry v)))
+        (RT.MapR k (RT.SetR EventId, RT.MapR EventId v))
         ( StateC
             (DepsCache depsCache)
             (StateC (Set EventId) AppIOC)
@@ -177,61 +167,69 @@ mkStateGraph evsA (depsA, hdl) =
         ()
     process (oldEvs, newEvs) runWithDeps updDepsCache emptyDepsAccessed =
       whilePop @EventId \evId → do
-        let markChanged timeline = affectedReads evId timeline isWriteEntry (const True)
+        let markChanged timeline = affectedReads evId timeline
 
         Dict ← pure $ depsApplicativeProof depsA
         prevStateGraph ← get @(RT.MapR k _)
         let runStateGraphUpdate (UpdateC a) =
               runReader (evId, StateGraph prevStateGraph)
-                $ execState Map.empty a
+                $ execState (Set.empty, Map.empty) a
             hdlEvFrom evSet = do
               evM ← RT.lookup (RT.selEq evId) evSet
               res ← for evM \ev →
                 sendAI $ runWithDeps evId $ runStateGraphUpdate $ hdl ev
-              pure $ fromMaybe (Map.empty, emptyDepsAccessed) res
-        (oldMain, oldDeps) ← hdlEvFrom oldEvs
-        (newMain, newDeps) ← hdlEvFrom newEvs
-        -- Remove deleted entries
-        let fullyDeleted = oldMain `Map.difference` newMain
-        for_ (Map.toList fullyDeleted) \(delFromK, deleted) →
-          get @(RT.MapR k (RT.MapR EventId (StateGraphEntry v)))
-            >>= RT.update
-              ( \oldDelFromM → do
-                  oldDelFrom ← P.fromJust <$> fetch oldDelFromM
-                  when (isWriteEntry deleted) $ lift $ lift $ lift $ markChanged oldDelFrom
-                  alloc . Just =<< RT.delete (RT.selEq evId) oldDelFrom
-              )
-              (RT.selEq delFromK)
-            >>= put
+              pure $ fromMaybe ((Set.empty, Map.empty), emptyDepsAccessed) res
+        ((oldReads, oldWrites), oldDeps) ← hdlEvFrom oldEvs
+        ((newReads, newWrites), newDeps) ← hdlEvFrom newEvs
+
+        let
+          updater :: forall sig2 m2. Has (State (RT.MapR k (RT.SetR EventId, RT.MapR EventId v)) :+: AppIO) sig2 m2 ⇒
+            (Maybe (RT.SetR EventId, RT.MapR EventId v) -> ReduceC m2 (RT.SetR EventId, RT.MapR EventId v)) -> k -> m2 ()
+          updater cont delFromK =
+              get @(RT.MapR k (RT.SetR EventId, RT.MapR EventId v))
+              >>= RT.update
+                ( \oldDelFromM →
+                    alloc . Just =<< cont =<< fetch oldDelFromM
+                )
+                (RT.selEq delFromK)
+              >>= put
+          {-# INLINE updater #-}
+        
+        -- Delete reads
+        for_ (Set.toList (oldReads `Set.difference` newReads)) $
+          updater $ bimapM (RT.delete (RT.selEq evId)) pure . P.fromJust
+
+        -- Create reads
+        for_ (Set.toList (newReads `Set.difference` oldReads)) $
+          updater $ bimapM (RT.insert (RT.selEq evId) ()) pure . fromMaybe (RT.empty, RT.empty)
+
+        -- Remove deleted writes
+        let fullyDeleted = oldWrites `Map.difference` newWrites
+        for_ (Map.keys fullyDeleted) $
+          updater \(P.fromJust -> timeline) -> do
+            lift $ lift $ lift $ markChanged timeline
+            bimapM pure (RT.delete $ RT.selEq evId) timeline
 
         -- Update entries
-        for_ (Map.toList $ newMain `Map.difference` fullyDeleted) \(updateFromK, newValM) → do
-          newVal ← case newValM of
-            StateGraphEntrySampled → pure StateGraphEntrySampled
-            StateGraphEntryModified xM → StateGraphEntryModified <$> sendAI xM
+        for_ (Map.toList $ newWrites `Map.difference` fullyDeleted) \(updateFromK, newValM) → do
+          newVal ← sendAI newValM
           -- TODO: temporary implementation
           let updateIfNeeded oldUpdateFrom oldValM = do
                 oldVal ← fetch oldValM
                 if maybe False (`same` newVal) oldVal
                   then E.empty
                   else do
-                    when (isWriteEntryMaybe oldVal || isWriteEntry newVal)
-                      $ lift
+                    lift
                       $ lift
                       $ lift
                       $ lift
                       $ lift
                       $ markChanged oldUpdateFrom
                     alloc $ Just newVal
-          fromEmpty ()
-            $ get @(RT.MapR k (RT.MapR EventId (StateGraphEntry v)))
-            >>= RT.update
-              ( \oldUpdateFromM → do
-                  oldUpdateFrom ← fromMaybe RT.empty <$> fetch oldUpdateFromM
-                  alloc . Just =<< RT.update (updateIfNeeded oldUpdateFrom) (RT.selEq evId) oldUpdateFrom
-              )
-              (RT.selEq updateFromK)
-            >>= put
+          fromEmpty () $ updater
+            (\(fromMaybe (RT.empty, RT.empty) → (oldUpdateReads, oldUpdateWrites)) →
+              (oldUpdateReads,) <$> RT.update (updateIfNeeded (oldUpdateReads, oldUpdateWrites)) (RT.selEq evId) oldUpdateWrites)
+            updateFromK
 
         -- deps
         put . DepsCache =<< sendAI . updDepsCache evId oldDeps newDeps . unDepsCache =<< get
@@ -270,14 +268,13 @@ update k = send . Update k
 {-# INLINE update #-}
 
 hdlQuery ∷ (Has AppIO sig m, Ser v, Typeable k, RT.IsRadixKey k) ⇒ EventId → k → StateGraph k v → m (Maybe v)
-hdlQuery nowEvId k (StateGraph queriedSG) = RT.runNonDetMax do
-  queriedTimeline ← maybeToEmpty =<< RT.lookup (RT.selEq k) queriedSG
-  -- Range in which we search for the previous entry
-  let prevRange = (RT.RBUnrestricted, RT.RBRestricted False $ RT.toRadixKey nowEvId)
-  candidate ← maybeToEmpty =<< RT.lookup (RT.selNonDetRanged prevRange) queriedTimeline
-  case candidate of
-    StateGraphEntrySampled → E.empty
-    StateGraphEntryModified v → pure v
+hdlQuery nowEvId k (StateGraph queriedSG) = 
+  RT.lookup (RT.selEq k) queriedSG >>= \case
+    Nothing -> pure Nothing
+    Just (_, queriedTimeline) ->
+      let prevRange = (RT.RBUnrestricted, RT.RBRestricted False $ RT.toRadixKey nowEvId) in
+      RT.runNonDetMax $
+        P.fromJust <$> RT.lookup (RT.selNonDetRanged prevRange) queriedTimeline
 {-# INLINE hdlQuery #-}
 
 instance (Has (GetNowEventId :+: AppIO) sig m, Typeable k, Ord k, RT.IsRadixKey k, Ser v) ⇒ Algebra (Query k v :+: sig) (QueryC k v m) where
@@ -296,11 +293,11 @@ instance (Has AppIO sig m, Typeable k, Ord k, RT.IsRadixKey k, Ser v) ⇒ Algebr
       (evId, _ ∷ StateGraph k v) ← ask
       pure $ ctx $> evId
     L (R (L (Query k))) → do
-      modify @(Map k (StateGraphEntry (AppIOC v))) $ Map.alter (Just . fromMaybe StateGraphEntrySampled) k
+      modify @(Set k, Map k (AppIOC v)) $ bimap (Set.insert k) id
       (nowEvId, queriedSG) ← ask
       (ctx $>) <$> hdlQuery nowEvId k queriedSG
     L (R (R (Update k v))) → do
-      modify @(Map k (StateGraphEntry (AppIOC v))) $ Map.insert k (StateGraphEntryModified v)
+      modify @(Set k, Map k (AppIOC v)) $ bimap id $ Map.insert k v
       pure $ ctx $> ()
     R other → alg (unUpdateC . hdl) (R (R other)) ctx
   {-# INLINE alg #-}
@@ -310,12 +307,13 @@ instance (Has AppIO sig m, Typeable k, Ord k, RT.IsRadixKey k, Ser v) ⇒ Algebr
 toLists ∷ (Has AppIO sig m, RT.IsRadixKey k, Ser v, Typeable k) ⇒ StateGraph k v → m [(k, [(EventId, v)])]
 toLists (StateGraph perKeyRT) = do
   perKey ← RT.toListM perKeyRT
-  for perKey \(k, perTimeRT) →
-    (k,) <$> do
-      perTime ← RT.toListM perTimeRT
-      let perTimeFiltered =
-            perTime & mapMaybe \(evId, entry) →
-              (evId,) <$> case entry of
-                StateGraphEntrySampled → Nothing
-                StateGraphEntryModified v → Just v
-      pure perTimeFiltered
+  for perKey \(k, (_, perTimeRT)) →
+    (k,) <$> RT.toListM perTimeRT
+
+toListsFull ∷ (Has AppIO sig m, RT.IsRadixKey k, Ser v, Typeable k) ⇒ StateGraph k v → m [(k, [(EventId, Either () v)])]
+toListsFull (StateGraph perKeyRT) = do
+  perKey ← RT.toListM perKeyRT
+  for perKey \(k, (perTimeRT1, perTimeRT2)) → do
+    a <- RT.toListM perTimeRT1
+    b <- RT.toListM perTimeRT2
+    pure (k, sortBy (\(a', _) (b', _) -> compare b' a') (fmap Left <$> a) <> (fmap Right <$> b))

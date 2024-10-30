@@ -1,41 +1,13 @@
-import Control.Carrier.Reader (ask, runReader)
-import qualified Dentrado.POC.Data.RadixTree as RT
-import Dentrado.POC.Gear (GearTemplate', asmGear, builtinAsmGearTemplate, confNewGear, events, runGear)
-import Dentrado.POC.Memory (AppIOC (..), Env (..), EnvLoad (..), EnvStore (..), Val (..), ValT (..), sendAI)
-import Dentrado.POC.StateGraph (StateGraphDeps (..))
+import Dentrado.POC.Gear (confNewGear, runGear)
 import qualified Dentrado.POC.StateGraph as SG
-import Dentrado.POC.TH (moduleId, sFreshI)
-import Dentrado.POC.Types (Any1 (..), Event (..), EventId (..), LocalEventId (..), SiteAccessLevel (..), Timestamp (..), UserId)
-import GHC.Exts (IsList (..))
+import Dentrado.POC.Types (Event (..), EventId (..), SiteAccessLevel (..), UserId)
 import Language.Haskell.TH (newDeclarationGroup)
 import RIO hiding (ask, runReader)
 import RIO.List (inits)
-import System.IO.Unsafe (unsafePerformIO)
 import Test.QuickCheck
-
-$(moduleId 102)
-
-unsafeRunAppIO ∷ AppIOC a → a
-unsafeRunAppIO act = unsafePerformIO do
-  env ←
-    Env
-      <$> newIORef 0
-      <*> pure mempty
-      <*> newMVar mempty
-      <*> pure (EnvLoad \_ → fail "not available")
-      <*> pure (EnvStore \_ → fail "not available")
-      <*> newMVar RT.empty
-      <*> newMVar mempty
-      <*> newMVar ([], 0)
-  runReader env $ unAppIOC act
-
-putEventList ∷ [(EventId, Event)] → AppIOC ()
-putEventList evs = do
-  evsM ← envEvents <$> ask
-  sendAI $ void $ swapMVar evsM (fmap (Any1 . Val ValTEvent) <$> fromList evs, length evs)
-
-e ∷ Word32 → EventId
-e = EventId (Timestamp 0) . LocalEventId
+import Shared.Model
+import Shared.Util
+import Dentrado.POC.Memory (AppIOC)
 
 {- | Test input: set of events, modeling the site with the concept of user access level.
 Admin users can change the level of other users, including other admins.
@@ -58,28 +30,6 @@ test1 =
     , AdminSetAccessLevel (Just $ e 2) (e 4) SalModerator -- 4 is now moderator
     ]
 
-{- | The Gear that processes the test input, returning the StateGraph
-which associates SiteAccessLevel to each UserId throughout all points of time.
--}
-status ∷ GearTemplate' () (SG.StateGraph UserId SiteAccessLevel)
-status =
-  $sFreshI
-    $ builtinAsmGearTemplate
-    $ SG.mkStateGraph
-      (asmGear events)
-      ( StateGraphDepsNil
-      , \case
-          AdminSetAccessLevel adminM target level → do
-            hasAccess ← case adminM of
-              Nothing → pure True
-              Just admin →
-                SG.query admin <&> \case
-                  Just SalAdmin → True
-                  _ → False
-            when hasAccess $ SG.update target $ pure level
-          _ → pure ()
-      )
-
 -- | Test expected result.
 test1Res ∷ [(UserId, [(EventId, SiteAccessLevel)])]
 test1Res =
@@ -89,13 +39,24 @@ test1Res =
   , (e 4, [(e 10, SalModerator)])
   ]
 
+oneshot :: [(EventId, Event)] -> (SG.StateGraph EventId SiteAccessLevel -> AppIOC r) -> r --[(UserId, [(EventId, SiteAccessLevel)])]
+oneshot t renderer = unsafeRunAppIO do
+  status' <- confNewGear status ()
+  putEventList t
+  renderer =<< runGear status'
+
 prop_test1_oneshot_correct =
   withMaxSuccess 1
     $ test1Res
-    == unsafeRunAppIO do
-      status' ← confNewGear status ()
-      putEventList test1
-      SG.toLists =<< runGear status'
+    == oneshot test1 SG.toLists
+
+multishot :: [(EventId, Event)] -> (SG.StateGraph UserId SiteAccessLevel -> AppIOC a) -> a
+multishot t renderer = unsafeRunAppIO do
+  status' ← confNewGear status ()
+  for_ @[] (inits t) \curr → do
+    _ ← runGear status'
+    putEventList curr
+  renderer =<< runGear status'
 
 {- | This test shuffles the list of events and provides events to Dentrado one by one.
 It is expected that any shuffle of the input events yields the same result, since
@@ -103,15 +64,11 @@ all events are associated with some point in time.
 Dentrado, being reactive, processes these events incrementally, but might
 perform expensive history rewrites to keep the result consistent.
 -}
-prop_test1_multishot_correct = withMaxSuccess 100 $ forAll
+prop_test1_multishot_correct = withMaxSuccess 100 $ forAllShrink
   (shuffle test1)
+  (shrinkList shrinkNothing)
   \test1' →
-    test1Res == unsafeRunAppIO do
-      status' ← confNewGear status ()
-      for_ @[] (inits test1') \curr → do
-        _ ← runGear status'
-        putEventList curr
-      SG.toLists =<< runGear status'
+    oneshot test1' SG.toLists == multishot test1' SG.toLists
 
 $(newDeclarationGroup)
 main ∷ IO ()

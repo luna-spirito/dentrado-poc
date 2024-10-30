@@ -61,6 +61,17 @@ test-suite radix-tree
 test-suite model
     import: lang
     type: exitcode-stdio-1.0
-    hs-source-dirs: tests
-    main-is: Model.hs
     build-depends: dentrado-poc-lib, QuickCheck >= 2
+
+    hs-source-dirs: tests
+    other-modules: Shared.Util, Shared.Model
+    main-is: Model.hs
+
+benchmark model-perf
+    import: lang
+    type: exitcode-stdio-1.0
+    build-depends: dentrado-poc-lib, model, QuickCheck >= 2
+
+    hs-source-dirs: tests
+    other-modules: Shared.Util, Shared.Model
+    main-is: Perf/Model.hs
