@@ -32,6 +32,7 @@ library dentrado-poc-lib
     exposed-modules:
         Dentrado.POC.Types,
         Dentrado.POC.Memory,
+        Dentrado.POC.Ser,
         Dentrado.POC.Data.RadixTree,
         -- Dentrado.POC.Data.RadixZipper,
         Dentrado.POC.Gear,

@@ -21,11 +21,12 @@ import qualified Data.ByteString.Unsafe as B
 import Data.Foldable (foldrM)
 import Data.Kind (Type)
 import Data.Monoid (First (..))
-import Dentrado.POC.Memory (AppDelay (..), AppForce (..), AppIO, AppIOC, C (..), Container (..), Delay (..), DelayApp (..), InferContainerT, InferValT, Reduce, Reduce' (..), Reduce'C (..), ReduceC, Res (..), ResB (..), RevList, Ser, Serialized (..), SerializedGearFn (..), alloc, allocC, builtin, builtinFunM, delayAppBuiltinFun, fetch, fetchC, mkDelayCache, mkDelayLazy, mkReducible, reduce', reducible, reducible', revSnoc, runReduce, runReduce', sNothing, tryFetchC, unwrap, wrapB, (:->) (..))
+import Dentrado.POC.Memory (AppDelay (..), AppForce (..), AppIO, AppIOC, C (..), Container (..), Delay (..), DelayApp (..), InferContainerT, InferValT (..), Reduce, Reduce' (..), Reduce'C (..), ReduceC, Res (..), ResB (..), RevList, Serialized (..), alloc, allocC, builtin, builtinFunM, delayAppBuiltinFun, fetch, fetchC, mkDelayCache, mkDelayLazy, mkReducible, reduce', reducible, reducible', revSnoc, runReduce, runReduce', sNothing, tryFetchC, unwrap, wrapB, (:->) (..), ValT' (..), ValTWrapped' (..), EValT (..), valTypeableProof)
 import Dentrado.POC.TH (moduleId, sFreshI)
-import Dentrado.POC.Types (Chunk, EventId (EventId), LocalEventId (..), MapDiffE (..), RadixChunk, RadixChunk' (..), RadixTree (..), Timestamp (..), maybeToEmpty, readReducible)
+import Dentrado.POC.Types (Chunk, EventId (EventId), LocalEventId (..), RadixChunk, RadixChunk' (..), RadixTree (..), Timestamp (..), maybeToEmpty, readReducible, W (..))
 import GHC.Exts (IsList (..))
 import RIO hiding (Map, Set, catch, lookup, mask, runReader, toList, (<|>))
+import Data.Constraint (Dict(..))
 
 {-
 This module contains implementation of RadixTree for the needs of Dentrado.
@@ -63,7 +64,7 @@ instance IsRadixKey Chunk where
 -- TODO: UNSAFE
 -- Deal with it when implementing deduplication
 -- instance IsRadixKey ByteString where
-instance IsRadixKey (Serialized a) where
+instance IsRadixKey Serialized where
   toRadixKey = \(UnsafeSerialized x) → f x
    where
     f (B.null → True) = []
@@ -76,9 +77,6 @@ instance IsRadixKey (Serialized a) where
        in x : f (B.drop 4 b)
   fromRadixKey =
     UnsafeSerialized . toStrictBytes . B.toLazyByteString . mconcat . fmap B.word32BE
-instance IsRadixKey (SerializedGearFn) where
-  toRadixKey (SerializedGearFn x) = toRadixKey x
-  fromRadixKey = SerializedGearFn . fromRadixKey
 
 instance IsRadixKey EventId where
   toRadixKey (EventId (Timestamp a) (LocalEventId b)) = [a, b]
@@ -125,6 +123,25 @@ type SetR k = MapR k ()
 
 -- MapDiffE utility operations
 
+{- | `MapDiffE v` is used to capture the difference between the old value of type `v` and new value of type `v`.
+It appears, for example, when calculating the difference between old RadixTree and new RadixTree.
+-}
+data MapDiffE v = MapAdd !v | MapUpd !v !v | MapDel !v
+
+valTMapDiffE :: ValT' s v → ValT' s (W (MapDiffE v))
+valTMapDiffE =
+  let wrapped = ValTWrapped $ $sFreshI $ builtin $ ValTWrapped'
+        (\(EValT (ValTEither a _)) → valTypeableProof a & \Dict → Dict)
+        (either MapAdd $ either (uncurry MapUpd) MapDel)
+        (\case
+          MapAdd v → Left v
+          MapUpd a b → Right (Left (a, b))
+          MapDel v → Right $ Right v)
+  in \v → wrapped $ ValTEither v (ValTEither (ValTTuple v v) v)
+
+instance InferValT s v => InferValT s (W (MapDiffE v)) where
+  inferValT = valTMapDiffE inferValT
+
 unMapDiffE ∷ MapDiffE v → (Maybe v, Maybe v)
 unMapDiffE = \case
   MapDel v → (Just v, Nothing)
@@ -150,15 +167,15 @@ mkMapDiffE a b = case (a, b) of
 
 -- Builtin empty chunk
 sNil ∷ ResB (RadixChunk c2 k a)
-sNil = $sFreshI $ builtin $ mkReducible Nil
+sNil = $sFreshI $ builtin $ W $ mkReducible Nil
 
 {- | A function to call to attempt to reduce the spine of the data structure.
 TODO: I don't know how effective is this
 -}
 reduceChunk'' ∷ (Container c, Has (AppIO :+: Reduce' s) sig m) ⇒ Proxy s → RadixChunk' c k a → m (RadixChunk' c k a, Maybe (c (RadixChunk c k a)))
 reduceChunk'' (Proxy @s) = \case
-  Tip _ (RadixTree (tryFetchC → Just Nothing) (tryFetchC → Just (readReducible → Nil))) → reduce' (Proxy @s) $> (Nil, Just $ wrapB sNil)
-  Bin _ left'@(tryFetchC → Just (readReducible → left)) right'@(tryFetchC → Just (readReducible → right))
+  Tip _ (RadixTree (tryFetchC → Just (W Nothing)) (tryFetchC → Just (W (readReducible → Nil)))) → reduce' (Proxy @s) $> (Nil, Just $ wrapB sNil)
+  Bin _ left'@(tryFetchC → Just (W (readReducible → left))) right'@(tryFetchC → Just (W (readReducible → right)))
     | Nil ← left → reduce' (Proxy @s) $> (right, Just right') -- hopefully no need to reduceChunk left/right
     | Nil ← right → reduce' (Proxy @s) $> (left, Just left')
   nonReducible → pure (nonReducible, Nothing)
@@ -173,10 +190,10 @@ reduceChunk = reduceChunk' (Proxy @"")
 {-# INLINE reduceChunk #-}
 
 -- | A combination of reduceChunk and alloc. More optimized.
-allocReducedChunk ∷ (Container c1, Container c2, Has AppIO sig m, Ser a, Typeable k) ⇒ (∀ b. c2 b → ReduceC m (c1 b)) → RadixChunk' c2 k a → m (c1 (RadixChunk c2 k a))
+allocReducedChunk ∷ (Container c1, Container c2, Has AppIO sig m, InferValT True a, InferValT False k) ⇒ (∀ b. c2 b → ReduceC m (c1 b)) → RadixChunk' c2 k a → m (c1 (RadixChunk c2 k a))
 allocReducedChunk f c =
   runReduce $ reduceChunk'' (Proxy @"") c >>= \case
-    (v, Nothing) → allocC $ mkReducible v
+    (v, Nothing) → allocC $ W $ mkReducible v
     (_, Just v) → f v
 {-# INLINE allocReducedChunk #-}
 
@@ -197,7 +214,7 @@ newtype FinalPath = FinalPath [Chunk]
 Each selector decides which direction to recurse on each fork.
 -}
 class Selector s m where
-  selTree ∷ (Ser a) ⇒ (Container c) ⇒ s k STree → c (Maybe a) → m (Maybe (s k SChunk))
+  selTree ∷ (InferValT True a, Container c) ⇒ s k STree → c (W (Maybe a)) → m (Maybe (s k SChunk))
   selBin ∷ s k SChunk → Chunk → m (Maybe (Bool, s k SChunk))
   selTip ∷ s k SChunk → Chunk → m (Maybe (s k STree))
   selNil ∷ s k SChunk → m (Chunk, [Chunk])
@@ -205,9 +222,9 @@ class Selector s m where
 -- | Accept handlers (continuations) of the operation, selector, tree and return the result provided by the handlers.
 accessRadix ∷
   ∀ sel c k a tree chunk sig m.
-  (Selector sel m, Container c, Has (AppIO :+: Reduce) sig m, Typeable k, Ser a) ⇒
+  (Selector sel m, Container c, Has (AppIO :+: Reduce) sig m, InferValT False k, InferValT True a) ⇒
   -- | on sub, tree
-  (c (Maybe a) → chunk → tree) →
+  (c (W (Maybe a)) → chunk → tree) →
   -- | on found, tree
   (FinalPath → RadixTree c k a → tree) →
   -- | on missing, chunk
@@ -231,7 +248,7 @@ accessRadix onSubT onFoundT onMissingC onTipC onBranchC =
           let (mask, placeRight) = makeMask exKey key
           pure $ onBranchC placeRight mask chunkM missing
        in
-        fetchC chunkM >>= \chunk → reducible reduceChunk chunk \case
+        fetchC chunkM >>= \(W chunk) → reducible reduceChunk chunk \case
           Nil → snd <$> selNil'
           (Tip key subtree) →
             selTip sel1 key >>= \case
@@ -254,49 +271,49 @@ mkBinNonRe ∷ (Container c) ⇒ Bool → Chunk → c (RadixChunk c k a) → c (
 mkBinNonRe right mask a b = Bin mask (if right then a else b) (if right then b else a)
 {-# INLINE mkBinNonRe #-}
 
-mkBin ∷ (Container c1, Container c2, Has AppIO sig m, Ser a, Typeable k) ⇒ (∀ b. c2 b → ReduceC m (c1 b)) → Bool → Chunk → c2 (RadixChunk c2 k a) → c2 (RadixChunk c2 k a) → m (c1 (RadixChunk c2 k a))
+mkBin ∷ (Container c1, Container c2, Has AppIO sig m, InferValT True a, InferValT False k) ⇒ (∀ b. c2 b → ReduceC m (c1 b)) → Bool → Chunk → c2 (RadixChunk c2 k a) → c2 (RadixChunk c2 k a) → m (c1 (RadixChunk c2 k a))
 mkBin f a b c d = allocReducedChunk f $ mkBinNonRe a b c d
 {-# INLINE mkBin #-}
 
 mkTipNonRe ∷ Chunk → RadixTree c k a → RadixChunk' c k a
 mkTipNonRe = Tip
 
-mkTip ∷ (Container c1, Container c2, Has AppIO sig m, Ser a, Typeable k) ⇒ (∀ b. c2 b → ReduceC m (c1 b)) → Chunk → RadixTree c2 k a → m (c1 (RadixChunk c2 k a))
+mkTip ∷ (Container c1, Container c2, Has AppIO sig m, InferValT True a, InferValT False k) ⇒ (∀ b. c2 b → ReduceC m (c1 b)) → Chunk → RadixTree c2 k a → m (c1 (RadixChunk c2 k a))
 mkTip f k v = allocReducedChunk f $ mkTipNonRe k v
 {-# INLINE mkTip #-}
 
 -- | Internal lookup functionality.
-internalLookup ∷ (Has (AppIO :+: Reduce) sig m, Selector sel m, Container c, IsRadixKey k, Ser a, Typeable k) ⇒ (RevList Chunk → sel k SChunk → c (RadixChunk c k a) → m (m (Maybe (FinalPath, a))), RevList Chunk → sel k STree → RadixTree c k a → m (m (Maybe (FinalPath, a))))
+internalLookup ∷ (Has (AppIO :+: Reduce) sig m, Selector sel m, Container c, IsRadixKey k, InferValT True a, InferValT False k) ⇒ (RevList Chunk → sel k SChunk → c (RadixChunk c k a) → m (m (Maybe (FinalPath, a))), RevList Chunk → sel k STree → RadixTree c k a → m (m (Maybe (FinalPath, a))))
 internalLookup =
   accessRadix
     (\_ → id)
-    (\k (RadixTree a _) → ((k,) <$>) <$> fetchC a)
+    (\k (RadixTree a _) → ((k,) <$>) . unW <$> fetchC a)
     (\_ _ _ → pure Nothing)
     (\_ → id)
     (\_ _ _ → id)
 {-# INLINE internalLookup #-}
 
-lookup' ∷ (Has AppIO sig m, Selector sel (ReduceC m), Container c, IsRadixKey k, Ser a, Typeable k) ⇒ sel k STree → RadixTree c k a → m (Maybe (FinalPath, a))
+lookup' ∷ (Has AppIO sig m, Selector sel (ReduceC m), Container c, IsRadixKey k, InferValT True a, InferValT False k) ⇒ sel k STree → RadixTree c k a → m (Maybe (FinalPath, a))
 lookup' k tr = runReduce $ join $ snd internalLookup [] k tr
 {-# INLINE lookup' #-}
 
 -- | Lookup with key.
-lookupKV ∷ (Has AppIO sig m, Selector sel (ReduceC m), Container c, IsRadixKey k, Ser a, Typeable k) ⇒ sel k STree → RadixTree c k a → m (Maybe (k, a))
+lookupKV ∷ (Has AppIO sig m, Selector sel (ReduceC m), Container c, IsRadixKey k, InferValT True a, InferValT False k) ⇒ sel k STree → RadixTree c k a → m (Maybe (k, a))
 lookupKV k tr = fmap ((bimap (\(FinalPath fk) → fromRadixKey fk)) id) <$> lookup' k tr
 {-# INLINE lookupKV #-}
 
 -- | Lookup.
-lookup ∷ (Has AppIO sig m, Selector sel (ReduceC m), Container c, IsRadixKey k, Ser a, Typeable k) ⇒ sel k STree → RadixTree c k a → m (Maybe a)
+lookup ∷ (Has AppIO sig m, Selector sel (ReduceC m), Container c, IsRadixKey k, InferValT True a, InferValT False k) ⇒ sel k STree → RadixTree c k a → m (Maybe a)
 lookup k tr = fmap snd <$> lookup' k tr
 {-# INLINE lookup #-}
 
 -- | Create a new RadixTree of one element placed at some key.
-internalNested ∷ (Ser a, Container c, Algebra sig m, Has AppIO sig m, Typeable k) ⇒ c (Maybe a) → [Chunk] → m (c (RadixChunk c k a))
+internalNested ∷ (InferValT True a, Container c, Algebra sig m, Has AppIO sig m, InferValT False k) ⇒ c (W (Maybe a)) → [Chunk] → m (c (RadixChunk c k a))
 internalNested finalVal ks = do
   (_state, res) ←
     foldrM
       ( \key (subval, subchunk) →
-          (wrapB sNothing,) <$> allocC (mkReducible $ mkTipNonRe key $ RadixTree subval subchunk) -- unlikely reduced
+          (wrapB sNothing,) <$> allocC (W $ mkReducible $ mkTipNonRe key $ RadixTree subval subchunk) -- unlikely reduced
       )
       (finalVal, wrapB sNil)
       ks
@@ -304,20 +321,20 @@ internalNested finalVal ks = do
 {-# INLINE internalNested #-}
 
 -- | Internal insert functionality.
-internalInsert ∷ ∀ sel c k sig m a. (Selector sel m, Container c, Has (AppIO :+: Reduce) sig m, Ser a, Typeable k) ⇒ a → (RevList Chunk → sel k SChunk → c (RadixChunk c k a) → m (m (c (RadixChunk c k a))), RevList Chunk → sel k STree → RadixTree c k a → m (m (RadixTree c k a)))
+internalInsert ∷ ∀ sel c k sig m a. (Selector sel m, Container c, Has (AppIO :+: Reduce) sig m, InferValT True a, InferValT False k) ⇒ a → (RevList Chunk → sel k SChunk → c (RadixChunk c k a) → m (m (c (RadixChunk c k a))), RevList Chunk → sel k STree → RadixTree c k a → m (m (RadixTree c k a)))
 internalInsert val =
   accessRadix
     (\a b → RadixTree a <$> b)
-    (\_ (RadixTree _oldVal b) → (`RadixTree` b) <$> allocC (Just val))
-    (\key1 keys2 _ → (`internalNested` (key1 : keys2)) =<< allocC (Just val))
-    (\k v → allocC . mkReducible . mkTipNonRe k =<< v)
-    (\k r a b → allocC . mkReducible . mkBinNonRe k r a =<< b)
+    (\_ (RadixTree _oldVal b) → (`RadixTree` b) <$> allocC (W $ Just val))
+    (\key1 keys2 _ → (`internalNested` (key1 : keys2)) =<< allocC (W $ Just val))
+    (\k v → allocC . W . mkReducible . mkTipNonRe k =<< v)
+    (\k r a b → allocC . W . mkReducible . mkBinNonRe k r a =<< b)
 {-# INLINE internalInsert #-}
 
 {- | Insert.
 TODO: short-circuit
 -}
-insert ∷ (Selector sel (ReduceC m), Container c, Has AppIO sig m, Ser p, Typeable k) ⇒ sel k STree → p → RadixTree c k p → m (RadixTree c k p)
+insert ∷ (Selector sel (ReduceC m), Container c, Has AppIO sig m, InferValT True p, InferValT False k) ⇒ sel k STree → p → RadixTree c k p → m (RadixTree c k p)
 insert k v tr = runReduce $ join $ snd (internalInsert v) [] k tr
 {-# INLINE insert #-}
 
@@ -326,8 +343,8 @@ could be m (f (...)), but I don't think it's worth it
 edit: probably needed, but probably overshadowed by the Church theme
 -}
 internalUpdate ∷
-  (Selector sel m, Container c, Has (AppIO :+: Reduce) sig m, Ser a, Typeable k) ⇒
-  (c (Maybe a) → m (c (Maybe a))) →
+  (Selector sel m, Container c, Has (AppIO :+: Reduce) sig m, InferValT True a, InferValT False k) ⇒
+  (c (W (Maybe a)) → m (c (W (Maybe a)))) →
   (RevList Chunk → sel k SChunk → c (RadixChunk c k a) → m (m (c (RadixChunk c k a))), RevList Chunk → sel k STree → RadixTree c k a → m (m (RadixTree c k a)))
 internalUpdate f =
   accessRadix
@@ -348,23 +365,23 @@ It's analogous to `alter` in the terminology of people who, unlike me, have brai
 TODO: short-circuit?
 TODO: rename?
 -}
-update ∷ (Selector sel (ReduceC m), Container c, Has AppIO sig m, Ser a, Typeable k) ⇒ (c (Maybe a) → ReduceC m (c (Maybe a))) → sel k STree → RadixTree c k a → m (RadixTree c k a)
+update ∷ (Selector sel (ReduceC m), Container c, Has AppIO sig m, InferValT True a, InferValT False k) ⇒ (c (W (Maybe a)) → ReduceC m (c (W (Maybe a)))) → sel k STree → RadixTree c k a → m (RadixTree c k a)
 update f k tr = runReduce $ join $ snd (internalUpdate f) [] k tr
 {-# INLINE update #-}
 
 {- | Delete.
 TODO: short-circuit?
 -}
-delete ∷ (Selector sel (ReduceC m), Container c, Has AppIO sig m, Ser a, Typeable k) ⇒ sel k STree → RadixTree c k a → m (RadixTree c k a)
+delete ∷ (Selector sel (ReduceC m), Container c, Has AppIO sig m, InferValT True a, InferValT False k) ⇒ sel k STree → RadixTree c k a → m (RadixTree c k a)
 delete = update (\_ → pure $ wrapB sNothing)
 
 -- | Pop. Deletes the element by some index and deletes it from the source.
-pop ∷ (Selector sel (ReduceC (WriterC (First a) m)), Container c, Has AppIO sig m, Ser a, Typeable k) ⇒ sel k STree → RadixTree c k a → m (Maybe a, RadixTree c k a)
+pop ∷ (Selector sel (ReduceC (WriterC (First a) m)), Container c, Has AppIO sig m, InferValT True a, InferValT False k) ⇒ sel k STree → RadixTree c k a → m (Maybe a, RadixTree c k a)
 pop k rt =
   runWriter (\(First a) b → pure (a, b))
     $ update
       ( \v → do
-          v' ← fetchC v
+          W v' ← fetchC v
           tell $ First v'
           pure $ wrapB sNothing
       )
@@ -373,7 +390,7 @@ pop k rt =
 
 -- | Upsert Church internal functionality.
 upsertChurchInternal ∷
-  (Selector sel (ReduceC m), Container c, Has AppIO sig m, Ser a, Typeable k, IsRadixKey k) ⇒
+  (Selector sel (ReduceC m), Container c, Has AppIO sig m, InferValT True a, InferValT False k, IsRadixKey k) ⇒
   ( RevList Chunk → sel k SChunk → c (RadixChunk c k a) → ReduceC m (ReduceC m (Maybe (k, a)), a → m (c (RadixChunk c k a)))
   , RevList Chunk → sel k STree → RadixTree c k a → ReduceC m (ReduceC m (Maybe (k, a)), a → m (RadixTree c k a))
   )
@@ -381,8 +398,8 @@ upsertChurchInternal ∷
 upsertChurchInternal =
   accessRadix
     (\a (lookRes, ins) → (lookRes, \newVal → RadixTree a <$> ins newVal)) -- on sub, tree
-    (\(FinalPath k) (RadixTree exVal sub) → (fmap (fromRadixKey k,) <$> fetchC exVal, \newVal → (`RadixTree` sub) <$> allocC (Just newVal))) -- on found, tree
-    (\k1 ks _ → (pure Nothing, (`internalNested` (k1 : ks)) <=< allocC . Just)) -- on missing, chunk
+    (\(FinalPath k) (RadixTree exVal sub) → (fmap (fromRadixKey k,) . unW <$> fetchC exVal, \newVal → (`RadixTree` sub) <$> allocC (W $ Just newVal))) -- on found, tree
+    (\k1 ks _ → (pure Nothing, (`internalNested` (k1 : ks)) <=< allocC . W . Just)) -- on missing, chunk
     (\key (lookRes, ins) → (lookRes, \newVal → mkTip pure key =<< ins newVal)) -- on Tip, chunk
     (\k r a (lookRes, ins) → (lookRes, \newVal → mkBin pure k r a =<< ins newVal)) -- on branch, chunk
 {-# INLINE upsertChurchInternal #-}
@@ -390,7 +407,7 @@ upsertChurchInternal =
 {- | Upsert Church. Experimental function that allows to read any element and provides a function to `upsert` a new value.
 TODO: It's might be a good idea to rewrite the rest of the module in a similar style.
 -}
-upsertChurch ∷ (Container c, Has AppIO sig m, Selector sel (ReduceC m), Ser a, Typeable k, IsRadixKey k) ⇒ sel k STree → RadixTree c k a → m (Maybe a, a → m (RadixTree c k a))
+upsertChurch ∷ (Container c, Has AppIO sig m, Selector sel (ReduceC m), InferValT True a, InferValT False k, IsRadixKey k) ⇒ sel k STree → RadixTree c k a → m (Maybe a, a → m (RadixTree c k a))
 upsertChurch sel tree = runReduce do
   (lookRes1M, ins1) ← snd upsertChurchInternal [] sel tree
   lookRes1 ← lookRes1M
@@ -405,7 +422,7 @@ Wither functionality.
 
 -- | Class to generalize `witherF` over greedy/lazy strategy.
 class (Container c, Container cfin) ⇒ AppWither strat m c cfin where
-  stratWitherLift ∷ (Has Fresh sig2 m2, InferValT a, InferValT b) ⇒ strat → (Res a → ReduceC m (Res b)) → m2 (c a → ReduceC m (cfin b))
+  stratWitherLift ∷ (Has Fresh sig2 m2, InferValT True a, InferValT True b) ⇒ strat → (Res a → ReduceC m (Res b)) → m2 (c a → ReduceC m (cfin b))
 
 -- | Greedy wither strategy.
 instance (Has AppIO sig m, Container c, Container cfin) ⇒ AppWither AppForce m c cfin where
@@ -422,22 +439,22 @@ instance AppWither AppDelay AppIOC Delay Delay where
 -- | Generalized wither implementation.
 witherF ∷
   ∀ tree chunk sig1 m1 sig2 m2 strat c cfin k a b.
-  (Has Fresh sig1 m1, MonadFix m1, AppWither strat m2 c cfin, InferValT a, InferValT b, Ser a, Has AppIO sig2 m2, Typeable k, InferValT chunk, InferValT k, InferContainerT c) ⇒
-  (cfin (Maybe b) → cfin chunk → m2 tree) →
+  (Has Fresh sig1 m1, MonadFix m1, AppWither strat m2 c cfin, InferValT True a, InferValT True b, InferValT True a, Has AppIO sig2 m2, InferValT False k, InferValT True chunk, InferValT False k, InferContainerT c) ⇒
+  (cfin (W (Maybe b)) → cfin chunk → m2 tree) →
   (Bool → Chunk → cfin chunk → cfin chunk → m2 (Res chunk)) →
   (Chunk → tree → m2 (Res chunk)) →
   m2 (Res chunk) →
   strat →
-  (Res (Maybe a) → a → ReduceC m2 (Res (Maybe b))) →
+  (Res (W (Maybe a)) → a → ReduceC m2 (Res (W (Maybe b)))) →
   m1 (c (RadixChunk c k a) → ReduceC m2 (cfin chunk), RadixTree c k a → m2 tree) -- impredicativity
 witherF onTree onBin onTip onNil strat f = mdo
   goVal ← stratWitherLift strat \vR → do
-    vM ← fetch vR
+    W vM ← fetch vR
     case vM of
       Nothing → pure $ ResBuiltin sNothing
       Just v → f vR v
   goChunk ← stratWitherLift strat \chunkRes → do
-    chunkRed ← fetch chunkRes
+    W chunkRed ← fetch chunkRes
     reducible reduceChunk chunkRed \case
       Tip mask v → do
         t ← goTree v
@@ -458,9 +475,9 @@ witherF onTree onBin onTip onNil strat f = mdo
 
 wither ∷
   ∀ sig1 m1 sig2 m2 strat c cfin k a b.
-  (Has Fresh sig1 m1, MonadFix m1, Has AppIO sig2 m2, AppWither strat m2 c cfin, Ser b, Ser a, Typeable k, InferValT b, InferValT a, InferValT k, InferContainerT cfin, InferContainerT c) ⇒
+  (Has Fresh sig1 m1, MonadFix m1, Has AppIO sig2 m2, AppWither strat m2 c cfin, InferValT True b, InferValT True a, InferValT False k, InferValT True b, InferValT True a, InferValT False k, InferContainerT cfin, InferContainerT c) ⇒
   strat →
-  (Res (Maybe a) → a → ReduceC m2 (Res (Maybe b))) →
+  (Res (W (Maybe a)) → a → ReduceC m2 (Res (W (Maybe b)))) →
   m1 (c (RadixChunk c k a) → ReduceC m2 (cfin (RadixChunk cfin k b)), RadixTree c k a → m2 (RadixTree cfin k b)) -- impredicativity
 wither = witherF (\a b → pure $ RadixTree a b) (mkBin unwrap) (mkTip unwrap) (pure $ ResBuiltin sNil)
 
@@ -474,15 +491,15 @@ wither = witherF (\a b → pure $ RadixTree a b) (mkBin unwrap) (mkTip unwrap) (
 
 -- | Merge handlers.
 data OnOne chunk (m ∷ Type → Type) c k this fin = OnOne
-  { onOneVal ∷ !(Res (Maybe this) → this → m (Res (Maybe fin))) -- this must be unwrapped for this conclusion
+  { onOneVal ∷ !(Res (W (Maybe this)) → this → m (Res (W (Maybe fin)))) -- this must be unwrapped for this conclusion
   , onOneSubtree ∷ !(Res (RadixChunk c k this) → ReduceC m (Res chunk))
   }
 
 newtype OnBoth m one two fin = OnBoth
-  {onBothVal ∷ Res (Maybe one) → one → Res (Maybe two) → two → m (Res (Maybe fin))}
+  {onBothVal ∷ Res (W (Maybe one)) → one → Res (W (Maybe two)) → two → m (Res (W (Maybe fin)))}
 data OnSame chunk m c cfin k one two fin = OnSame
-  { onSameVal ∷ !(c (Maybe one) → c (Maybe two) → m (cfin (Maybe fin)))
-  , onSameValR ∷ !(Res (Maybe one) → Res (Maybe two) → m (Res (Maybe fin)))
+  { onSameVal ∷ !(c (W (Maybe one)) → c (W (Maybe two)) → m (cfin (W (Maybe fin))))
+  , onSameValR ∷ !(Res (W (Maybe one)) → Res (W (Maybe two)) → m (Res (W (Maybe fin))))
   , onSameSubtree ∷ !(c (RadixChunk c k one) → c (RadixChunk c k two) → m (cfin chunk))
   , onSameSubtreeR ∷ !(Res (RadixChunk c k one) → Res (RadixChunk c k two) → m (Res chunk))
   }
@@ -491,7 +508,7 @@ data OnSame chunk m c cfin k one two fin = OnSame
 class (Container c, Container cfin) ⇒ AppMerge strat m c cfin where
   -- stratMerge :: strat -> Res (Res x -> Res y -> Reduce'C "1" (Reduce'C "2" m) (Res z)) -> c x -> c y -> Reduce'C "1" (Reduce'C "2" m) (cfin z)
   stratMergeLift ∷
-    (Has Fresh sig2 m2, InferValT x, InferValT y, InferValT z) ⇒
+    (Has Fresh sig2 m2, InferValT True x, InferValT True y, InferValT True z) ⇒
     strat →
     (Res x → Res y → Reduce'C "1" (Reduce'C "2" m) (Res z)) →
     m2 (c x → c y → Reduce'C "1" (Reduce'C "2" m) (cfin z))
@@ -532,16 +549,16 @@ mergeF ∷
   , AppMerge strat m2 c cfin
   , Has AppIO sig2 m2
   , InferContainerT c
-  , InferValT one
-  , InferValT two
-  , InferValT fin
-  , InferValT chunk
-  , InferValT k
-  , Typeable k
-  , Ser one
-  , Ser two
+  , InferValT True one
+  , InferValT True two
+  , InferValT True fin
+  , InferValT True chunk
+  , InferValT False k
+  , InferValT False k
+  , InferValT True one
+  , InferValT True two
   ) ⇒
-  (cfin (Maybe fin) → cfin chunk → m2 tree) →
+  (cfin (W (Maybe fin)) → cfin chunk → m2 tree) →
   (Bool → Chunk → cfin chunk → cfin chunk → m2 (Res chunk)) →
   (Chunk → tree → m2 (Res chunk)) →
   strat →
@@ -570,8 +587,8 @@ mergeF onTree onBin onTip strat one1 one2 both sameM = mdo
       r2
       (\s → lift $ lift $ onSameValR s r1 r2)
       do
-        v1 ← fetch r1
-        v2 ← fetch r2
+        W v1 ← fetch r1
+        W v2 ← fetch r2
         lift $ lift $ case (v1, v2) of
           (Just a, Just b) → onBothVal both r1 a r2 b
           (Just a, Nothing) → onOneVal one1 r1 a
@@ -583,8 +600,8 @@ mergeF onTree onBin onTip strat one1 one2 both sameM = mdo
       res2
       (\s → lift $ lift $ onSameSubtreeR s res1 res2)
       do
-        v1 ← fetch res1
-        v2 ← fetch res2
+        W v1 ← fetch res1
+        W v2 ← fetch res2
         let binOfMerges mask a1 a2 b1 b2 = do
               (a, b) ← (,) <$> checkSameMergeChunk a1 a2 <*> checkSameMergeChunk b1 b2
               lift $ lift $ onBin True mask a b
@@ -633,14 +650,14 @@ merge ∷
   , Has AppIO sig2 m2
   , InferContainerT c
   , InferContainerT cfin
-  , InferValT one
-  , InferValT two
-  , InferValT fin
-  , InferValT k
-  , Typeable k
-  , Ser one
-  , Ser two
-  , Ser fin
+  , InferValT True one
+  , InferValT True two
+  , InferValT True fin
+  , InferValT False k
+  , InferValT False k
+  , InferValT True one
+  , InferValT True two
+  , InferValT True fin
   ) ⇒
   strat →
   OnOne (RadixChunk cfin k fin) m2 c k one fin →
@@ -683,8 +700,8 @@ onOneErase = OnOne (const $ const $ pure $ wrapB sNothing) (const $ pure $ wrapB
 onOneKeep ∷ (Applicative m) ⇒ OnOne (RadixChunk c k fin) m c k fin fin
 onOneKeep = OnOne (const . pure) pure
 
-onBothZip ∷ (Has AppIO sig m, Ser fin) ⇒ (one → two → Maybe fin) → OnBoth m one two fin
-onBothZip f = OnBoth \_ one _ two → alloc $ f one two
+onBothZip ∷ (Has AppIO sig m, InferValT True fin) ⇒ (one → two → Maybe fin) → OnBoth m one two fin
+onBothZip f = OnBoth \_ one _ two → alloc $ W $ f one two
 
 onOneWitherFM ∷
   ( Has Fresh sig1 m1
@@ -693,33 +710,33 @@ onOneWitherFM ∷
   , AppWither strat m2 c cfin
   , Has AppIO sig2 m2
   , InferContainerT c
-  , InferValT b
-  , InferValT a
-  , InferValT chunk
-  , InferValT k
-  , Typeable k
-  , Ser a
+  , InferValT True b
+  , InferValT True a
+  , InferValT True chunk
+  , InferValT False k
+  , InferValT False k
+  , InferValT True a
   ) ⇒
-  (cfin (Maybe b) → cfin chunk → m2 tree) →
+  (cfin (W (Maybe b)) → cfin chunk → m2 tree) →
   (Bool → Chunk → cfin chunk → cfin chunk → m2 (Res chunk)) →
   (Chunk → tree → m2 (Res chunk)) →
   m2 (Res chunk) →
   strat →
-  (Res (Maybe a) → a → m2 (Res (Maybe b))) →
+  (Res (W (Maybe a)) → a → m2 (Res (W (Maybe b)))) →
   m1 (OnOne chunk m2 c k a b)
 onOneWitherFM onTree onBin onTip onNil strat f = do
   toFin ← fst <$> witherF onTree onBin onTip onNil strat \x y → lift (f x y)
   pure $ OnOne f \chunk → toFin (wrap chunk) >>= unwrap
 
 onOneWitherM ∷
-  (Has Fresh sig m, MonadFix m, Container c, Has AppIO sig2 m2, AppWither strat m2 c cfin, Ser this, InferContainerT c, InferContainerT cfin, InferValT fin, InferValT this, InferValT k, Typeable k, Ser fin) ⇒
+  (Has Fresh sig m, MonadFix m, Container c, Has AppIO sig2 m2, AppWither strat m2 c cfin, InferValT True this, InferContainerT c, InferContainerT cfin, InferValT True fin, InferValT True this, InferValT False k, InferValT False k, InferValT True fin) ⇒
   strat →
-  (Res (Maybe this) → this → m2 (Res (Maybe fin))) →
+  (Res (W (Maybe this)) → this → m2 (Res (W (Maybe fin)))) →
   m (OnOne (RadixChunk cfin k fin) m2 c k this fin)
 onOneWitherM = onOneWitherFM (\a b → pure $ RadixTree a b) (mkBin unwrap) (mkTip unwrap) (pure $ wrapB sNil)
 
 -- mergeWithUpdate :: forall c sig1 m1 sig2 m2 k fin upd.
---   (Container c, Has Fresh sig1 m1, MonadFix m1, Has AppIO sig2 m2, Ser fin, InferValT k, InferValT upd, InferValT fin, InferContainerT c, Ser upd, Typeable k)
+--   (Container c, Has Fresh sig1 m1, MonadFix m1, Has AppIO sig2 m2, InferValT True fin, InferValT False k, InferValT True upd, InferValT True fin, InferContainerT c, InferValT True upd, InferValT False k)
 --   => (Maybe fin -> upd -> fin)
 --   -> m1 (RadixTree c k fin
 --     -> RadixTree c k upd
@@ -731,26 +748,26 @@ onOneWitherM = onOneWitherFM (\a b → pure $ RadixTree a b) (mkBin unwrap) (mkT
 --       Nothing
 
 mergeId ∷
-  (Ser a, Ser this, InferValT k, InferValT this, InferValT a, InferContainerT cfin, InferContainerT c, AppWither p m2 c cfin, AppMerge p m2 c cfin, Has AppIO sig m2, Typeable k) ⇒
+  (InferValT True a, InferValT True this, InferValT False k, InferValT True this, InferValT True a, InferContainerT cfin, InferContainerT c, AppWither p m2 c cfin, AppMerge p m2 c cfin, Has AppIO sig m2, InferValT False k) ⇒
   p →
   RadixTree c k this →
   RadixTree c k a →
-  m2 (RadixTree cfin k (Maybe this, Maybe a))
+  m2 (RadixTree cfin k (W (Maybe this), W (Maybe a)))
 mergeId strat = $sFreshI do
-  o1 ← onOneWitherM strat \_ → allocC . Just . (,Nothing) . Just
-  o2 ← onOneWitherM strat \_ → allocC . Just . (Nothing,) . Just
-  merge strat o1 o2 (OnBoth \_ a _ b → allocC $ Just (Just a, Just b)) Nothing
+  o1 ← onOneWitherM strat \_ → allocC . W . Just . (,W Nothing) . W . Just
+  o2 ← onOneWitherM strat \_ → allocC . W . Just . (W Nothing,) . W . Just
+  merge strat o1 o2 (OnBoth \_ a _ b → allocC $ W $ Just (W $ Just a, W $ Just b)) Nothing
 
 -- diff
 
 diffF ∷
-  (Has Fresh sig1 m1, MonadFix m1, AppMerge strat m2 c cfin, AppWither strat m2 c cfin, Has AppIO sig2 m2, InferContainerT c, InferValT fin, InferValT a, InferValT chunk, InferValT k, Ser a, Typeable k) ⇒
-  (cfin (Maybe fin) → cfin chunk → m2 tree) →
+  (Has Fresh sig1 m1, MonadFix m1, AppMerge strat m2 c cfin, AppWither strat m2 c cfin, Has AppIO sig2 m2, InferContainerT c, InferValT True fin, InferValT True a, InferValT True chunk, InferValT False k, InferValT True a, InferValT False k) ⇒
+  (cfin (W (Maybe fin)) → cfin chunk → m2 tree) →
   (Bool → Chunk → cfin chunk → cfin chunk → m2 (Res chunk)) →
   (Chunk → tree → m2 (Res chunk)) →
   m2 (Res chunk) →
   strat →
-  (MapDiffE a → m2 (Res (Maybe fin))) →
+  (MapDiffE a → m2 (Res (W (Maybe fin)))) →
   m1 (RadixTree c k a → RadixTree c k a → m2 tree)
 diffF onTree onBin onTip onNil strat f = do
   w1 ← onOneWitherFM onTree onBin onTip onNil strat \_ x → f (MapDel x)
@@ -766,21 +783,21 @@ diffF onTree onBin onTip onNil strat f = do
     (Just $ OnSame (\_ _ → pure $ wrapB sNothing) (\_ _ → pure $ wrapB sNothing) (\_ _ → wrap <$> onNil) (\_ _ → onNil))
 
 diff ∷
-  (Has Fresh sig1 m1, MonadFix m1, AppMerge strat m2 c cfin, AppWither strat m2 c cfin, Has AppIO sig2 m2, Ser a, InferContainerT c, InferContainerT cfin, InferValT fin, InferValT a, InferValT k, Typeable k, Ser fin) ⇒
+  (Has Fresh sig1 m1, MonadFix m1, AppMerge strat m2 c cfin, AppWither strat m2 c cfin, Has AppIO sig2 m2, InferValT True a, InferContainerT c, InferContainerT cfin, InferValT True fin, InferValT True a, InferValT False k, InferValT False k, InferValT True fin) ⇒
   strat →
-  (MapDiffE a → m2 (Res (Maybe fin))) →
+  (MapDiffE a → m2 (Res (W (Maybe fin)))) →
   m1 (RadixTree c k a → RadixTree c k a → m2 (RadixTree cfin k fin))
 diff = diffF (\a b → pure $ RadixTree a b) (mkBin unwrap) (mkTip unwrap) (pure $ wrapB sNil)
 
 diffId ∷
-  (Ser a, Ser (MapDiffE a), InferValT k, InferValT a, InferValT (MapDiffE a), InferContainerT cfin, InferContainerT c, AppWither strat m2 c cfin, AppMerge strat m2 c cfin, Has AppIO sig m2, Typeable k) ⇒
+  (InferValT True a, InferValT False k, InferValT True a, InferContainerT cfin, InferContainerT c, AppWither strat m2 c cfin, AppMerge strat m2 c cfin, Has AppIO sig m2) ⇒
   strat →
   RadixTree c k a →
   RadixTree c k a →
-  m2 (RadixTree cfin k (MapDiffE a))
-diffId strat = $sFreshI $ diff strat $ alloc . Just
+  m2 (RadixTree cfin k (W (MapDiffE a)))
+diffId strat = $sFreshI $ diff strat $ alloc . W . Just . W
 
-intersection ∷ (AppMerge p m c2 c2, Has AppIO sig m, InferContainerT c2, InferValT two, InferValT fin, InferValT k2, Ser two, Ser fin, Typeable k2) ⇒ p → RadixTree c2 k2 fin → RadixTree c2 k2 two → m (RadixTree c2 k2 fin)
+intersection ∷ (AppMerge p m c2 c2, Has AppIO sig m, InferContainerT c2, InferValT True two, InferValT True fin, InferValT False k2, InferValT True two, InferValT True fin, InferValT False k2) ⇒ p → RadixTree c2 k2 fin → RadixTree c2 k2 two → m (RadixTree c2 k2 fin)
 intersection strat =
   $sFreshI
     $ merge strat onOneErase onOneErase (OnBoth \a _ _ _ → pure a)
@@ -822,7 +839,7 @@ instance (Has (AppIO :+: Reduce :+: NonDet) sig m) ⇒ Selector SelNonDet m wher
     now ← send Choose
     if now
       then do
-        exists ← isJust <$> fetchC valM
+        exists ← isJust . unW <$> fetchC valM
         unless exists E.empty
         pure Nothing
       else pure $ Just SelNonDetC
@@ -940,7 +957,7 @@ instance (Has (AppIO :+: Reduce :+: NonDet) sig m) ⇒ Selector SelNonDetRanged 
     let (this, rangeM) = unconsRangeT range0
      in ( do
             E.guard this
-            E.guard . isJust =<< fetchC valM
+            E.guard . isJust . unW =<< fetchC valM
             pure Nothing
         )
           <|> Just . SelNonDetRangedC <$> maybeToEmpty rangeM
@@ -960,21 +977,21 @@ selNonDetRanged = SelNonDetRangedT
 empty ∷ (Container c) ⇒ RadixTree c k a
 empty = RadixTree (wrapB sNothing) (wrapB sNil)
 
-fromListM ∷ ∀ c sig m k v. (Has AppIO sig m, Container c, IsRadixKey k, Typeable k, Ser v) ⇒ [(k, v)] → m (RadixTree c k v)
+fromListM ∷ ∀ c sig m k v. (Has AppIO sig m, Container c, IsRadixKey k, InferValT False k, InferValT True v) ⇒ [(k, v)] → m (RadixTree c k v)
 fromListM = foldM (\t (k, v) → insert (selEq k) v t) empty
 
-toListM ∷ ∀ c sig m k v. (Has AppIO sig m, Container c, IsRadixKey k, Typeable k, Ser v) ⇒ RadixTree c k v → m [(k, v)]
+toListM ∷ ∀ c sig m k v. (Has AppIO sig m, Container c, IsRadixKey k, InferValT False k, InferValT True v) ⇒ RadixTree c k v → m [(k, v)]
 toListM = fmap catMaybes . runNonDetA . lookupKV selNonDet
 
-toDelayed ∷ ∀ k v. (Typeable k, Ser v) ⇒ RadixTree Res k v → RadixTree Delay k v
+toDelayed ∷ ∀ k v. (InferValT False k, InferValT False k, InferValT True v) ⇒ RadixTree Res k v → RadixTree Delay k v
 toDelayed (RadixTree valM subM) = RadixTree (DelayPin valM) (toDelayedC subM)
  where
   toDelayedC ∷ Res (RadixChunk Res k v) → Delay (RadixChunk Delay k v)
   toDelayedC x =
     mkDelayLazy
       $ fetch x
-      >>= ( readReducible >>> \case
+      >>= ( unW >>> readReducible >>> \case
               Nil → pure $ wrapB sNil
-              Tip k rt → allocC $ mkReducible $ Tip k $ toDelayed rt
-              Bin k a b → allocC $ mkReducible $ Bin k (toDelayedC a) (toDelayedC b)
+              Tip k rt → allocC $ W $ mkReducible $ Tip k $ toDelayed rt
+              Bin k a b → allocC $ W $ mkReducible $ Bin k (toDelayedC a) (toDelayedC b)
           )

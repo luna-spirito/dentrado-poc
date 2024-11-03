@@ -41,6 +41,9 @@ readReducible (Reducible x) = unsafePerformIO $ readIORef x
 instance (Show a) ⇒ Show (Reducible a) where
   show = show . readReducible
 
+-- | No-op wrapper. Used to simplify Haskell type inference.
+newtype W a = W {unW ∷ a}
+
 {-
 In Dentrado, the border between memory and disk data is blurred.
 Some data structures could be so large that they are only partially loaded into RAM, while the rest stays on disk.
@@ -58,27 +61,14 @@ It features:
 
 `c` stands for the generalized container type: either Res (regular container) or Delay (lazy container, which holds possibly non-evaluated values).
 -}
-data RadixTree c (k ∷ Type) a = RadixTree !(c (Maybe a)) !(c (RadixChunk c k a)) -- both element and next is containerized, both can be left unwrapped.
+data RadixTree c (k ∷ Type) a = RadixTree !(c (W (Maybe a))) !(c (RadixChunk c k a)) -- both element and next is containerized, both can be left unwrapped.
   deriving (Generic)
 
-type RadixChunk c (k ∷ Type) a = Reducible (RadixChunk' c k a)
+type RadixChunk c (k ∷ Type) a = W (Reducible (RadixChunk' c k a))
 data RadixChunk' c (k ∷ Type) a
   = Nil
   | Tip !Chunk !(RadixTree c k a) -- RadixTree is the only possible branch. Still could be containerized, but I'm not sure it's worth it
   | Bin !Chunk !(c (RadixChunk c k a)) !(c (RadixChunk c k a)) -- Either branch can be accessed, so containerization
-  deriving (Generic)
-
-{- |
-`MapDiffE v` is used to capture the difference between the old value of type `v` and new value of type `v`.
-It appears, for example, when calculating the difference between old RadixTree and new RadixTree.
--}
-data MapDiffE v = MapAdd !v | MapUpd !v !v | MapDel !v
-  deriving (Generic)
-
-{- |
-Type use in the the StateGraph's internal implementation.
--}
-data StateGraphEntry v = StateGraphEntrySampled | StateGraphEntryModified !v
   deriving (Generic)
 
 -- | Timestamp is 4 unsigned bytes.
@@ -99,30 +89,30 @@ data EventId = EventId !Timestamp !LocalEventId
 instance Show EventId where
   show (EventId (Timestamp a) (LocalEventId b)) = "#" <> show a <> "-" <> show b
 
-{-
-The rest of the file should be moved as soon as possible, but this requires to invent the functionality for
-Dentrado to work with custom type.
-Currently, we just hardcode all the types used in tests.
--}
+-- {-
+-- The rest of the file should be moved as soon as possible, but this requires to invent the functionality for
+-- Dentrado to work with custom type.
+-- Currently, we just hardcode all the types used in tests.
+-- -}
 
-{- | Model: SiteAccessLevel: enum that defines priviliges of the site's user.
-Either user is an admin, or a moderator, or a regular user, or is simply banned (None).
--}
-data SiteAccessLevel = SalNone | SalUser | SalModerator | SalAdmin
-  deriving (Eq, Show, Generic)
+-- {- | Model: SiteAccessLevel: enum that defines priviliges of the site's user.
+-- Either user is an admin, or a moderator, or a regular user, or is simply banned (None).
+-- -}
+-- data SiteAccessLevel = SalNone | SalUser | SalModerator | SalAdmin
+--   deriving (Eq, Show, Generic)
 
-type UserId = EventId -- Users/other entities could be represnted as events that created them.
-type LoginId = EventId
+-- type UserId = EventId -- Users/other entities could be represnted as events that created them.
+-- type LoginId = EventId
 
--- | Model: Event: enum that defines list of events that are being processed to construct a site.
-data Event
-  = CreateUser -- #0: Marker. Is sent when a new user is created.
-  | -- | admin?, user, level
-    -- UNUSED: | | AdminRevoke !EventId !EventId -- #2: admin, user event
-    -- UNUSED: | UserCreateMessage !EventId !Bool -- #3: user, owned?
-    -- UNUSED: | UserEditMessage !EventId !EventId !(Maybe (Maybe Text, (Maybe Text, [(Text, Maybe EventId)]))) -- #3: user, message, new content?: update title?, update content?, update-set subpages
-    AdminSetAccessLevel !(Maybe UserId) !UserId !SiteAccessLevel -- #1: Is sent when some admin (or superuser) assignes new SiteAccessLevel to the user.
-  deriving (Show, Generic)
+-- -- | Model: Event: enum that defines list of events that are being processed to construct a site.
+-- data Event
+--   = CreateUser -- #0: Marker. Is sent when a new user is created.
+--   | -- | admin?, user, level
+--     -- UNUSED: | | AdminRevoke !EventId !EventId -- #2: admin, user event
+--     -- UNUSED: | UserCreateMessage !EventId !Bool -- #3: user, owned?
+--     -- UNUSED: | UserEditMessage !EventId !EventId !(Maybe (Maybe Text, (Maybe Text, [(Text, Maybe EventId)]))) -- #3: user, message, new content?: update title?, update content?, update-set subpages
+--     AdminSetAccessLevel !(Maybe UserId) !UserId !SiteAccessLevel -- #1: Is sent when some admin (or superuser) assignes new SiteAccessLevel to the user.
+--   deriving (Show, Generic)
 
 -- Util functions
 -- TODO: Move them.

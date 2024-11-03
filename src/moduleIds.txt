@@ -2,6 +2,7 @@
 1: Dentrado.POC.Data.RadixTree
 2: Dentrado.POC.Data.RadixZipper
 3: Dentrado.POC.Db
+4: Dentrado.POC.SEr
 
 Tests:
 100: (any leaf module)
