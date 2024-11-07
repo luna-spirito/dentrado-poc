@@ -97,6 +97,7 @@ mkStateGraph evsA (depsA, hdl) =
         (P.fromJust <$> RT.lookupKV (RT.selNonDetRanged (lbound, rbound)) reads)
         \(affId, _) → modify (Set.insert affId)
     {-# SCC affectedReads #-}
+    {-# INLINE affectedReads #-}
 
     mkRunWithDeps ∷ StateGraphDeps ctx m → RunWithDeps m ctx
     mkRunWithDeps = \case
@@ -166,7 +167,9 @@ mkStateGraph evsA (depsA, hdl) =
         ()
     process (oldEvs, newEvs) runWithDeps updDepsCache emptyDepsAccessed =
       whilePop @EventId \evId → do
-        let markChanged timeline = affectedReads evId timeline
+        let
+          markChanged timeline = affectedReads evId timeline
+          {-# INLINE markChanged #-}
 
         Dict ← pure $ depsApplicativeProof depsA
         prevStateGraph ← get @(RT.MapR k _)
@@ -327,3 +330,4 @@ toListsFull (StateGraph perKeyRT) = do
     a ← RT.toListM perTimeRT1
     b ← RT.toListM perTimeRT2
     pure (k, sortBy (\(a', _) (b', _) → compare b' a') (fmap Left <$> a) <> (fmap Right <$> b))
+
