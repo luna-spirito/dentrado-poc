@@ -1,30 +1,77 @@
 module Shared.Model where
 
-import Dentrado.POC.Gear (GearTemplate', asmGear, builtinAsmGearTemplate, events)
+import Data.Constraint (Dict (..))
+import qualified Dentrado.POC.Data.RadixTree as RT
+import Dentrado.POC.Gear (GearTemplate', asmGear, builtinAsmGearTemplate, events')
+import Dentrado.POC.Memory (InferValT, ValT' (..), ValTWrapped' (..), builtin, inferValT, struct, unstruct)
+import Dentrado.POC.StateGraph (Same)
 import qualified Dentrado.POC.StateGraph as SG
 import Dentrado.POC.TH (moduleId, sFreshI)
-import Dentrado.POC.Types (Event (..), SiteAccessLevel (..), UserId)
+import Dentrado.POC.Types (EventId, W (..))
 import RIO
 
 $(moduleId 102)
 
+{- | Model: SiteAccessLevel: enum that defines priviliges of the site's user.
+Either user is an admin, or a moderator, or a regular user, or is simply banned (None).
+-}
+data SiteAccessLevel = SalNone | SalUser | SalModerator | SalAdmin
+  deriving (Eq, Show, Generic)
+
+instance Same SiteAccessLevel where
+  same = (==)
+
+valTSiteAccessLevel ∷ ValT' s (W SiteAccessLevel)
+valTSiteAccessLevel =
+  ValTWrapped
+    ($sFreshI $ builtin $ ValTWrapped' (\_ → Dict) unstruct struct)
+    inferValT -- ValTEither (ValTEither ValTUnit ValTUnit) (ValTEither ValTUnit ValTUnit)
+
+instance InferValT s (W SiteAccessLevel) where
+  inferValT = valTSiteAccessLevel
+
+type UserId = EventId -- Users/other entities could be represnted as events that created them.
+type LoginId = EventId
+
+-- | Model: Event: enum that defines list of events that are being processed to construct a site.
+data Event
+  = CreateUser -- #0: Marker. Is sent when a new user is created.
+  | -- | admin?, user, level
+    -- UNUSED: | | AdminRevoke !EventId !EventId -- #2: admin, user event
+    -- UNUSED: | UserCreateMessage !EventId !Bool -- #3: user, owned?
+    -- UNUSED: | UserEditMessage !EventId !EventId !(Maybe (Maybe Text, (Maybe Text, [(Text, Maybe EventId)]))) -- #3: user, message, new content?: update title?, update content?, update-set subpages
+    AdminSetAccessLevel !(W (Maybe UserId)) !UserId !(W SiteAccessLevel) -- #1: Is sent when some admin (or superuser) assignes new SiteAccessLevel to the user.
+  deriving (Show, Generic)
+
+valTEvent ∷ ValT' s (W Event)
+valTEvent =
+  ValTWrapped
+    ($sFreshI $ builtin $ ValTWrapped' (\_ → Dict) unstruct struct)
+    inferValT
+
+instance InferValT s (W Event) where
+  inferValT = valTEvent
+
+events ∷ GearTemplate' () (RT.MapR EventId (W Event))
+events = $sFreshI $ builtinAsmGearTemplate $ events' @(W Event)
+
 {- | The Gear that processes the test input, returning the StateGraph
 which associates SiteAccessLevel to each UserId throughout all points of time.
 -}
-status ∷ GearTemplate' () (SG.StateGraph UserId SiteAccessLevel)
+status ∷ GearTemplate' () (SG.StateGraph UserId (W SiteAccessLevel))
 status =
   $sFreshI
     $ builtinAsmGearTemplate
     $ SG.mkStateGraph
       (asmGear events)
       ( SG.StateGraphDepsNil
-      , \case
-          AdminSetAccessLevel adminM target level → do
+      , unW >>> \case
+          AdminSetAccessLevel (W adminM) target level → do
             hasAccess ← case adminM of
               Nothing → pure True
               Just admin →
                 SG.query admin <&> \case
-                  Just SalAdmin → True
+                  Just (W SalAdmin) → True
                   _ → False
             when hasAccess $ SG.update target $ pure level
           _ → pure ()

@@ -9,13 +9,13 @@ import Data.Constraint (Dict (..))
 import Data.Dynamic (Dynamic (..), fromDynamic)
 import qualified Data.IntMap.Strict as IMap
 import qualified Dentrado.POC.Data.RadixTree as RT
-import Dentrado.POC.Memory (AppForce (..), AppIOC, Container, Env (..), Gear (..), GearFn (..), GearTemplate (..), InferContainerT, InferValT (..), M (..), Res, RevList (..), ValT (..), builtinFunM, funApp', sendAI, tryFromVal, tryLazy, ValT' (..), EValT (..), valTMaybe, valTypeableProof)
+import Dentrado.POC.Memory (AppForce (..), AppIOC, Container, EValT (..), Env (..), Gear (..), GearFn (..), GearTemplate (..), InferContainerT, InferValT (..), M (..), Res, RevList (..), ValT (..), ValT' (..), builtinFunM, funApp', sendAI, tryFromVal, tryLazy, valTMaybe, valTypeableProof)
+import Dentrado.POC.Ser (serGearFn, unstableSerialized)
 import Dentrado.POC.TH (moduleId, sFreshI)
 import Dentrado.POC.Types (EventId (..), W (..))
 import RIO hiding (asks, runReader, toList)
 import qualified RIO.Partial as P
 import Type.Reflection (pattern TypeRep)
-import Dentrado.POC.Ser (unstableSerialized, serGearFn)
 
 $(moduleId 3)
 
@@ -157,21 +157,21 @@ If some event needs to be cancelled, this should be another event.
 Obviously this is subject to change.
 TODO: POC: Temp
 -}
-events ∷ forall a. InferValT True a => Asm () (RT.MapR EventId a)
-events = 
+events' ∷ ∀ a. (InferValT True a) ⇒ Asm () (RT.MapR EventId a)
+events' =
   asmCached
     (0, RT.empty @Res)
-  $ pure \(oldLen, oldRes) → do
-    (UnsafeRevList evs, newLen) ← readMVar =<< asks envEvents
-    newRes ←
-      foldM
-        ( \rt (t, ev) →
-            tryFromVal @a ev & maybe (pure rt) \v →
-              RT.insert (RT.selEq t) v rt
-        )
-        oldRes
-        (take (newLen - oldLen) evs)
-    pure (newRes, (newLen, newRes))
+    $ pure \(oldLen, oldRes) → do
+      (UnsafeRevList evs, newLen) ← readMVar =<< asks envEvents
+      newRes ←
+        foldM
+          ( \rt (t, ev) →
+              tryFromVal @a ev & maybe (pure rt) \v →
+                RT.insert (RT.selEq t) v rt
+          )
+          oldRes
+          (take (newLen - oldLen) evs)
+      pure (newRes, (newLen, newRes))
 
 -- indexes
 

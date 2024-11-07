@@ -18,15 +18,15 @@ import Data.Bits (complement, countLeadingZeros, countTrailingZeros, finiteBitSi
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Builder as B
 import qualified Data.ByteString.Unsafe as B
+import Data.Constraint (Dict (..))
 import Data.Foldable (foldrM)
 import Data.Kind (Type)
 import Data.Monoid (First (..))
-import Dentrado.POC.Memory (AppDelay (..), AppForce (..), AppIO, AppIOC, C (..), Container (..), Delay (..), DelayApp (..), InferContainerT, InferValT (..), Reduce, Reduce' (..), Reduce'C (..), ReduceC, Res (..), ResB (..), RevList, Serialized (..), alloc, allocC, builtin, builtinFunM, delayAppBuiltinFun, fetch, fetchC, mkDelayCache, mkDelayLazy, mkReducible, reduce', reducible, reducible', revSnoc, runReduce, runReduce', sNothing, tryFetchC, unwrap, wrapB, (:->) (..), ValT' (..), ValTWrapped' (..), EValT (..), valTypeableProof)
+import Dentrado.POC.Memory (AppDelay (..), AppForce (..), AppIO, AppIOC, C (..), Container (..), Delay (..), DelayApp (..), EValT (..), InferContainerT, InferValT (..), Reduce, Reduce' (..), Reduce'C (..), ReduceC, Res (..), ResB (..), RevList, Serialized (..), ValT' (..), ValTWrapped' (..), alloc, allocC, builtin, builtinFunM, delayAppBuiltinFun, fetch, fetchC, mkDelayCache, mkDelayLazy, mkReducible, reduce', reducible, reducible', revSnoc, runReduce, runReduce', sNothing, tryFetchC, unwrap, valTypeableProof, wrapB, (:->) (..))
 import Dentrado.POC.TH (moduleId, sFreshI)
-import Dentrado.POC.Types (Chunk, EventId (EventId), LocalEventId (..), RadixChunk, RadixChunk' (..), RadixTree (..), Timestamp (..), maybeToEmpty, readReducible, W (..))
+import Dentrado.POC.Types (Chunk, EventId (EventId), LocalEventId (..), RadixChunk, RadixChunk' (..), RadixTree (..), Timestamp (..), W (..), maybeToEmpty, readReducible)
 import GHC.Exts (IsList (..))
 import RIO hiding (Map, Set, catch, lookup, mask, runReader, toList, (<|>))
-import Data.Constraint (Dict(..))
 
 {-
 This module contains implementation of RadixTree for the needs of Dentrado.
@@ -128,18 +128,23 @@ It appears, for example, when calculating the difference between old RadixTree a
 -}
 data MapDiffE v = MapAdd !v | MapUpd !v !v | MapDel !v
 
-valTMapDiffE :: ValT' s v → ValT' s (W (MapDiffE v))
+valTMapDiffE ∷ ValT' s v → ValT' s (W (MapDiffE v))
 valTMapDiffE =
-  let wrapped = ValTWrapped $ $sFreshI $ builtin $ ValTWrapped'
-        (\(EValT (ValTEither a _)) → valTypeableProof a & \Dict → Dict)
-        (either MapAdd $ either (uncurry MapUpd) MapDel)
-        (\case
-          MapAdd v → Left v
-          MapUpd a b → Right (Left (a, b))
-          MapDel v → Right $ Right v)
-  in \v → wrapped $ ValTEither v (ValTEither (ValTTuple v v) v)
+  let wrapped =
+        ValTWrapped
+          $ $sFreshI
+          $ builtin
+          $ ValTWrapped'
+            (\(EValT (ValTEither a _)) → valTypeableProof a & \Dict → Dict)
+            (either MapAdd $ either (uncurry MapUpd) MapDel)
+            ( \case
+                MapAdd v → Left v
+                MapUpd a b → Right (Left (a, b))
+                MapDel v → Right $ Right v
+            )
+   in \v → wrapped $ ValTEither v (ValTEither (ValTTuple v v) v)
 
-instance InferValT s v => InferValT s (W (MapDiffE v)) where
+instance (InferValT s v) ⇒ InferValT s (W (MapDiffE v)) where
   inferValT = valTMapDiffE inferValT
 
 unMapDiffE ∷ MapDiffE v → (Maybe v, Maybe v)

@@ -1,7 +1,7 @@
 import Dentrado.POC.Gear (confNewGear, runGear)
 import Dentrado.POC.Memory (AppIOC)
 import qualified Dentrado.POC.StateGraph as SG
-import Dentrado.POC.Types (Event (..), EventId (..), SiteAccessLevel (..), UserId)
+import Dentrado.POC.Types (EventId (..), W (..))
 import Language.Haskell.TH (newDeclarationGroup)
 import RIO hiding (ask, runReader)
 import RIO.List (inits)
@@ -12,34 +12,34 @@ import Test.QuickCheck
 {- | Test input: set of events, modeling the site with the concept of user access level.
 Admin users can change the level of other users, including other admins.
 -}
-test1 ∷ [(EventId, Event)]
+test1 ∷ [(EventId, W Event)]
 test1 =
   zipWith
-    (\i v → (e i, v))
+    (\i v → (e i, W v))
     [0 ..]
     [ CreateUser
     , CreateUser
     , CreateUser
     , CreateUser
-    , AdminSetAccessLevel Nothing (e 0) SalAdmin -- 0 is now admin
-    , AdminSetAccessLevel (Just $ e 0) (e 1) SalModerator -- 1 is now moderator
-    , AdminSetAccessLevel (Just $ e 1) (e 1) SalAdmin -- denied
-    , AdminSetAccessLevel (Just $ e 1) (e 3) SalModerator -- denied
-    , AdminSetAccessLevel (Just $ e 0) (e 2) SalAdmin -- 2 is now admin
-    , AdminSetAccessLevel (Just $ e 2) (e 1) SalNone -- 1 is now banned
-    , AdminSetAccessLevel (Just $ e 2) (e 4) SalModerator -- 4 is now moderator
+    , AdminSetAccessLevel (W Nothing) (e 0) $ W SalAdmin -- 0 is now admin
+    , AdminSetAccessLevel (W $ Just $ e 0) (e 1) $ W SalModerator -- 1 is now moderator
+    , AdminSetAccessLevel (W $ Just $ e 1) (e 1) $ W SalAdmin -- denied
+    , AdminSetAccessLevel (W $ Just $ e 1) (e 3) $ W SalModerator -- denied
+    , AdminSetAccessLevel (W $ Just $ e 0) (e 2) $ W SalAdmin -- 2 is now admin
+    , AdminSetAccessLevel (W $ Just $ e 2) (e 1) $ W SalNone -- 1 is now banned
+    , AdminSetAccessLevel (W $ Just $ e 2) (e 4) $ W SalModerator -- 4 is now moderator
     ]
 
 -- | Test expected result.
-test1Res ∷ [(UserId, [(EventId, SiteAccessLevel)])]
+test1Res ∷ [(UserId, [(EventId, W SiteAccessLevel)])]
 test1Res =
-  [ (e 0, [(e 4, SalAdmin)])
-  , (e 1, [(e 5, SalModerator), (e 9, SalNone)])
-  , (e 2, [(e 8, SalAdmin)])
-  , (e 4, [(e 10, SalModerator)])
+  [ (e 0, [(e 4, W SalAdmin)])
+  , (e 1, [(e 5, W SalModerator), (e 9, W SalNone)])
+  , (e 2, [(e 8, W SalAdmin)])
+  , (e 4, [(e 10, W SalModerator)])
   ]
 
-oneshot ∷ [(EventId, Event)] → (SG.StateGraph EventId SiteAccessLevel → AppIOC r) → r -- [(UserId, [(EventId, SiteAccessLevel)])]
+oneshot ∷ [(EventId, W Event)] → (SG.StateGraph EventId (W SiteAccessLevel) → AppIOC r) → r -- [(UserId, [(EventId, SiteAccessLevel)])]
 oneshot t renderer = unsafeRunAppIO do
   status' ← confNewGear status ()
   putEventList t
@@ -50,7 +50,7 @@ prop_test1_oneshot_correct =
     $ test1Res
     == oneshot test1 SG.toLists
 
-multishot ∷ [(EventId, Event)] → (SG.StateGraph UserId SiteAccessLevel → AppIOC a) → a
+multishot ∷ [(EventId, W Event)] → (SG.StateGraph UserId (W SiteAccessLevel) → AppIOC a) → a
 multishot t renderer = unsafeRunAppIO do
   status' ← confNewGear status ()
   for_ @[] (inits t) \curr → do

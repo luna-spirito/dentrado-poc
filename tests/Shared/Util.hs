@@ -3,8 +3,8 @@ module Shared.Util where
 import Control.Algebra
 import Control.Carrier.Reader (ask, runReader)
 import qualified Dentrado.POC.Data.RadixTree as RT
-import Dentrado.POC.Memory (AppIO, AppIOC (..), Env (..), EnvLoad (..), EnvStore (..), Val (..), ValT (..), sendAI)
-import Dentrado.POC.Types (Any1 (..), Event, EventId (..), LocalEventId (..), Timestamp (..))
+import Dentrado.POC.Memory (AppIO, AppIOC (..), Env (..), EnvLoad (..), EnvStore (..), InferValT, Val (..), inferValT, sendAI)
+import Dentrado.POC.Types (Any1 (..), EventId (..), LocalEventId (..), Timestamp (..))
 import GHC.Exts (IsList (..))
 import RIO hiding (ask, runReader)
 import RIO.Time (diffUTCTime, getCurrentTime)
@@ -29,17 +29,17 @@ runAppIO act = do
       <$> newIORef 0
       <*> pure mempty
       <*> newMVar mempty
-      <*> pure (EnvLoad \_ → fail "not available")
-      <*> pure (EnvStore \_ → fail "not available")
+      <*> pure (EnvLoad \_ _ → fail "not available")
+      <*> pure (EnvStore \_ _ → fail "not available")
       <*> newMVar RT.empty
       <*> newMVar mempty
       <*> newMVar ([], 0)
   runReader env $ unAppIOC act
 
-putEventList ∷ [(EventId, Event)] → AppIOC ()
+putEventList ∷ (InferValT True x) ⇒ [(EventId, x)] → AppIOC ()
 putEventList evs = do
   evsM ← envEvents <$> ask
-  sendAI $ void $ swapMVar evsM (fmap (Any1 . Val ValTEvent) <$> fromList evs, length evs)
+  sendAI $ void $ swapMVar evsM (fmap (Any1 . Val inferValT) <$> fromList evs, length evs)
 
 e ∷ Word32 → EventId
 e = EventId (Timestamp 0) . LocalEventId

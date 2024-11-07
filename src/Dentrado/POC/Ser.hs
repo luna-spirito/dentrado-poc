@@ -1,32 +1,32 @@
 module Dentrado.POC.Ser where
 
-import RIO hiding (asks)
 import Control.Algebra
-import Control.Effect.Sum
-import Data.Kind (Type)
-import Control.Carrier.State.Church (StateC, get, put)
-import Control.Effect.Empty (Empty)
-import Control.Carrier.Writer.Church (WriterC, tell, runWriter)
-import Dentrado.POC.Memory (AppIOC, RevList (..), Res (..), (:->) (..), ResB (..), Env (..), ValT, Val (..), MonadT (..), ContainerT (..), EValT (..), sendAI, ResA (..), Delay (..), DelayApp (..), unDelayLazy, runReduce, fetch, withUnsafeEq, C (..), valTypeableProof, B (..), Gear (..), GearFn (..), GearTemplate (..), ValT' (..), unser, ValTWrapped' (..), Serialized (..), EnvStore (..), tryLazy, valTMaybe, valTReducible)
 import Control.Carrier.Empty.Church (EmptyC)
-import Dentrado.POC.Types (Any1 (..), maybeToEmpty, Dynamic1 (..), RadixTree (..), W (..), RadixChunk' (..), LocalEventId (..), EventId (..), Timestamp (..))
-import RIO.List (uncons)
-import qualified Type.Reflection as T
-import Data.Constraint (Dict(..))
-import qualified Data.ByteString.Builder as B
-import qualified RIO.ByteString as B
+import Control.Carrier.State.Church (StateC, get, put)
+import Control.Carrier.Writer.Church (WriterC, runWriter, tell)
+import Control.Effect.Empty (Empty)
 import qualified Control.Effect.Empty as E
-import qualified RIO.Partial as P
-import Data.Dynamic (fromDynamic, Dynamic (..))
-import qualified Data.IntMap as IMap
 import Control.Effect.Reader (asks)
-import Data.Bits ((.|.), Bits (unsafeShiftL), unsafeShiftR, finiteBitSize)
+import Control.Effect.Sum
+import Data.Bits (Bits (unsafeShiftL), finiteBitSize, unsafeShiftR, (.|.))
+import qualified Data.ByteString.Builder as B
 import qualified Data.ByteString.Unsafe as B
-import qualified RIO.List as L
-import System.Mem.Weak (deRefWeak, mkWeakPtr)
+import Data.Constraint (Dict (..))
+import Data.Dynamic (Dynamic (..), fromDynamic)
+import Data.Functor.Compose (Compose (..))
+import qualified Data.IntMap as IMap
+import Data.Kind (Type)
 import Data.Tuple (swap)
-import Data.Functor.Compose (Compose(..))
+import Dentrado.POC.Memory (AppIOC, B (..), C (..), ContainerT (..), Delay (..), DelayApp (..), EValT (..), Env (..), EnvStore (..), Gear (..), GearFn (..), GearTemplate (..), MonadT (..), Res (..), ResA (..), ResB (..), RevList (..), Serialized (..), Val (..), ValT, ValT' (..), ValTWrapped' (..), fetch, runReduce, sendAI, tryLazy, unDelayLazy, unser, valTMaybe, valTReducible, valTypeableProof, withUnsafeEq, (:->) (..))
 import Dentrado.POC.TH (moduleId)
+import Dentrado.POC.Types (Any1 (..), Dynamic1 (..), EventId (..), LocalEventId (..), RadixChunk' (..), RadixTree (..), Timestamp (..), W (..), maybeToEmpty)
+import RIO hiding (asks)
+import qualified RIO.ByteString as B
+import RIO.List (uncons)
+import qualified RIO.List as L
+import qualified RIO.Partial as P
+import System.Mem.Weak (deRefWeak, mkWeakPtr)
+import qualified Type.Reflection as T
 import Unsafe.Coerce (unsafeCoerce)
 
 $(moduleId 4)
@@ -76,14 +76,14 @@ getWord8 = do
 
 -- ValT serialization
 
-serMonadT :: MonadT m → SerM' ()
+serMonadT ∷ MonadT m → SerM' ()
 serMonadT = \case
   MonadTAppIOC → putWord8 0
   MonadTReduceC y → putWord8 1 *> serMonadT y
   MonadTReduceC1 y → putWord8 2 *> serMonadT y
   MonadTReduceC2 y → putWord8 3 *> serMonadT y
 
-deserMonadT :: DeserM' (Any1 MonadT)
+deserMonadT ∷ DeserM' (Any1 MonadT)
 deserMonadT =
   getWord8 >>= \case
     0 → pure $ Any1 MonadTAppIOC
@@ -97,18 +97,18 @@ deserMonadT =
       Any1 x ← deserMonadT
       pure $ Any1 $ MonadTReduceC2 x
 
-serContainerT :: ContainerT a → SerM' ()
+serContainerT ∷ ContainerT a → SerM' ()
 serContainerT = \case
   ContainerTRes → putWord8 0
   ContainerTDelay → putWord8 1
 
-deserContainerT :: DeserM' (Any1 ContainerT)
+deserContainerT ∷ DeserM' (Any1 ContainerT)
 deserContainerT =
   getWord8 <&> \case
     0 → Any1 ContainerTRes
     _1 → Any1 ContainerTDelay
 
-serValT :: ValT' s a → SerM' ()
+serValT ∷ ValT' s a → SerM' ()
 serValT = \case
   ValTFun a (EValT b) → putWord8 0 *> serValT a *> serValT b
   ValTUnit → putWord8 1
@@ -127,171 +127,174 @@ serValT = \case
   ValTEventId → putWord8 14
   ValTMonad mT vT → putWord8 150 *> serMonadT mT *> serValT vT
   ValTSerialized → putWord8 151
-  -- >= 150 RESERVED FOR EVAL
+
+-- >= 150 RESERVED FOR EVAL
 
 deserValT ∷ DeserM' (Any1 ValT)
-deserValT = getWord8 >>= \case
-  0 → do
-    Any1 a ← deserValT
-    Any1 b ← deserEValT
-    pure $ Any1 $ ValTFun a b
-  1 → pure $ Any1 ValTUnit
-  2 → do
-    Any1 a ← deserValT
-    Any1 b ← deserValT
-    pure $ Any1 $ ValTTuple a b
-  3 → do
-    Any1 a ← deserValT
-    Any1 b ← deserValT
-    pure $ Any1 $ ValTEither a b
-  4 → pure $ Any1 ValTInt
-  5 → pure $ Any1 ValTWord32
-  6 → do
-    Any1 a ← deserValT
-    pure $ Any1 $ ValTList a
-  7 → do
-    Any1 c ← deserContainerT
-    Any1 v ← deserValT
-    pure $ Any1 $ ValTContainer c v
-  8 → do
-    Any1 c ← deserContainerT
-    Any1 (EValT k) ← deserEValT
-    Any1 v ← deserValT
-    pure $ Any1 $ ValTRadixTree c k v
-  9 → do
-    Any1 c ← deserContainerT
-    Any1 k ← deserValT
-    Any1 v ← deserValT
-    pure $ Any1 $ ValTRadixChunk c k v
-  10 → do
-    Any1 ctx ← deserValT
-    Any1 out ← deserEValT
-    pure $ Any1 $ ValTGear ctx out
-  11 → pure $ Any1 ValTVal
-  12 → do
-    Dynamic1 rep res ← deserResB'
-    case rep of
-      valT' `T.App` b `T.App` _
-        | Just T.HRefl ← T.eqTypeRep valT' (T.TypeRep @ValT')
-        , Just T.HRefl ← T.eqTypeRep b (T.TypeRep @True) →
-          pure $ Any1 $ ValTB res
-      _ → E.empty
-  13 → do
-    Dynamic1 rep res ← deserResB'
-    Any1 @_ @a real@(valTypeableProof → Dict) ← deserValT
-    case rep of
-      wrapped `T.App` a `T.App` _
-        | Just T.HRefl ← T.eqTypeRep wrapped (T.TypeRep @ValTWrapped')
-        , Just T.HRefl ← T.eqTypeRep a (T.TypeRep @a)
-        → pure $ Any1 $ ValTWrapped res real
-      _ → E.empty
-  14 → E.empty
-  150 → E.empty -- ValTMonad
-  _151 → E.empty -- ValTSerialized
+deserValT =
+  getWord8 >>= \case
+    0 → do
+      Any1 a ← deserValT
+      Any1 b ← deserEValT
+      pure $ Any1 $ ValTFun a b
+    1 → pure $ Any1 ValTUnit
+    2 → do
+      Any1 a ← deserValT
+      Any1 b ← deserValT
+      pure $ Any1 $ ValTTuple a b
+    3 → do
+      Any1 a ← deserValT
+      Any1 b ← deserValT
+      pure $ Any1 $ ValTEither a b
+    4 → pure $ Any1 ValTInt
+    5 → pure $ Any1 ValTWord32
+    6 → do
+      Any1 a ← deserValT
+      pure $ Any1 $ ValTList a
+    7 → do
+      Any1 c ← deserContainerT
+      Any1 v ← deserValT
+      pure $ Any1 $ ValTContainer c v
+    8 → do
+      Any1 c ← deserContainerT
+      Any1 (EValT k) ← deserEValT
+      Any1 v ← deserValT
+      pure $ Any1 $ ValTRadixTree c k v
+    9 → do
+      Any1 c ← deserContainerT
+      Any1 k ← deserValT
+      Any1 v ← deserValT
+      pure $ Any1 $ ValTRadixChunk c k v
+    10 → do
+      Any1 ctx ← deserValT
+      Any1 out ← deserEValT
+      pure $ Any1 $ ValTGear ctx out
+    11 → pure $ Any1 ValTVal
+    12 → do
+      Dynamic1 rep res ← deserResB'
+      case rep of
+        valT' `T.App` b `T.App` _
+          | Just T.HRefl ← T.eqTypeRep valT' (T.TypeRep @ValT')
+          , Just T.HRefl ← T.eqTypeRep b (T.TypeRep @True) →
+              pure $ Any1 $ ValTB res
+        _ → E.empty
+    13 → do
+      Dynamic1 rep res ← deserResB'
+      Any1 @_ @a real@(valTypeableProof → Dict) ← deserValT
+      case rep of
+        wrapped `T.App` a `T.App` _
+          | Just T.HRefl ← T.eqTypeRep wrapped (T.TypeRep @ValTWrapped')
+          , Just T.HRefl ← T.eqTypeRep a (T.TypeRep @a) →
+              pure $ Any1 $ ValTWrapped res real
+        _ → E.empty
+    14 → E.empty
+    150 → E.empty -- ValTMonad
+    _151 → E.empty -- ValTSerialized
 
-withEquatedSer :: forall s1 a s2 b c. (ValT' s1 a -> ValT' s1 b -> c) -> ValT' s1 a -> ValT' s2 b -> c
+withEquatedSer ∷ ∀ s1 a s2 b c. (ValT' s1 a → ValT' s1 b → c) → ValT' s1 a → ValT' s2 b → c
 withEquatedSer f a b = f a (unsafeCoerce @(ValT' s2 b) @(ValT' s1 b) b)
 
 -- TODO: Deduplicate
 deserEValT ∷ DeserM' (Any1 EValT)
-deserEValT = getWord8 >>= \case
-  0 → do
-    Any1 a ← deserValT
-    Any1 b ← deserEValT
-    pure $ Any1 $ EValT $ ValTFun a b
-  1 → pure $ Any1 $ EValT ValTUnit
-  2 → do
-    Any1 (EValT a) ← deserEValT
-    Any1 (EValT b) ← deserEValT
-    pure $ Any1 $ EValT $ withEquatedSer ValTTuple a b
-  3 → do
-    Any1 (EValT a) ← deserEValT
-    Any1 (EValT b) ← deserEValT
-    pure $ Any1 $ EValT $ withEquatedSer ValTEither a b
-  4 → pure $ Any1 $ EValT ValTInt
-  5 → pure $ Any1 $ EValT ValTWord32
-  6 → do
-    Any1 (EValT a) ← deserEValT
-    pure $ Any1 $ EValT $ ValTList a
-  7 → do
-    Any1 c ← deserContainerT
-    Any1 (EValT v) ← deserEValT
-    pure $ Any1 $ EValT $ ValTContainer c v
-  8 → do
-    Any1 c ← deserContainerT
-    Any1 (EValT k) ← deserEValT
-    Any1 (EValT v) ← deserEValT
-    pure $ Any1 $ EValT $ withEquatedSer (ValTRadixTree c) k v
-  9 → do
-    Any1 c ← deserContainerT
-    Any1 (EValT k) ← deserEValT
-    Any1 (EValT v) ← deserEValT
-    pure $ Any1 $ EValT $ withEquatedSer (ValTRadixChunk c) k v
-  10 → do
-    Any1 (EValT ctx) ← deserEValT
-    Any1 out ← deserEValT
-    pure $ Any1 $ EValT $ ValTGear ctx out
-  11 → pure $ Any1 $ EValT ValTVal
-  12 → do
-    Dynamic1 rep res ← deserResB'
-    case rep of
-      valT' `T.App` _ `T.App` _
-        | Just T.HRefl ← T.eqTypeRep valT' (T.TypeRep @ValT') →
-          pure $ Any1 $ EValT $ ValTB res
-      _ → E.empty
-  13 → do
-    Dynamic1 rep res ← deserResB'
-    Any1 @_ @a (EValT real@(valTypeableProof → Dict)) ← deserEValT
-    case rep of
-      wrapped `T.App` a `T.App` _
-        | Just T.HRefl ← T.eqTypeRep wrapped (T.TypeRep @ValTWrapped')
-        , Just T.HRefl ← T.eqTypeRep a (T.TypeRep @a)
-        → pure $ Any1 $ EValT $ ValTWrapped res real
-      _ → E.empty
-  14 → pure $ Any1 $ EValT ValTEventId
-  150 → do
-    Any1 mT ← deserMonadT
-    Any1 vT ← deserValT
-    pure $ Any1 $ EValT $ ValTMonad mT vT
-  _151 → pure $ Any1 $ EValT ValTSerialized
-    
-serVal :: Val a -> SerM' ()
+deserEValT =
+  getWord8 >>= \case
+    0 → do
+      Any1 a ← deserValT
+      Any1 b ← deserEValT
+      pure $ Any1 $ EValT $ ValTFun a b
+    1 → pure $ Any1 $ EValT ValTUnit
+    2 → do
+      Any1 (EValT a) ← deserEValT
+      Any1 (EValT b) ← deserEValT
+      pure $ Any1 $ EValT $ withEquatedSer ValTTuple a b
+    3 → do
+      Any1 (EValT a) ← deserEValT
+      Any1 (EValT b) ← deserEValT
+      pure $ Any1 $ EValT $ withEquatedSer ValTEither a b
+    4 → pure $ Any1 $ EValT ValTInt
+    5 → pure $ Any1 $ EValT ValTWord32
+    6 → do
+      Any1 (EValT a) ← deserEValT
+      pure $ Any1 $ EValT $ ValTList a
+    7 → do
+      Any1 c ← deserContainerT
+      Any1 (EValT v) ← deserEValT
+      pure $ Any1 $ EValT $ ValTContainer c v
+    8 → do
+      Any1 c ← deserContainerT
+      Any1 (EValT k) ← deserEValT
+      Any1 (EValT v) ← deserEValT
+      pure $ Any1 $ EValT $ withEquatedSer (ValTRadixTree c) k v
+    9 → do
+      Any1 c ← deserContainerT
+      Any1 (EValT k) ← deserEValT
+      Any1 (EValT v) ← deserEValT
+      pure $ Any1 $ EValT $ withEquatedSer (ValTRadixChunk c) k v
+    10 → do
+      Any1 (EValT ctx) ← deserEValT
+      Any1 out ← deserEValT
+      pure $ Any1 $ EValT $ ValTGear ctx out
+    11 → pure $ Any1 $ EValT ValTVal
+    12 → do
+      Dynamic1 rep res ← deserResB'
+      case rep of
+        valT' `T.App` _ `T.App` _
+          | Just T.HRefl ← T.eqTypeRep valT' (T.TypeRep @ValT') →
+              pure $ Any1 $ EValT $ ValTB res
+        _ → E.empty
+    13 → do
+      Dynamic1 rep res ← deserResB'
+      Any1 @_ @a (EValT real@(valTypeableProof → Dict)) ← deserEValT
+      case rep of
+        wrapped `T.App` a `T.App` _
+          | Just T.HRefl ← T.eqTypeRep wrapped (T.TypeRep @ValTWrapped')
+          , Just T.HRefl ← T.eqTypeRep a (T.TypeRep @a) →
+              pure $ Any1 $ EValT $ ValTWrapped res real
+        _ → E.empty
+    14 → pure $ Any1 $ EValT ValTEventId
+    150 → do
+      Any1 mT ← deserMonadT
+      Any1 vT ← deserValT
+      pure $ Any1 $ EValT $ ValTMonad mT vT
+    _151 → pure $ Any1 $ EValT ValTSerialized
+
+serVal ∷ Val a → SerM' ()
 serVal (Val xT x) = serValT xT *> ser xT x
 
-deserVal :: DeserM' (Any1 Val)
+deserVal ∷ DeserM' (Any1 Val)
 deserVal = do
   Any1 xT ← deserValT
   Any1 . Val xT <$> deser xT
 
 -- Val serialization
 
-{-| Serialization of ResB is performed just by instructing the system to store the pointer.
+{- | Serialization of ResB is performed just by instructing the system to store the pointer.
 Pointer serialization is queued and is not performed instantly, since that would require to
 force serialization of the referenced object.
 -}
-serResB :: ResB a → SerM' ()
+serResB ∷ ResB a → SerM' ()
 serResB = serRes . ResBuiltin
 
-deserResB' :: DeserM' (Dynamic1 ResB)
+deserResB' ∷ DeserM' (Dynamic1 ResB)
 deserResB' = do
   addr ∷ Word64 ←
     consume >>= \case
       ObjRes addr → pure addr
       _notRes → E.empty
   builtins ← asks envBuiltins
-  Dynamic rep val <- maybeToEmpty $ IMap.lookup (fromIntegral addr) builtins
+  Dynamic rep val ← maybeToEmpty $ IMap.lookup (fromIntegral addr) builtins
   pure $ Dynamic1 rep $ ResB addr val
 
-deserResB :: forall a. Typeable a ⇒ DeserM' (ResB a)
+deserResB ∷ ∀ a. (Typeable a) ⇒ DeserM' (ResB a)
 deserResB = do
   Dynamic1 rep res ← deserResB'
   T.HRefl ← maybeToEmpty $ T.eqTypeRep rep (T.TypeRep @a)
   pure res
 
-serRes :: Res a → SerM' ()
+serRes ∷ Res a → SerM' ()
 serRes x = tell @(RevList (Obj (Any1 Res))) [ObjRes $ Any1 x]
 
-deserRes :: forall a. Typeable a ⇒ DeserM' (Res a)
+deserRes ∷ ∀ a. (Typeable a) ⇒ DeserM' (Res a)
 deserRes = do
   addr ∷ Word64 ←
     consume >>= \case
@@ -331,16 +334,16 @@ deserRes = do
                 oldKnown
             )
 
-serFn :: forall a b. a :-> b -> SerM' ()
+serFn ∷ ∀ a b. a :-> b → SerM' ()
 serFn = \case
   FunBuiltin x → putWord8 0 *> serResB x
   FunCurry f → putWord8 1 *> serFn f
   FunCurry1 xT x f → putWord8 2 *> serVal (Val xT x) *> serFn f
 
-serWord32 :: Word32 → SerM' ()
+serWord32 ∷ Word32 → SerM' ()
 serWord32 = tell . B.word32BE
 
-deserWord32 :: DeserM' Word32
+deserWord32 ∷ DeserM' Word32
 deserWord32 = do
   old ← get
   E.guard (B.length old >= 4)
@@ -352,10 +355,10 @@ deserWord32 = do
     .|. (fromIntegral @_ @Word32 (old `B.unsafeIndex` 2) `unsafeShiftL` 8)
     .|. fromIntegral @_ @Word32 (old `B.unsafeIndex` 3)
 
-serWord64 :: Word64 → SerM' ()
+serWord64 ∷ Word64 → SerM' ()
 serWord64 = tell . B.word64BE
 
-deserWord64 :: DeserM' Word64
+deserWord64 ∷ DeserM' Word64
 deserWord64 = do
   old ← get
   E.guard (B.length old >= 8)
@@ -369,13 +372,13 @@ deserWord64 = do
     .|. (fromIntegral (old `B.unsafeIndex` 6) `unsafeShiftL` 8)
     .|. (fromIntegral (old `B.unsafeIndex` 7))
 
-deserFn :: forall a b. ValT a -> EValT b -> DeserM' (a :-> b)
+deserFn ∷ ∀ a b. ValT a → EValT b → DeserM' (a :-> b)
 deserFn aT (EValT bT) =
   getWord8 >>= \case
     0
       | Dict ← valTypeableProof aT
-      , Dict ← valTypeableProof bT
-      → FunBuiltin <$> deserResB
+      , Dict ← valTypeableProof bT →
+          FunBuiltin <$> deserResB
     1 → case bT of
       (ValTFun cT eT) → FunCurry <$> deserFn (ValTTuple aT cT) eT
       _nonFun → E.empty
@@ -384,25 +387,25 @@ deserFn aT (EValT bT) =
       FunCurry1 xT x <$> deserFn (ValTTuple xT aT) (EValT bT)
 
 -- TODO: Varint
-serInt :: Int -> SerM' ()
+serInt ∷ Int → SerM' ()
 serInt = serWord64 . fromIntegral
 
-deserInt :: DeserM' Int
+deserInt ∷ DeserM' Int
 deserInt = fromIntegral <$> deserWord64
 
-serDelay :: Delay a → SerM' ()
+serDelay ∷ Delay a → SerM' ()
 serDelay = \case
   DelayPin a → putWord8 0 *> serRes a
   DelayLazy x → runReduce (unDelayLazy (Proxy @"") x) >>= serDelay
   DelayCache app _memo → putWord8 1 *> serDelayApp app
 
-deserDelay :: Typeable a ⇒ DeserM' (Delay a)
+deserDelay ∷ (Typeable a) ⇒ DeserM' (Delay a)
 deserDelay =
   getWord8 >>= \case
     0 → DelayPin <$> deserRes
     _1 → DelayCache <$> deserDelayApp <*> sendAI (newIORef Nothing)
 
-serDelayApp :: DelayApp a → SerM' ()
+serDelayApp ∷ DelayApp a → SerM' ()
 serDelayApp = void . ser' 0
  where
   ser' ∷ ∀ b. Word8 → DelayApp b → WriterC (RevList (Obj (Any1 Res))) SerM (EValT b)
@@ -411,11 +414,12 @@ serDelayApp = void . ser' 0
       putWord8 args *> serRes f
       Any1 @_ @c (Val valT _) ← fetch f
       pure $ withUnsafeEq @b @c $ EValT valT
-    DelayApp f a → ser' (args + 1) f >>= \case
-      EValT (ValTFun (ValTContainer ContainerTRes (valTypeableProof → Dict)) bT) →
-        serDelay a $> bT
+    DelayApp f a →
+      ser' (args + 1) f >>= \case
+        EValT (ValTFun (ValTContainer ContainerTRes (valTypeableProof → Dict)) bT) →
+          serDelay a $> bT
 
-deserDelayApp :: forall a. Typeable a ⇒ DeserM' (DelayApp a)
+deserDelayApp ∷ ∀ a. (Typeable a) ⇒ DeserM' (DelayApp a)
 deserDelayApp = do
   args ← getWord8
   valR ← deserRes
@@ -431,66 +435,68 @@ deserDelayApp = do
     deser' (args - 1) (DelayApp d a) bT
   deser' _args _d _nonFun = E.empty
 
-serContainer :: ContainerT c -> c a -> SerM' ()
+serContainer ∷ ContainerT c → c a → SerM' ()
 serContainer c = case c of
   ContainerTRes → serRes
   ContainerTDelay → serDelay
 
-deserContainer :: ContainerT c -> ValT a1 -> ConsumeC (Obj Word64) DeserM (c a1)
-deserContainer c (valTypeableProof -> Dict) = case c of
+deserContainer ∷ ContainerT c → ValT a1 → ConsumeC (Obj Word64) DeserM (c a1)
+deserContainer c (valTypeableProof → Dict) = case c of
   ContainerTRes → deserRes
   ContainerTDelay → deserDelay
 
-serRT :: ContainerT c → RadixTree c k v → SerM' ()
+serRT ∷ ContainerT c → RadixTree c k v → SerM' ()
 serRT cT (RadixTree val chunk) = serContainer cT val *> serContainer cT chunk
 
-deserRT :: ContainerT c -> ValT' s k -> ValT a -> DeserM' (RadixTree c k a)
+deserRT ∷ ContainerT c → ValT' s k → ValT a → DeserM' (RadixTree c k a)
 deserRT cT kT vT = RadixTree <$> deserContainer cT (valTMaybe vT) <*> deserContainer cT (valTReducible $ ValTRadixChunk cT kT vT)
 
-serRC :: ContainerT c → RadixChunk' c k v → SerM' ()
+serRC ∷ ContainerT c → RadixChunk' c k v → SerM' ()
 serRC cT = \case
   Nil → putWord8 0
   Tip chunk rt → putWord8 1 *> serWord32 chunk *> serRT cT rt
   Bin chunk sub1 sub2 → putWord8 2 *> serWord32 chunk *> serContainer cT sub1 *> serContainer cT sub2
 
-deserRC :: ContainerT c → ValT' s k → ValT v → DeserM' (RadixChunk' c k v)
-deserRC cT kT vT = getWord8 >>= \case
-  0 → pure Nil
-  1 → Tip <$> deserWord32 <*> deserRT cT kT vT
-  _2 → Bin <$> deserWord32 <*> deserContainer cT (valTReducible $ ValTRadixChunk cT kT vT) <*> deserContainer cT (valTReducible $ ValTRadixChunk cT kT vT)
+deserRC ∷ ContainerT c → ValT' s k → ValT v → DeserM' (RadixChunk' c k v)
+deserRC cT kT vT =
+  getWord8 >>= \case
+    0 → pure Nil
+    1 → Tip <$> deserWord32 <*> deserRT cT kT vT
+    _2 → Bin <$> deserWord32 <*> deserContainer cT (valTReducible $ ValTRadixChunk cT kT vT) <*> deserContainer cT (valTReducible $ ValTRadixChunk cT kT vT)
 
-serGearTemplate :: ValT cache → GearTemplate ctx out cache cfg → SerM' ()
+serGearTemplate ∷ ValT cache → GearTemplate ctx out cache cfg → SerM' ()
 serGearTemplate cacheT (UnsafeGearTemplate cache cfg fn) = ser cacheT cache *> serFn cfg *> serFn fn
 
-deserGearTemplate :: ValT ctx → EValT out → ValT cache → ValT cfg → DeserM' (GearTemplate ctx out cache cfg)
-deserGearTemplate ctxT (EValT outT) cacheT cfgT = UnsafeGearTemplate
-  <$> deser cacheT
-  <*> deserFn (ValTTuple ctxT $ valTMaybe cfgT) (EValT $ ValTMonad MonadTAppIOC cfgT)
-  <*> deserFn (ValTTuple cfgT cacheT) (EValT $ ValTMonad MonadTAppIOC $ ValTTuple outT $ unser cacheT)
+deserGearTemplate ∷ ValT ctx → EValT out → ValT cache → ValT cfg → DeserM' (GearTemplate ctx out cache cfg)
+deserGearTemplate ctxT (EValT outT) cacheT cfgT =
+  UnsafeGearTemplate
+    <$> deser cacheT
+    <*> deserFn (ValTTuple ctxT $ valTMaybe cfgT) (EValT $ ValTMonad MonadTAppIOC cfgT)
+    <*> deserFn (ValTTuple cfgT cacheT) (EValT $ ValTMonad MonadTAppIOC $ ValTTuple outT $ unser cacheT)
 
-serGearFn :: ValT cache → GearFn ctx out cache -> SerM' ()
+serGearFn ∷ ValT cache → GearFn ctx out cache → SerM' ()
 serGearFn cacheT (GearFn cfgT cfg fn) = serValT cfgT *> ser cfgT cfg *> serGearTemplate cacheT fn
 
-deserGearFn :: ValT ctx → EValT out → ValT cache → DeserM' (GearFn ctx out cache)
+deserGearFn ∷ ValT ctx → EValT out → ValT cache → DeserM' (GearFn ctx out cache)
 deserGearFn ctxT outT cacheT = do
   Any1 cfgT ← deserValT
   GearFn cfgT <$> deser cfgT <*> deserGearTemplate ctxT outT cacheT cfgT
 
-serGear :: Gear ctx out -> SerM' ()
+serGear ∷ Gear ctx out → SerM' ()
 serGear (UnsafeGear cacheT fn cache) = serValT cacheT *> serGearFn cacheT fn *> serInt cache
 
-deserGear :: ValT ctx → EValT out → DeserM' (Gear ctx out)
+deserGear ∷ ValT ctx → EValT out → DeserM' (Gear ctx out)
 deserGear ctxT outT = do
   Any1 cacheT ← deserValT
   UnsafeGear cacheT <$> deserGearFn ctxT outT cacheT <*> deserInt
 
-ser :: ValT a → a → SerM' ()
+ser ∷ ValT a → a → SerM' ()
 ser = \case
   ValTB (ResB _ aT) → ser aT . unB
   ValTWrapped (ResB _ (ValTWrapped' _ _ g)) aT → ser aT . g . unW
   ValTFun _a _b → serFn
   ValTUnit → pure
-  ValTTuple a b → \(a', b') -> ser a a' *> ser b b'
+  ValTTuple a b → \(a', b') → ser a a' *> ser b b'
   ValTEither a b → \case
     Left a' → putWord8 0 *> ser a a'
     Right b' → putWord8 1 *> ser b b'
@@ -504,16 +510,17 @@ ser = \case
   ValTVal → \(Any1 v) → serVal v
   ValTEventId → \(EventId (Timestamp a) (LocalEventId b)) → serWord32 a *> serWord32 b
 
-deser :: ValT a → DeserM' a
+deser ∷ ValT a → DeserM' a
 deser = \case
   ValTB (ResB _ aT) → B <$> deser aT
   ValTWrapped (ResB _ (ValTWrapped' _ f _)) aT → W . f <$> deser aT
   ValTFun aT bT → deserFn aT bT
   ValTUnit → pure ()
   ValTTuple a b → (,) <$> deser a <*> deser b
-  ValTEither a b → getWord8 >>= \case
-    0 → Left <$> deser a
-    _1 → Right <$> deser b
+  ValTEither a b →
+    getWord8 >>= \case
+      0 → Left <$> deser a
+      _1 → Right <$> deser b
   ValTInt → deserInt
   ValTWord32 → deserWord32
   ValTList a → deserInt >>= \l → sequenceA $ replicate l (deser a)
@@ -524,9 +531,10 @@ deser = \case
   ValTVal → deserVal
   ValTEventId → EventId <$> (Timestamp <$> deserWord32) <*> (LocalEventId <$> deserWord32)
 
--- | Force serialization of the object and acquire its identifier.
--- TODO: Remove if possible.
-getInd ∷ forall a. Res a → AppIOC Word64
+{- | Force serialization of the object and acquire its identifier.
+TODO: Remove if possible.
+-}
+getInd ∷ ∀ a. Res a → AppIOC Word64
 getInd = \case
   ResBuiltin (ResB i _) → pure i
   ResAlloc xV → do

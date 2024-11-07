@@ -11,7 +11,7 @@ import Data.Constraint (Dict (..))
 import qualified Dentrado.POC.Data.RadixTree as RT
 import Dentrado.POC.Gear
 import Dentrado.POC.Memory (AppForce (..), AppIO, AppIOC, Container, InferContainerT, InferValT (..), ReduceC, Res, alloc, fetch, sendAI)
-import Dentrado.POC.Types (EventId (..), fromEmpty, W (..))
+import Dentrado.POC.Types (EventId (..), W (..), fromEmpty)
 import RIO hiding (ask, runReader)
 import RIO.List (sortBy)
 import qualified RIO.Map as Map
@@ -35,6 +35,9 @@ newtype StateGraph k v = StateGraph {unStateGraph ∷ RT.Map Res k (RT.SetR Even
 
 class Same a where -- TODO: POC: temporary. A crutch to ensure short-circuiting when update doesn't need to be propagated.
   same ∷ a → a → Bool
+
+instance (Same a) ⇒ Same (W a) where
+  same (W a) (W b) = a `same` b
 
 -- instance Same SiteAccessLevel where
 --   same = (==)

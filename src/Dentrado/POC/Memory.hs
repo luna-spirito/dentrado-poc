@@ -29,7 +29,7 @@ import Data.Kind (Type)
 import Data.Tuple (swap)
 import Data.Type.Equality (type (~))
 import Dentrado.POC.TH (moduleId, sFreshI)
-import Dentrado.POC.Types (Any1 (..), Dynamic1 (..), EventId, LocalEventId, RadixChunk', RadixTree, Reducible (..), Timestamp, fromEmpty, maybeToEmpty, readReducible, W (..))
+import Dentrado.POC.Types (Any1 (..), Dynamic1 (..), EventId, LocalEventId, RadixChunk', RadixTree, Reducible (..), Timestamp, W (..), fromEmpty, maybeToEmpty, readReducible)
 import GHC.Base (Symbol)
 import GHC.Exts (IsList (..))
 import qualified GHC.Generics as G
@@ -151,7 +151,7 @@ funApp' xT f x = case f of
 Dentrado doesn't have any scheme and could store data of any type in any cell.
 Typically the type of the accessed cell is inferred from the context.
 However, this is not always possible, and sometimes we need to store the type of data
-along the data on the disk. 
+along the data on the disk.
 -}
 
 -- | Type of monadic computation.
@@ -162,7 +162,7 @@ data MonadT m where
   MonadTReduceC2 ∷ MonadT m → MonadT (Reduce'C "2" m)
 
 -- | Boilerplate for Haskell to inference the type to store.
-class Typeable m => InferMonadT m where
+class (Typeable m) ⇒ InferMonadT m where
   inferMonadT ∷ MonadT m
 
 instance InferMonadT AppIOC where
@@ -190,7 +190,7 @@ data ContainerT a where
   ContainerTDelay ∷ ContainerT Delay
 
 -- | Container type inference.
-class Typeable a => InferContainerT a where
+class (Typeable a) ⇒ InferContainerT a where
   inferContainerT ∷ ContainerT a
 
 instance InferContainerT Res where
@@ -215,11 +215,12 @@ newtype B a = B {unB ∷ a}
 
 data ValTWrapped' a b = ValTWrapped' !(EValT a → Dict (Typeable b)) !(a → b) !(b → a)
 
--- | ValT is a value that stores serializable type.
--- TODO: another cleanup?
-data ValT' (s :: Bool) a where
-  ValTB :: !(ResB (ValT' s a)) → ValT' s (B a)
-  ValTWrapped :: !(ResB (ValTWrapped' a b)) → !(ValT' s a) → ValT' s (W b) -- TODO: inference, nonserializable?
+{- | ValT is a value that stores serializable type.
+TODO: another cleanup?
+-}
+data ValT' (s ∷ Bool) a where
+  ValTB ∷ !(ResB (ValT' s a)) → ValT' s (B a)
+  ValTWrapped ∷ !(ResB (ValTWrapped' a b)) → !(ValT' s a) → ValT' s (W b) -- TODO: inference, nonserializable?
   ValTFun ∷ !(ValT' True a) → !(EValT b) → ValT' s (a :-> b)
   ValTUnit ∷ ValT' s ()
   ValTTuple ∷ !(ValT' s a) → !(ValT' s b) → ValT' s (a, b)
@@ -232,15 +233,15 @@ data ValT' (s :: Bool) a where
   ValTRadixChunk ∷ !(ContainerT c) → !(ValT' anyS k) → !(ValT' s v) → ValT' s (RadixChunk' c k v)
   ValTGear ∷ !(ValT' s ctx) → !(EValT out) → ValT' s (Gear ctx out)
   ValTVal ∷ ValT' s (Any1 Val)
-  ValTEventId :: ValT' s EventId
+  ValTEventId ∷ ValT' s EventId
   ValTMonad ∷ MonadT m → ValT' s a → ValT' False (M m a)
   ValTSerialized ∷ ValT' False Serialized
 
 type ValT = ValT' True
-data EValT a = forall anyS. EValT !(ValT' anyS a)
+data EValT a = ∀ anyS. EValT !(ValT' anyS a)
 
 -- | ValT' True x is a subtype of ValT' anyS x
-unser :: forall anyS a. ValT' True a → ValT' anyS a
+unser ∷ ∀ anyS a. ValT' True a → ValT' anyS a
 unser x = unsafeCoerce x
 
 {-
@@ -284,26 +285,31 @@ So the approach chosen for now is just to offload recursive types to the languag
 ValTB and ValTWrapped allow additional ValT's to be expresed with Haskell.
 -}
 
-valTReducible :: ValT' s a → ValT' s (W (Reducible a))
+valTReducible ∷ ValT' s a → ValT' s (W (Reducible a))
 valTReducible =
-  ValTWrapped (
-    $sFreshI $ builtin $ ValTWrapped' (\(EValT (valTypeableProof → Dict)) → Dict) mkReducible readReducible
-  )
+  ValTWrapped
+    ( $sFreshI $ builtin $ ValTWrapped' (\(EValT (valTypeableProof → Dict)) → Dict) mkReducible readReducible
+    )
 
-valTMaybe :: ValT' s a → ValT' s (W (Maybe a))
+valTMaybe ∷ ValT' s a → ValT' s (W (Maybe a))
 valTMaybe =
-  ValTWrapped (
-    $sFreshI $ builtin $ ValTWrapped'
-      (\(EValT (ValTEither _ (valTypeableProof → Dict))) → Dict)
-      (either (const Nothing) Just)
-      (maybe (Left ()) Right)
-  ) . ValTEither ValTUnit
+  ValTWrapped
+    ( $sFreshI
+        $ builtin
+        $ ValTWrapped'
+          (\(EValT (ValTEither _ (valTypeableProof → Dict))) → Dict)
+          (either (const Nothing) Just)
+          (maybe (Left ()) Right)
+    )
+    . ValTEither ValTUnit
 
--- | Infer ValT associated with the Haskell type `a`.
--- "Typeable" is not required here.
-class Typeable a => InferValT s a where
+{- | Infer ValT associated with the Haskell type `a`.
+"Typeable" is not required here.
+-}
+class (Typeable a) ⇒ InferValT s a where
   inferValT ∷ ValT' s a
-instance {-# INCOHERENT #-} (InferValT True a, Typeable a) => InferValT False a where
+
+instance {-# INCOHERENT #-} (InferValT True a, Typeable a) ⇒ InferValT False a where
   inferValT = unsafeCoerce @(ValT' True a) @(ValT' False a) $ inferValT @True @a
 instance (InferValT True a, InferValT False b) ⇒ InferValT True (a :-> b) where
   inferValT = ValTFun inferValT (EValT $ inferValT @False)
@@ -331,14 +337,14 @@ instance InferValT s (Any1 Val) where
   inferValT = ValTVal
 instance InferValT s EventId where
   inferValT = ValTEventId
-instance (InferMonadT m, InferValT False a) => InferValT False (M m a) where
+instance (InferMonadT m, InferValT False a) ⇒ InferValT False (M m a) where
   inferValT = ValTMonad inferMonadT (inferValT @False)
 instance InferValT False Serialized where
   inferValT = ValTSerialized
 
-instance InferValT s a => InferValT s (W (Reducible a)) where
+instance (InferValT s a) ⇒ InferValT s (W (Reducible a)) where
   inferValT = valTReducible inferValT
-instance InferValT s a => InferValT s (W (Maybe a)) where
+instance (InferValT s a) ⇒ InferValT s (W (Maybe a)) where
   inferValT = valTMaybe inferValT
 
 -- | Val a = ValT + a
@@ -450,7 +456,7 @@ wrapB = wrap . ResBuiltin
 valTypeableProof ∷ ValT' s x → Dict (Typeable x)
 valTypeableProof = \case
   ValTB (ResB _ (valTypeableProof → Dict)) → Dict
-  ValTWrapped (ResB _ u) aT → u & (\(ValTWrapped' f _ _) -> f $ EValT aT) & \Dict → Dict
+  ValTWrapped (ResB _ u) aT → u & (\(ValTWrapped' f _ _) → f $ EValT aT) & \Dict → Dict
   ValTFun (valTypeableProof → Dict) (EValT (valTypeableProof → Dict)) → Dict
   ValTUnit → Dict
   ValTTuple (valTypeableProof → Dict) (valTypeableProof → Dict) → Dict
@@ -463,7 +469,9 @@ valTypeableProof = \case
   ValTRadixChunk (containerContainerProof → Dict) (valTypeableProof → Dict) (valTypeableProof → Dict) → Dict
   ValTGear (valTypeableProof → Dict) (EValT (valTypeableProof → Dict)) → Dict
   ValTVal → Dict
+  ValTEventId → Dict
   ValTMonad (monadTypeableProof → Dict) (valTypeableProof → Dict) → Dict
+  ValTSerialized → Dict
 
 -- Reduce
 
@@ -647,7 +655,8 @@ delayAppVal proxy = fmap (\(EVal _ x) → x) . delayAppVal'
   delayAppVal' = \case
     DelayAppUnsafeFun f → do
       Any1 @_ @a (Val vT v) ← fetchC' proxy f
-      pure $ withUnsafeEq @a @y $ EVal (EValT vT) v -- $ EVal (EValT vT) v
+      pure $ withUnsafeEq @a @y $ EVal (EValT vT) v
+    -- \$ EVal (EValT vT) v
     DelayApp (f ∷ DelayApp (C Res a :-> y)) a →
       delayAppVal' f >>= \case
         EVal (EValT (ValTFun aT@(valTypeableProof → Dict) bT)) f' →
@@ -750,3 +759,44 @@ data GearFn ctx out cache = ∀ cfg. GearFn !(ValT cfg) !cfg !(GearTemplate ctx 
 data Gear ctx out = ∀ cache. UnsafeGear !(ValT cache) !(GearFn ctx out cache) !Int
 
 newtype Serialized = UnsafeSerialized ByteString
+
+class GStruct (f ∷ k → Type) where
+  type GStructValT f ∷ Type
+
+  gStruct ∷ f x → GStructValT f
+  gUnstruct ∷ GStructValT f → f x
+
+instance (GStruct a, GStruct b) ⇒ GStruct (a G.:+: b) where
+  type GStructValT (a G.:+: b) = Either (GStructValT a) (GStructValT b)
+  gStruct = \case
+    G.L1 a → Left $ gStruct a
+    G.R1 b → Right $ gStruct b
+  gUnstruct = \case
+    Left a → G.L1 $ gUnstruct a
+    Right b → G.R1 $ gUnstruct b
+
+instance (GStruct a, GStruct b) ⇒ GStruct (a G.:*: b) where
+  type GStructValT (a G.:*: b) = (GStructValT a, GStructValT b)
+  gStruct (a G.:*: b) = (gStruct a, gStruct b)
+  gUnstruct (a, b) = gUnstruct a G.:*: gUnstruct b
+
+instance (GStruct a) ⇒ GStruct (G.M1 i c a) where
+  type GStructValT (G.M1 i c a) = GStructValT a
+  gStruct (G.M1 x) = gStruct x
+  gUnstruct = G.M1 . gUnstruct
+
+instance GStruct (G.K1 i a) where
+  type GStructValT (G.K1 i a) = a
+  gStruct (G.K1 a) = a
+  gUnstruct = G.K1
+
+instance GStruct G.U1 where
+  type GStructValT G.U1 = ()
+  gStruct G.U1 = ()
+  gUnstruct _ = G.U1
+
+struct ∷ (Generic a, GStruct (G.Rep a)) ⇒ a → GStructValT (G.Rep a)
+struct = gStruct . G.from
+
+unstruct ∷ (Generic a, GStruct (G.Rep a)) ⇒ GStructValT (G.Rep a) → a
+unstruct = G.to . gUnstruct
