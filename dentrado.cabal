@@ -1,5 +1,5 @@
 cabal-version:   3.0
-name:            dentrado-poc
+name:            dentrado
 version:         0.1.0.0
 license:         AGPL-3.0-or-later
 author:          Gardanta Spirito
@@ -25,8 +25,9 @@ common lang
         TupleSections, DeriveGeneric, PolyKinds, PatternSynonyms, DeriveFunctor, UnicodeSyntax
     build-depends: base >= 4, rio >= 0.1, mtl >= 2.3, fused-effects >= 1.1, hashable >= 1.4,
         free >= 5.2, containers >= 0.6, template-haskell >= 2.19, bytestring, constraints >= 0.14
+    -- TODO: are all those actually needed?
 
-library dentrado-poc-lib
+library
     import: lang
     hs-source-dirs: src
     exposed-modules:
@@ -39,30 +40,30 @@ library dentrado-poc-lib
         Dentrado.POC.StateGraph,
         Dentrado.POC.TH
 
-executable dentrado-poc-exe
-    import: lang
-    hs-source-dirs: src
-    main-is: Main.hs
-    build-depends: dentrado-poc-lib
+-- executable dentrado-exe
+--     import: lang
+--     hs-source-dirs: src
+--     main-is: Main.hs
+--     build-depends: dentrado
 
 test-suite th
     import: lang
     type: exitcode-stdio-1.0
     hs-source-dirs: tests
     main-is: TH.hs
-    build-depends: dentrado-poc-lib, QuickCheck >= 2
+    build-depends: dentrado, QuickCheck >= 2
 
 test-suite radix-tree
     import: lang
     type: exitcode-stdio-1.0
     hs-source-dirs: tests
     main-is: RadixTree.hs
-    build-depends: dentrado-poc-lib, QuickCheck >= 2
+    build-depends: dentrado, QuickCheck >= 2
 
 test-suite model
     import: lang
     type: exitcode-stdio-1.0
-    build-depends: dentrado-poc-lib, QuickCheck >= 2
+    build-depends: dentrado, QuickCheck >= 2
 
     hs-source-dirs: tests
     other-modules: Shared.Util, Shared.Model
@@ -71,7 +72,7 @@ test-suite model
 benchmark model-perf
     import: lang
     type: exitcode-stdio-1.0
-    build-depends: dentrado-poc-lib, model, QuickCheck >= 2
+    build-depends: dentrado, model, QuickCheck >= 2
 
     hs-source-dirs: tests
     other-modules: Shared.Util, Shared.Model
