@@ -43,7 +43,7 @@ instance (Show a) ⇒ Show (Reducible a) where
 
 -- | No-op wrapper. Used to simplify Haskell type inference.
 newtype W a = W {unW ∷ a}
-  deriving newtype (Eq, Ord, Show)
+  deriving newtype (Eq, Ord, Show) deriving Functor
 
 {-
 In Dentrado, the border between memory and disk data is blurred.

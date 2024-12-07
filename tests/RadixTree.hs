@@ -2,13 +2,15 @@
 
 {-# HLINT ignore "Use camelCase" #-}
 
+-- TODO: Fix tests
+
 import Control.Algebra
 import Control.Carrier.NonDet.Church (runNonDetA)
 import Control.Carrier.Reader (runReader)
 import Control.Monad.State (StateT, execStateT, get, put)
 import qualified Data.Map.Merge.Strict as Map
 import qualified Dentrado.POC.Data.RadixTree as RT
-import Dentrado.POC.Memory (AppForce (..), AppIO, AppIOC, Env (..), EnvLoad (..), EnvStore (..), InferValT, ReduceC, Res, Ser, allocC, sNothing, unAppIOC, wrapB)
+import Dentrado.POC.Memory (AppForce (..), AppIO, AppIOC, Env (..), EnvLoad (..), EnvStore (..), InferValT, ReduceC, Res, allocC, sNothing, unAppIOC, wrapB)
 import Dentrado.POC.TH (moduleId, sFreshI)
 import Dentrado.POC.Types (Chunk, RadixTree)
 import qualified Dentrado.POC.Types as RT

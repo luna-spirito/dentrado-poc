@@ -286,6 +286,11 @@ So the approach chosen for now is just to offload recursive types to the languag
 ValTB and ValTWrapped allow additional ValT's to be expresed with Haskell.
 -}
 
+builtinValTWrapped ∷ (Has Fresh sig m, Generic b, GStruct (G.Rep b), Typeable b, InferValT s (GStructValT (G.Rep b))) ⇒ m (ValT' s (W b))
+builtinValTWrapped = do
+  w ← builtin $ ValTWrapped' (\_ → Dict) unstruct struct
+  pure $ ValTWrapped w inferValT
+
 valTReducible ∷ ValT' s a → ValT' s (W (Reducible a))
 valTReducible =
   ValTWrapped
@@ -473,6 +478,7 @@ valTypeableProof = \case
   ValTGear (valTypeableProof → Dict) (EValT (valTypeableProof → Dict)) → Dict
   ValTVal → Dict
   ValTEventId → Dict
+  ValTByteString → Dict
   ValTMonad (monadTypeableProof → Dict) (valTypeableProof → Dict) → Dict
   ValTSerialized → Dict
 

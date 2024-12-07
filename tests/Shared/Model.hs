@@ -3,7 +3,7 @@ module Shared.Model where
 import Data.Constraint (Dict (..))
 import qualified Dentrado.POC.Data.RadixTree as RT
 import Dentrado.POC.Gear (GearTemplate', asmGear, builtinAsmGearTemplate, events')
-import Dentrado.POC.Memory (InferValT, ValT' (..), ValTWrapped' (..), builtin, inferValT, struct, unstruct)
+import Dentrado.POC.Memory (InferValT, ValT' (..), ValTWrapped' (..), builtin, inferValT, struct, unstruct, builtinValTWrapped)
 import Dentrado.POC.StateGraph (Same)
 import qualified Dentrado.POC.StateGraph as SG
 import Dentrado.POC.TH (moduleId, sFreshI)
@@ -22,10 +22,7 @@ instance Same SiteAccessLevel where
   same = (==)
 
 valTSiteAccessLevel ∷ ValT' s (W SiteAccessLevel)
-valTSiteAccessLevel =
-  ValTWrapped
-    ($sFreshI $ builtin $ ValTWrapped' (\_ → Dict) unstruct struct)
-    inferValT -- ValTEither (ValTEither ValTUnit ValTUnit) (ValTEither ValTUnit ValTUnit)
+valTSiteAccessLevel = $sFreshI $ builtinValTWrapped
 
 instance InferValT s (W SiteAccessLevel) where
   inferValT = valTSiteAccessLevel

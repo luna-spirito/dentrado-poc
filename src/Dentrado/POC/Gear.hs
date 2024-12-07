@@ -9,9 +9,9 @@ import Data.Constraint (Dict (..))
 import Data.Dynamic (Dynamic (..), fromDynamic)
 import qualified Data.IntMap.Strict as IMap
 import qualified Dentrado.POC.Data.RadixTree as RT
-import Dentrado.POC.Memory (AppForce (..), AppIOC, Container, EValT (..), Env (..), Gear (..), GearFn (..), GearTemplate (..), InferContainerT, InferValT (..), M (..), Res, RevList (..), ValT (..), ValT' (..), builtinFunM, funApp', sendAI, tryFromVal, tryLazy, valTMaybe, valTypeableProof)
+import Dentrado.POC.Memory (AppIOC, EValT (..), Env (..), Gear (..), GearFn (..), GearTemplate (..), InferValT (..), M (..), Res, RevList (..), ValT, ValT' (..), builtinFunM, funApp', sendAI, tryFromVal, tryLazy, valTMaybe, valTypeableProof)
 import Dentrado.POC.Ser (serGearFn, unstableSerialized)
-import Dentrado.POC.TH (moduleId, sFreshI)
+import Dentrado.POC.TH (moduleId)
 import Dentrado.POC.Types (EventId (..), W (..))
 import RIO hiding (asks, runReader, toList)
 import qualified RIO.Partial as P
