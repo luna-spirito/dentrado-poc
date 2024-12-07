@@ -234,6 +234,7 @@ data ValT' (s ∷ Bool) a where
   ValTGear ∷ !(ValT' s ctx) → !(EValT out) → ValT' s (Gear ctx out)
   ValTVal ∷ ValT' s (Any1 Val)
   ValTEventId ∷ ValT' s EventId
+  ValTByteString :: ValT' s ByteString
   ValTMonad ∷ MonadT m → ValT' s a → ValT' False (M m a)
   ValTSerialized ∷ ValT' False Serialized
 
@@ -337,6 +338,8 @@ instance InferValT s (Any1 Val) where
   inferValT = ValTVal
 instance InferValT s EventId where
   inferValT = ValTEventId
+instance InferValT s ByteString where
+  inferValT = ValTByteString
 instance (InferMonadT m, InferValT False a) ⇒ InferValT False (M m a) where
   inferValT = ValTMonad inferMonadT (inferValT @False)
 instance InferValT False Serialized where

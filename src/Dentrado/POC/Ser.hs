@@ -125,6 +125,7 @@ serValT = \case
   ValTB x → putWord8 12 *> serResB x
   ValTWrapped x n → putWord8 13 *> serResB x *> serValT n
   ValTEventId → putWord8 14
+  ValTByteString → putWord8 15
   ValTMonad mT vT → putWord8 150 *> serMonadT mT *> serValT vT
   ValTSerialized → putWord8 151
 
@@ -343,6 +344,8 @@ serFn = \case
 serWord32 ∷ Word32 → SerM' ()
 serWord32 = tell . B.word32BE
 
+-- TODO: unsafeTake/unsafeDrop?
+
 deserWord32 ∷ DeserM' Word32
 deserWord32 = do
   old ← get
@@ -363,7 +366,7 @@ deserWord64 = do
   old ← get
   E.guard (B.length old >= 8)
   put $ B.drop 8 old
-  return $! (fromIntegral (old `B.unsafeIndex` 0) `unsafeShiftL` 56)
+  pure $! (fromIntegral (old `B.unsafeIndex` 0) `unsafeShiftL` 56)
     .|. (fromIntegral (old `B.unsafeIndex` 1) `unsafeShiftL` 48)
     .|. (fromIntegral (old `B.unsafeIndex` 2) `unsafeShiftL` 40)
     .|. (fromIntegral (old `B.unsafeIndex` 3) `unsafeShiftL` 32)
@@ -371,6 +374,24 @@ deserWord64 = do
     .|. (fromIntegral (old `B.unsafeIndex` 5) `unsafeShiftL` 16)
     .|. (fromIntegral (old `B.unsafeIndex` 6) `unsafeShiftL` 8)
     .|. (fromIntegral (old `B.unsafeIndex` 7))
+
+-- TODO: Varint
+serInt ∷ Int → SerM' ()
+serInt = serWord64 . fromIntegral
+
+deserInt ∷ DeserM' Int
+deserInt = fromIntegral <$> deserWord64
+
+serByteString :: ByteString → SerM' ()
+serByteString x = serInt (B.length x) *> tell (B.byteString x)
+
+deserByteString :: DeserM' ByteString
+deserByteString = do
+  len ← deserInt
+  old ← get
+  E.guard (B.length old >= len)
+  put $ B.drop len old
+  pure $ B.copy $ B.take len old
 
 deserFn ∷ ∀ a b. ValT a → EValT b → DeserM' (a :-> b)
 deserFn aT (EValT bT) =
@@ -385,13 +406,6 @@ deserFn aT (EValT bT) =
     _2 → do
       Any1 (Val xT x) ← deserVal
       FunCurry1 xT x <$> deserFn (ValTTuple xT aT) (EValT bT)
-
--- TODO: Varint
-serInt ∷ Int → SerM' ()
-serInt = serWord64 . fromIntegral
-
-deserInt ∷ DeserM' Int
-deserInt = fromIntegral <$> deserWord64
 
 serDelay ∷ Delay a → SerM' ()
 serDelay = \case
@@ -509,6 +523,7 @@ ser = \case
   ValTGear _ _ → serGear
   ValTVal → \(Any1 v) → serVal v
   ValTEventId → \(EventId (Timestamp a) (LocalEventId b)) → serWord32 a *> serWord32 b
+  ValTByteString → serByteString
 
 deser ∷ ValT a → DeserM' a
 deser = \case
@@ -530,6 +545,7 @@ deser = \case
   ValTGear ctxT outT → deserGear ctxT outT
   ValTVal → deserVal
   ValTEventId → EventId <$> (Timestamp <$> deserWord32) <*> (LocalEventId <$> deserWord32)
+  ValTByteString → deserByteString
 
 {- | Force serialization of the object and acquire its identifier.
 TODO: Remove if possible.
