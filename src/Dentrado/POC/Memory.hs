@@ -234,7 +234,7 @@ data ValT' (s ∷ Bool) a where
   ValTGear ∷ !(ValT' s ctx) → !(EValT out) → ValT' s (Gear ctx out)
   ValTVal ∷ ValT' s (Any1 Val)
   ValTEventId ∷ ValT' s EventId
-  ValTByteString :: ValT' s ByteString
+  ValTByteString ∷ ValT' s ByteString -- WARNING: Should not contain \0 since \0 is used internally by Dentrado.
   ValTMonad ∷ MonadT m → ValT' s a → ValT' False (M m a)
   ValTSerialized ∷ ValT' False Serialized
 
@@ -761,7 +761,8 @@ data GearFn ctx out cache = ∀ cfg. GearFn !(ValT cfg) !cfg !(GearTemplate ctx 
 -- | Gear, a GearFn paired with a reference to the `cache` storage.
 data Gear ctx out = ∀ cache. UnsafeGear !(ValT cache) !(GearFn ctx out cache) !Int
 
-newtype Serialized = UnsafeSerialized ByteString
+newtype PaddedByteString = UnsafePaddedByteString ByteString
+newtype Serialized = UnsafeSerialized PaddedByteString
 
 class GStruct (f ∷ k → Type) where
   type GStructValT f ∷ Type

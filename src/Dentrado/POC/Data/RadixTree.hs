@@ -22,7 +22,8 @@ import Data.Constraint (Dict (..))
 import Data.Foldable (foldrM)
 import Data.Kind (Type)
 import Data.Monoid (First (..))
-import Dentrado.POC.Memory (AppDelay (..), AppForce (..), AppIO, AppIOC, C (..), Container (..), Delay (..), DelayApp (..), EValT (..), InferContainerT, InferValT (..), Reduce, Reduce' (..), Reduce'C (..), ReduceC, Res (..), ResB (..), RevList, Serialized (..), ValT' (..), ValTWrapped' (..), alloc, allocC, builtin, builtinFunM, delayAppBuiltinFun, fetch, fetchC, mkDelayCache, mkDelayLazy, mkReducible, reduce', reducible, reducible', revSnoc, runReduce, runReduce', sNothing, tryFetchC, unwrap, valTypeableProof, wrapB, (:->) (..))
+import Dentrado.POC.Memory (AppDelay (..), AppForce (..), AppIO, AppIOC, C (..), Container (..), Delay (..), DelayApp (..), EValT (..), InferContainerT, InferValT (..), PaddedByteString (..), Reduce, Reduce' (..), Reduce'C (..), ReduceC, Res (..), ResB (..), RevList, Serialized (..), ValT' (..), ValTWrapped' (..), alloc, allocC, builtin, builtinFunM, delayAppBuiltinFun, fetch, fetchC, mkDelayCache, mkDelayLazy, mkReducible, reduce', reducible, reducible', revSnoc, runReduce, runReduce', sNothing, tryFetchC, unwrap, valTypeableProof, wrapB, (:->) (..))
+import Dentrado.POC.Ser (pad, unpad)
 import Dentrado.POC.TH (moduleId, sFreshI)
 import Dentrado.POC.Types (Chunk, EventId (EventId), LocalEventId (..), RadixChunk, RadixChunk' (..), RadixTree (..), Timestamp (..), W (..), maybeToEmpty, readReducible)
 import GHC.Exts (IsList (..))
@@ -61,22 +62,31 @@ instance IsRadixKey Chunk where
     [x] → x
     _ → error "key corrupted"
 
+paddedToChunks ∷ PaddedByteString → [Chunk]
+paddedToChunks (UnsafePaddedByteString (B.null → True)) = []
+paddedToChunks (UnsafePaddedByteString b) =
+  let x =
+        (fromIntegral @_ @Word32 (b `B.unsafeIndex` 0) `unsafeShiftL` 24)
+          .|. (fromIntegral @_ @Word32 (b `B.unsafeIndex` 1) `unsafeShiftL` 16)
+          .|. (fromIntegral @_ @Word32 (b `B.unsafeIndex` 2) `unsafeShiftL` 8)
+          .|. fromIntegral @_ @Word32 (b `B.unsafeIndex` 3)
+   in x : paddedToChunks (UnsafePaddedByteString $ B.unsafeDrop 4 b)
+
+paddedFromChunks ∷ [Chunk] → PaddedByteString
+paddedFromChunks =
+  UnsafePaddedByteString . toStrictBytes . B.toLazyByteString . mconcat . fmap B.word32BE
+
+-- Pads and unpads with \0
+instance IsRadixKey ByteString where
+  toRadixKey = paddedToChunks . pad
+  fromRadixKey = unpad . paddedFromChunks
+
 -- TODO: UNSAFE
 -- Deal with it when implementing deduplication
 -- instance IsRadixKey ByteString where
 instance IsRadixKey Serialized where
-  toRadixKey = \(UnsafeSerialized x) → f x
-   where
-    f (B.null → True) = []
-    f b =
-      let x =
-            (fromIntegral @_ @Word32 (b `B.unsafeIndex` 0) `unsafeShiftL` 24)
-              .|. (fromIntegral @_ @Word32 (b `B.unsafeIndex` 1) `unsafeShiftL` 16)
-              .|. (fromIntegral @_ @Word32 (b `B.unsafeIndex` 2) `unsafeShiftL` 8)
-              .|. fromIntegral @_ @Word32 (b `B.unsafeIndex` 3)
-       in x : f (B.drop 4 b)
-  fromRadixKey =
-    UnsafeSerialized . toStrictBytes . B.toLazyByteString . mconcat . fmap B.word32BE
+  toRadixKey = \(UnsafeSerialized x) → paddedToChunks x
+  fromRadixKey = UnsafeSerialized . paddedFromChunks
 
 instance IsRadixKey EventId where
   toRadixKey (EventId (Timestamp a) (LocalEventId b)) = [a, b]

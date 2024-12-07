@@ -330,4 +330,3 @@ toListsFull (StateGraph perKeyRT) = do
     a ← RT.toListM perTimeRT1
     b ← RT.toListM perTimeRT2
     pure (k, sortBy (\(a', _) (b', _) → compare b' a') (fmap Left <$> a) <> (fmap Right <$> b))
-

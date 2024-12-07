@@ -17,7 +17,7 @@ import Data.Functor.Compose (Compose (..))
 import qualified Data.IntMap as IMap
 import Data.Kind (Type)
 import Data.Tuple (swap)
-import Dentrado.POC.Memory (AppIOC, B (..), C (..), ContainerT (..), Delay (..), DelayApp (..), EValT (..), Env (..), EnvStore (..), Gear (..), GearFn (..), GearTemplate (..), MonadT (..), Res (..), ResA (..), ResB (..), RevList (..), Serialized (..), Val (..), ValT, ValT' (..), ValTWrapped' (..), fetch, runReduce, sendAI, tryLazy, unDelayLazy, unser, valTMaybe, valTReducible, valTypeableProof, withUnsafeEq, (:->) (..))
+import Dentrado.POC.Memory (AppIOC, B (..), C (..), ContainerT (..), Delay (..), DelayApp (..), EValT (..), Env (..), EnvStore (..), Gear (..), GearFn (..), GearTemplate (..), MonadT (..), PaddedByteString (..), Res (..), ResA (..), ResB (..), RevList (..), Serialized (..), Val (..), ValT, ValT' (..), ValTWrapped' (..), fetch, runReduce, sendAI, tryLazy, unDelayLazy, unser, valTMaybe, valTReducible, valTypeableProof, withUnsafeEq, (:->) (..))
 import Dentrado.POC.TH (moduleId)
 import Dentrado.POC.Types (Any1 (..), Dynamic1 (..), EventId (..), LocalEventId (..), RadixChunk' (..), RadixTree (..), Timestamp (..), W (..), maybeToEmpty)
 import RIO hiding (asks)
@@ -382,10 +382,10 @@ serInt = serWord64 . fromIntegral
 deserInt ∷ DeserM' Int
 deserInt = fromIntegral <$> deserWord64
 
-serByteString :: ByteString → SerM' ()
+serByteString ∷ ByteString → SerM' ()
 serByteString x = serInt (B.length x) *> tell (B.byteString x)
 
-deserByteString :: DeserM' ByteString
+deserByteString ∷ DeserM' ByteString
 deserByteString = do
   len ← deserInt
   old ← get
@@ -562,6 +562,18 @@ getInd = \case
         i ← liftIO $ store t o
         pure (ResLoaded i o, i)
 
+pad ∷ ByteString → PaddedByteString
+pad unpadded =
+  UnsafePaddedByteString
+    $ let finalSegSize = B.length unpadded `mod` 4
+       in unpadded
+            <> if finalSegSize == 0 -- yes, I hate myself
+              then mempty
+              else B.pack $ replicate (4 - finalSegSize) (0 ∷ Word8)
+
+unpad ∷ PaddedByteString → ByteString
+unpad (UnsafePaddedByteString x) = B.dropWhileEnd (== 0) x
+
 -- "unstable" in a sense that serializing an object twice
 -- does not necessarily yield the same result.
 -- TODO: dedup, this doesn't work with dedup, at all.
@@ -570,13 +582,5 @@ unstableSerialized act = do
   (val, UnsafeRevList refs) ← runWriter (\a b → pure (a, b)) $ runWriter (\a _ → pure a) act
   refsI ← for refs \(ObjRes (Any1 r)) → getInd r
   pure
-    $ let
-        unpadded = toStrictBytes $ B.toLazyByteString $ val <> mconcat (B.word64BE <$> refsI)
-        padded =
-          let finalSegSize = B.length unpadded `mod` 4
-           in unpadded
-                <> if finalSegSize == 0 -- yes, I hate myself
-                  then mempty
-                  else B.pack $ replicate (4 - finalSegSize) (0 ∷ Word8)
-       in
-        UnsafeSerialized padded
+    $ let unpadded = toStrictBytes $ B.toLazyByteString $ val <> mconcat (B.word64BE <$> refsI)
+       in UnsafeSerialized $ pad unpadded
