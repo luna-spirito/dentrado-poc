@@ -29,7 +29,7 @@ import Data.Kind (Type)
 import Data.Tuple (swap)
 import Data.Type.Equality (type (~))
 import Dentrado.POC.TH (moduleId, sFreshI)
-import Dentrado.POC.Types (Any1 (..), Dynamic1 (..), EventId, LocalEventId, RadixChunk', RadixTree, Reducible (..), Timestamp, W (..), fromEmpty, maybeToEmpty, readReducible)
+import Dentrado.POC.Types (Any1 (..), EventId, LocalEventId, RadixChunk', RadixTree, Reducible (..), Timestamp, W (..), W1 (..), fromEmpty, maybeToEmpty, readReducible)
 import GHC.Base (Symbol)
 import GHC.Exts (IsList (..))
 import qualified GHC.Generics as G
@@ -104,14 +104,21 @@ data ResB a = ResB !Word64 {- no bang -} a
 ResA might not contain the resource, and instead hold the reference to it on the disk.
 -}
 data ResA a
-  = ResNew !(ValT a) !a -- Ser to serialize, since serialization is a background job
+  = ResNew !(Val a) -- Ser to serialize, since serialization is a background job
   | ResUnloaded !Word64
   | ResLoaded !Word64 !a
 
--- | Res = ResB + ResA
-data Res a
+data ResACell = ∀ a. ResACell !(ValT a) !(MVar (ResA a)) -- mutually exclusive with ResNew
+
+-- | Res' = ResB | ResA
+data Res' a
   = ResBuiltin !(ResB a)
   | ResAlloc !(MVar (ResA a))
+
+-- | Res = Res' | inline
+data Res a
+  = ResI !a
+  | ResNoI !(Res' a)
 
 -- Values and functions
 
@@ -133,10 +140,10 @@ funApp ∷ (InferValT True a) ⇒ a :-> b → a → b
 funApp = funApp' inferValT
 
 -- | Turn constant function into :->
-builtinFun ∷ (Has Fresh sig m) ⇒ (a → b) → m (a :-> b)
+builtinFun ∷ (Has Fresh sig m, Typeable a, Typeable b) ⇒ (a → b) → m (a :-> b)
 builtinFun f = FunBuiltin <$> builtin f
 
-builtinFunM ∷ (Has Fresh sig m) ⇒ (a → f b) → m (a :-> M f b)
+builtinFunM ∷ ∀ m a (f ∷ Type → Type) b sig. (Has Fresh sig m, Typeable a, Typeable b, Typeable f) ⇒ (a → f b) → m (a :-> M f b)
 builtinFunM f = builtinFun (M . f)
 
 funApp' ∷ ValT a → (a :-> b) → a → b
@@ -162,7 +169,7 @@ data MonadT m where
   MonadTReduceC2 ∷ MonadT m → MonadT (Reduce'C "2" m)
 
 -- | Boilerplate for Haskell to inference the type to store.
-class (Typeable m) ⇒ InferMonadT m where
+class InferMonadT m where
   inferMonadT ∷ MonadT m
 
 instance InferMonadT AppIOC where
@@ -213,14 +220,18 @@ newtype C c a = C {unC ∷ c a}
 -- | No-op wrapper. Used to simplify Haskell type inference.
 newtype B a = B {unB ∷ a}
 
-data ValTWrapped' a b = ValTWrapped' !(EValT a → Dict (Typeable b)) !(a → b) !(b → a)
+data ValTWrapped' s over = ∀ under. ValTWrapped' {- no bang -} (Dict (Typeable over)) !(ValT' s under) !(over → under) !(under → over)
+data ValTWrapped1' f = ValTWrapped1' !(Dict (Typeable f)) !(∀ s over. ValT' s over → ValTWrapped' s (f over))
 
 {- | ValT is a value that stores serializable type.
 TODO: another cleanup?
 -}
 data ValT' (s ∷ Bool) a where
-  ValTB ∷ !(ResB (ValT' s a)) → ValT' s (B a)
-  ValTWrapped ∷ !(ResB (ValTWrapped' a b)) → !(ValT' s a) → ValT' s (W b) -- TODO: inference, nonserializable?
+  -- ValTB ∷ !(ResB (ValT' s a)) → ValT' s (B a)
+  ValTWrapped ∷ !(ResB (ValTWrapped' s a)) → ValT' s (W a)
+  ValTWrapped1 ∷ !(ResB (ValTWrapped1' f)) → ValT' s a → ValT' s (W1 f a)
+  -- ValTWrapped ∷ !(ResB (ValTWrapped' a b)) → !(ValT' s a) → ValT' s (W b) -- TODO: inference, nonserializable?
+  -- ValTWrapped1 :: !(ResB (ValTWrapped1' f)) → !(ValT' s a) → ValT' s (W1 f a)
   ValTFun ∷ !(ValT' True a) → !(EValT b) → ValT' s (a :-> b)
   ValTUnit ∷ ValT' s ()
   ValTTuple ∷ !(ValT' s a) → !(ValT' s b) → ValT' s (a, b)
@@ -286,33 +297,39 @@ So the approach chosen for now is just to offload recursive types to the languag
 ValTB and ValTWrapped allow additional ValT's to be expresed with Haskell.
 -}
 
-builtinValTWrapped ∷ (Has Fresh sig m, Generic b, GStruct (G.Rep b), Typeable b, InferValT s (GStructValT (G.Rep b))) ⇒ m (ValT' s (W b))
+-- TODO: ValTB!!!
+-- builtinValTWrapped ∷ (Has Fresh sig m, Generic b, GStruct (G.Rep b), Typeable b, Typeable (GStructValT (G.Rep b)), InferValT s (GStructValT (G.Rep b))) ⇒ m (ValT' s (W b))
+-- cbuiltinValTWrapped :: Has Fresh sig m => m (ValT' s (W (GStructValT (G.Rep ghc-prim-0.11.0:GHC.Types.Any))))
+builtinValTWrapped ∷ (Has Fresh sig m, InferValT s (GStructValT (G.Rep a)), Typeable a, Typeable s, Generic a, GStruct (G.Rep a)) ⇒ m (ValT' s (W a))
 builtinValTWrapped = do
-  w ← builtin $ ValTWrapped' (\_ → Dict) unstruct struct
-  pure $ ValTWrapped w inferValT
+  w ← builtin $ ValTWrapped' Dict inferValT {-(\_ → Dict)-} struct unstruct
+  pure $ ValTWrapped w
 
-valTReducible ∷ ValT' s a → ValT' s (W (Reducible a))
+valTReducible ∷ ValT' s a → ValT' s (W1 Reducible a)
 valTReducible =
-  ValTWrapped
-    ( $sFreshI $ builtin $ ValTWrapped' (\(EValT (valTypeableProof → Dict)) → Dict) mkReducible readReducible
+  ValTWrapped1
+    ( $sFreshI $ builtin $ ValTWrapped1' Dict \a@(valTypeableProof → Dict) →
+        ValTWrapped' Dict a readReducible mkReducible -- {-(\(EValT (valTypeableProof → Dict)) → Dict)-} mkReducible readReducible)
     )
 
-valTMaybe ∷ ValT' s a → ValT' s (W (Maybe a))
+-- TODO: ValTB!!!
+valTMaybe ∷ ValT' s a → ValT' s (W1 Maybe a)
 valTMaybe =
-  ValTWrapped
+  ValTWrapped1
     ( $sFreshI
         $ builtin
-        $ ValTWrapped'
-          (\(EValT (ValTEither _ (valTypeableProof → Dict))) → Dict)
-          (either (const Nothing) Just)
-          (maybe (Left ()) Right)
+        $ ValTWrapped1' Dict \a@(valTypeableProof → Dict) →
+          ValTWrapped'
+            Dict
+            (ValTEither ValTUnit a)
+            (maybe (Left ()) (Right))
+            (either (const Nothing) Just)
     )
-    . ValTEither ValTUnit
 
 {- | Infer ValT associated with the Haskell type `a`.
 "Typeable" is not required here.
 -}
-class (Typeable a) ⇒ InferValT s a where
+class InferValT s a where
   inferValT ∷ ValT' s a
 
 instance {-# INCOHERENT #-} (InferValT True a, Typeable a) ⇒ InferValT False a where
@@ -350,9 +367,9 @@ instance (InferMonadT m, InferValT False a) ⇒ InferValT False (M m a) where
 instance InferValT False Serialized where
   inferValT = ValTSerialized
 
-instance (InferValT s a) ⇒ InferValT s (W (Reducible a)) where
+instance (InferValT s a) ⇒ InferValT s (W1 Reducible a) where
   inferValT = valTReducible inferValT
-instance (InferValT s a) ⇒ InferValT s (W (Maybe a)) where
+instance (InferValT s a) ⇒ InferValT s (W1 Maybe a) where
   inferValT = valTMaybe inferValT
 
 -- | Val a = ValT + a
@@ -370,7 +387,7 @@ asVal = Val inferValT
 newtype EnvLoad = EnvLoad (∀ a. ValT a → Word64 → IO a)
 
 -- | Computation provided by the external system to store elements to the disk.
-newtype EnvStore = EnvStore (∀ a. ValT a → a → IO Word64)
+newtype EnvStore = EnvStore (∀ a. Val a → IO Word64)
 
 -- Note: currently both methods are not implemented and just throw an exception.
 
@@ -381,7 +398,7 @@ data Env = Env
   { envFreshInd ∷ !(IORef Int) -- TODO: POC: This field currently store the next fresh identifier for allocated resource.
   -- In the actual implementation, it should be provided by the external system (EnvStore).
   , envBuiltins ∷ !(IntMap Dynamic) -- Dictionary of builtin operations. Allows to deserialize ResB.
-  , envKnown ∷ !(MVar (IntMap (Weak (Dynamic1 Res)))) -- Known resources. Might not even be actually loaded.
+  , envKnown ∷ !(MVar (IntMap (Weak ResACell))) -- Known resources. Might not even be actually loaded.
   -- This is a centralized storage that ensures that, if some object is loaded by independent systems,
   -- only one copy is actually stored. Is it also possibly? used to keep track of in-memory resources
   -- and to save them to disk in background.
@@ -422,7 +439,7 @@ sendAI = sendM
 
 -- | Perform "allocation", turning `a` into `Res a`.
 alloc ∷ (Has AppIO sig m, InferValT True a) ⇒ a → m (Res a)
-alloc v = ResAlloc <$> sendAI (newMVar $ ResNew inferValT v)
+alloc v = ResNoI . ResAlloc <$> sendAI (newMVar $ ResNew $ asVal v)
 {-# INLINE alloc #-}
 
 {- | Perform fetch by loading the value `a` from `Res a`.
@@ -430,11 +447,12 @@ This operation potentially causes disk access! (envLoad)
 -}
 fetch ∷ ∀ sig m a. (Has AppIO sig m, InferValT True a) ⇒ Res a → m a
 fetch = \case
-  ResBuiltin (ResB _ v) → pure v
-  ResAlloc ref → do
+  ResI v → pure v
+  ResNoI (ResBuiltin (ResB _ v)) → pure v
+  ResNoI (ResAlloc ref) → do
     EnvLoad load ← asks envLoad
     sendAI $ tryLazy ref $ pure . \case
-      ResNew _ v → Left v
+      ResNew (Val _ v) → Left v
       ResLoaded _ v → Left v
       ResUnloaded k → Right do
         v ← liftIO $ load inferValT k
@@ -444,13 +462,14 @@ fetch = \case
 -- | Attempt to fetch the value without accessing the disk.
 tryFetch ∷ Res a → Maybe a
 tryFetch = \case
-  ResBuiltin (ResB _ v) → Just v
-  ResAlloc ref → case unsafePerformIO $ readMVar ref of
-    ResNew _ v → Just v
+  ResI v → Just v
+  ResNoI (ResBuiltin (ResB _ v)) → Just v
+  ResNoI (ResAlloc ref) → case unsafePerformIO $ readMVar ref of
+    ResNew (Val _ v) → Just v
     ResUnloaded _ → Nothing
     ResLoaded _ v → Just v
 
-builtin ∷ (Has Fresh sig m) ⇒ a → m (ResB a)
+builtin ∷ (Has Fresh sig m, Typeable a) ⇒ a → m (ResB a)
 builtin v = do
   i ← fromIntegral <$> fresh
   pure
@@ -459,12 +478,13 @@ builtin v = do
       (ResB i v)
 
 wrapB ∷ (Container c) ⇒ ResB a → c a
-wrapB = wrap . ResBuiltin
+wrapB = wrap . ResNoI . ResBuiltin
 
 valTypeableProof ∷ ValT' s x → Dict (Typeable x)
 valTypeableProof = \case
-  ValTB (ResB _ (valTypeableProof → Dict)) → Dict
-  ValTWrapped (ResB _ u) aT → u & (\(ValTWrapped' f _ _) → f $ EValT aT) & \Dict → Dict
+  ValTWrapped (ResB _ (ValTWrapped' Dict _ _ _)) → Dict
+  ValTWrapped1 (ResB _ (ValTWrapped1' Dict f)) oT@(valTypeableProof → Dict) → case f oT of
+    ValTWrapped' Dict _ _ _ → Dict
   ValTFun (valTypeableProof → Dict) (EValT (valTypeableProof → Dict)) → Dict
   ValTUnit → Dict
   ValTTuple (valTypeableProof → Dict) (valTypeableProof → Dict) → Dict
@@ -481,6 +501,79 @@ valTypeableProof = \case
   ValTByteString → Dict
   ValTMonad (monadTypeableProof → Dict) (valTypeableProof → Dict) → Dict
   ValTSerialized → Dict
+
+eqContainerT ∷ ContainerT c1 → ContainerT c2 → Maybe (Dict (c1 ~ c2))
+eqContainerT = curry \case
+  (ContainerTDelay, ContainerTDelay) → Just Dict
+  (ContainerTDelay, _) → Nothing
+  (ContainerTRes, ContainerTRes) → Just Dict
+  (ContainerTRes, _) → Nothing
+
+eqMonadT ∷ MonadT m1 → MonadT m2 → Maybe (Dict (m1 ~ m2))
+eqMonadT = curry \case
+  (MonadTAppIOC, MonadTAppIOC) → Just Dict
+  (MonadTAppIOC, _) → Nothing
+  (MonadTReduceC a, MonadTReduceC b) → (\Dict → Dict) <$> eqMonadT a b
+  (MonadTReduceC _, _) → Nothing
+  (MonadTReduceC1 a, MonadTReduceC1 b) → (\Dict → Dict) <$> eqMonadT a b
+  (MonadTReduceC1 _, _) → Nothing
+  (MonadTReduceC2 a, MonadTReduceC2 b) → (\Dict → Dict) <$> eqMonadT a b
+  (MonadTReduceC2 _, _) → Nothing
+
+eqValT ∷ ValT' s1 a → ValT' s2 b → Maybe (Dict (a ~ b))
+eqValT = curry \case
+  (ValTWrapped w1, ValTWrapped w2) → (\Dict → Dict) <$> (ResNoI (ResBuiltin w1) `same` ResNoI (ResBuiltin w2))
+  -- I think it's better to let this fail if quick comparison doesn't work.
+  (ValTWrapped _, _) → Nothing
+  (ValTWrapped1 w1 a, ValTWrapped1 w2 b) → (\Dict Dict → Dict) <$> (ResNoI (ResBuiltin w1)) `same` (ResNoI (ResBuiltin w2)) <*> eqValT a b
+  -- Again, fail if not quick comparison
+  (ValTWrapped1 _ _, _) → Nothing
+  (ValTFun a1 (EValT b1), ValTFun a2 (EValT b2)) → do
+    Dict ← eqValT a1 a2
+    Dict ← eqValT b1 b2
+    pure Dict
+  (ValTFun _ _, _) → Nothing
+  (ValTUnit, ValTUnit) → Just Dict
+  (ValTUnit, _) → Nothing
+  (ValTTuple a1 b1, ValTTuple a2 b2) → (\Dict Dict → Dict) <$> eqValT a1 a2 <*> eqValT b1 b2
+  (ValTTuple _ _, _) → Nothing
+  (ValTEither a1 b1, ValTEither a2 b2) → (\Dict Dict → Dict) <$> eqValT a1 a2 <*> eqValT b1 b2
+  (ValTEither _ _, _) → Nothing
+  (ValTInt, ValTInt) → Just Dict
+  (ValTInt, _) → Nothing
+  (ValTWord32, ValTWord32) → Just Dict
+  (ValTWord32, _) → Nothing
+  (ValTList a, ValTList b) → (\Dict → Dict) <$> eqValT a b
+  (ValTList _, _) → Nothing
+  (ValTContainer c1 a1, ValTContainer c2 a2) → (\Dict Dict → Dict) <$> eqContainerT c1 c2 <*> eqValT a1 a2
+  (ValTContainer _ _, _) → Nothing
+  (ValTRadixTree c1 k1 v1, ValTRadixTree c2 k2 v2) → do
+    Dict ← eqContainerT c1 c2
+    Dict ← eqValT k1 k2
+    Dict ← eqValT v1 v2
+    pure Dict
+  (ValTRadixTree _ _ _, _) → Nothing
+  (ValTRadixChunk c1 k1 v1, ValTRadixChunk c2 k2 v2) → do
+    Dict ← eqContainerT c1 c2
+    Dict ← eqValT k1 k2
+    Dict ← eqValT v1 v2
+    pure Dict
+  (ValTRadixChunk _ _ _, _) → Nothing
+  (ValTGear ctx1 (EValT v1), ValTGear ctx2 (EValT v2)) → do
+    Dict ← eqValT ctx1 ctx2
+    Dict ← eqValT v1 v2
+    pure Dict
+  (ValTGear _ _, _) → Nothing
+  (ValTVal, ValTVal) → Just Dict
+  (ValTVal, _) → Nothing
+  (ValTEventId, ValTEventId) → Just Dict
+  (ValTEventId, _) → Nothing
+  (ValTByteString, ValTByteString) → Just Dict
+  (ValTByteString, _) → Nothing
+  (ValTMonad m1 a, ValTMonad m2 b) → (\Dict Dict → Dict) <$> eqMonadT m1 m2 <*> eqValT a b
+  (ValTMonad _ _, _) → Nothing
+  (ValTSerialized, ValTSerialized) → Just Dict
+  (ValTSerialized, _) → Nothing
 
 -- Reduce
 
@@ -551,9 +644,8 @@ reducible = reducible' (Proxy @"")
 {-# INLINE reducible #-}
 
 -- | Attempt to extract a value of type `a` from `Val` over statically unknown type.
-tryFromVal ∷ ∀ a. (Typeable a) ⇒ Any1 Val → Maybe a
-tryFromVal (Any1 (Val @b (valTypeableProof → Dict) a)) =
-  (\HRefl → a) <$> eqTypeRep (TypeRep @a) (TypeRep @b)
+tryFromVal ∷ ∀ a. ValT a → Any1 Val → Maybe a
+tryFromVal valT1 (Any1 (Val valT2 a)) = (\Dict → a) <$> eqValT valT1 valT2
 
 -- Val conversion
 
@@ -576,7 +668,7 @@ class (Typeable t, InferContainerT t) ⇒ Container t where
   -- Can have false negatives, cannot have false positives.
   -- `same a b = False` is a lawful implementation.
   -- In practice `same` tries to compare two objects by pointer.
-  same ∷ t a → t b → Bool
+  same ∷ t a → t b → (Maybe (Dict (a ~ b)))
 
 -- | Generalized `alloc`.
 allocC ∷ (Container t, Has AppIO sig m, InferValT True a) ⇒ a → m (t a)
@@ -605,9 +697,9 @@ instance Container Res where
   wrap = id
   unwrap' _ = pure
   tryUnwrap = Just
-  same (ResBuiltin (ResB aId _)) (ResBuiltin (ResB bId _)) = aId == bId
-  same (ResAlloc a) (ResAlloc b) = a == unsafeCoerce b
-  same _ _ = False
+  same (ResNoI (ResBuiltin (ResB aId _))) (ResNoI (ResBuiltin (ResB bId _))) = if aId == bId then Just (unsafeCoerce $ Dict @()) else Nothing
+  same (ResNoI (ResAlloc a)) (ResNoI (ResAlloc b)) = if a == unsafeCoerce b then Just (unsafeCoerce $ Dict @()) else Nothing
+  same _ _ = Nothing -- ResInline _ `same` ResInline _ fails as well
 
 {- | Greedy strategy marker.
 This marker is used to identify that some action (such as merge of radix trees) must be performed in a greedy fashion.
@@ -655,7 +747,7 @@ delayCache (Proxy @s) actM memo =
       pure res
 
 withUnsafeEq ∷ ∀ a b x. ((a ~ b) ⇒ x) → x
-withUnsafeEq = withDict (unsafeCoerce @() @(Dict (a ~ b)) ())
+withUnsafeEq = withDict (unsafeCoerce @(Dict ()) @(Dict (a ~ b)) $ Dict @())
 
 delayAppVal ∷ ∀ sig m s x. (Has (AppIO :+: Reduce' s) sig m) ⇒ Proxy s → DelayApp x → m x
 delayAppVal proxy = fmap (\(EVal _ x) → x) . delayAppVal'
@@ -668,7 +760,7 @@ delayAppVal proxy = fmap (\(EVal _ x) → x) . delayAppVal'
     -- \$ EVal (EValT vT) v
     DelayApp (f ∷ DelayApp (C Res a :-> y)) a →
       delayAppVal' f >>= \case
-        EVal (EValT (ValTFun aT@(valTypeableProof → Dict) bT)) f' →
+        EVal (EValT (ValTFun aT bT)) f' →
           EVal bT . funApp' aT f' . C <$> unwrap' proxy a
 
 mkDelayLazy ∷ AppIOC (Delay a) → Delay a
@@ -702,20 +794,23 @@ instance Container Delay where
   same = curry \case
     (DelayPin a, DelayPin b) → a `same` b
     (DelayCache valM1 memo1, DelayCache valM2 memo2) →
-      unsafePerformIO
-        ( fromEmpty False do
-            m1 ← maybeToEmpty =<< readIORef memo1
-            m2 ← maybeToEmpty =<< readIORef memo2
-            pure $ m1 `same` m2
-        )
-        || (valM1 `sameDelayApp` valM2)
-    _nonMatching → False
+      if ( unsafePerformIO
+            ( fromEmpty False do
+                m1 ← maybeToEmpty =<< readIORef memo1
+                m2 ← maybeToEmpty =<< readIORef memo2
+                pure $ isJust $ m1 `same` m2
+            )
+            || (valM1 `sameDelayApp` valM2)
+         )
+        then Just (unsafeCoerce $ Dict @())
+        else Nothing
+    _nonMatching → Nothing
    where
     sameDelayApp ∷ DelayApp a → DelayApp b → Bool
     sameDelayApp = curry \case
-      (DelayAppUnsafeFun a, DelayAppUnsafeFun b) → a `same` b
+      (DelayAppUnsafeFun a, DelayAppUnsafeFun b) → isJust $ a `same` b
       (DelayApp df1 da1, DelayApp df2 da2) →
-        df1 `sameDelayApp` df2 && da1 `same` da2
+        df1 `sameDelayApp` df2 && isJust (da1 `same` da2)
       _nonMatching → False
 
 {- | Lazy strategy marker.
@@ -723,11 +818,8 @@ This marker is used to identify that some action (such as merge of radix trees) 
 -}
 data AppDelay = AppDelay
 
-sNothing ∷ ResB (W (Maybe a))
-sNothing = $sFreshI $ builtin $ W Nothing
-
 delayAppBuiltinFun ∷ (Has Fresh sig m, InferValT True a) ⇒ a → m (DelayApp a)
-delayAppBuiltinFun x = DelayAppUnsafeFun . ResBuiltin <$> builtin (Any1 $ asVal x)
+delayAppBuiltinFun x = DelayAppUnsafeFun . ResNoI . ResBuiltin <$> builtin (Any1 $ asVal x)
 
 -- Gears definition (I don't like that it's here)
 
@@ -758,7 +850,7 @@ If a Gear was initialized from another Gear, it tries to carry the cache over in
 -}
 
 -- | A template of the Gear, which can be instantiated into GearFn.
-data GearTemplate ctx (out ∷ Type) cache cfg = UnsafeGearTemplate !cache !((ctx, W (Maybe cfg)) :-> M AppIOC cfg) !((cfg, cache) :-> M AppIOC (out, cache))
+data GearTemplate ctx (out ∷ Type) cache cfg = UnsafeGearTemplate !cache !((ctx, W1 Maybe cfg) :-> M AppIOC cfg) !((cfg, cache) :-> M AppIOC (out, cache))
   deriving (Generic)
 
 -- | GearFn, an instantiated GearTemplate that only needs `cache` as input.
@@ -810,3 +902,6 @@ struct = gStruct . G.from
 
 unstruct ∷ (Generic a, GStruct (G.Rep a)) ⇒ GStructValT (G.Rep a) → a
 unstruct = G.to . gUnstruct
+
+sNothing ∷ Res (W1 Maybe a)
+sNothing = ResI $ W1 Nothing

@@ -11,7 +11,7 @@ import Data.Constraint (Dict (..))
 import qualified Dentrado.POC.Data.RadixTree as RT
 import Dentrado.POC.Gear
 import Dentrado.POC.Memory (AppForce (..), AppIO, AppIOC, Container, InferContainerT, InferValT (..), ReduceC, Res, alloc, fetch, sendAI)
-import Dentrado.POC.Types (EventId (..), W (..), fromEmpty)
+import Dentrado.POC.Types (EventId (..), W (..), W1 (..), fromEmpty)
 import RIO hiding (ask, runReader)
 import RIO.List (sortBy)
 import qualified RIO.Map as Map
@@ -51,7 +51,7 @@ newtype UpdateC k v m a = UpdateC {unUpdateC ∷ StateC (Set k, Map k (AppIOC v)
 data StateGraphDeps ctx m where
   StateGraphDepsNil ∷ StateGraphDeps ctx AppIOC
   StateGraphDepsCons ∷
-    (InferValT True k, InferValT True v, Ord k, RT.IsRadixKey k) ⇒
+    (InferValT True k, InferValT True v, Ord k, RT.IsRadixKey k, Typeable k, Typeable v) ⇒
     Asm ctx (StateGraph k v) →
     StateGraphDeps ctx m →
     StateGraphDeps ctx (QueryC k v m)
@@ -77,7 +77,7 @@ data RunWithDeps m ctx
 -- | The core function: constructs new StateGraph.
 mkStateGraph ∷
   ∀ ctx c event k v handlerM.
-  (InferValT True k, InferValT True v, InferValT True event, InferContainerT c, Container c, RT.IsRadixKey k, Ord k, Same v) ⇒
+  (InferValT True k, InferValT True v, InferValT True event, InferContainerT c, Container c, RT.IsRadixKey k, Ord k, Same v, Typeable k, Typeable v, Typeable event) ⇒
   -- | Events. They form the base of the stategraph.
   Asm ctx (RT.Map c EventId event) →
   -- | Every StateGraph is event-based, and works by interpreting events. Handler function for the event must be provided, along
@@ -113,7 +113,7 @@ mkStateGraph evsA (depsA, hdl) =
                         otherAff ← otherAffM otherCache
                         execState otherAff do
                           changedKeys ← RT.toListM =<< RT.diffId @_ @_ @Res AppForce old new
-                          for changedKeys \(k, W (RT.fromMapDiffE (RT.empty, RT.empty) → (snd → oldTimeline, snd → newTimeline))) → do
+                          for changedKeys \(k, W1 (RT.fromMapDiffE (RT.empty, RT.empty) → (snd → oldTimeline, snd → newTimeline))) → do
                             cacheT ← fromMaybe RT.empty <$> RT.lookup (RT.selEq k) cache
                             updatedEvs ← RT.diffId AppForce oldTimeline newTimeline >>= RT.toListM @Res
                             for updatedEvs \(evId, _) →
@@ -131,13 +131,13 @@ mkStateGraph evsA (depsA, hdl) =
                       for_ (acc1 `Set.difference` acc2) \unwitness →
                         get @(RT.MapR k2 (RT.SetR EventId))
                           >>= RT.update
-                            (alloc . W <=< traverse (RT.delete (RT.selEq evId)) . unW <=< fetch)
+                            (alloc . W1 <=< traverse (RT.delete (RT.selEq evId)) . unW1 <=< fetch)
                             (RT.selEq unwitness)
                           >>= put
                       for_ (acc2 `Set.difference` acc1) \witness →
                         get @(RT.MapR k2 (RT.SetR EventId))
                           >>= RT.update
-                            (alloc . W <=< traverse (RT.insert (RT.selEq evId) ()) . unW <=< fetch)
+                            (alloc . W1 <=< traverse (RT.insert (RT.selEq evId) ()) . unW1 <=< fetch)
                             (RT.selEq witness)
                           >>= put
                     <*> otherUpd evId otherAcc1 otherAcc2 otherCache
@@ -187,7 +187,7 @@ mkStateGraph evsA (depsA, hdl) =
         let
           updater ∷
             ∀ sig2 m2.
-            (Has (State (RT.MapR k (RT.SetR EventId, RT.MapR EventId v)) :+: AppIO) sig2 m2) ⇒
+            (Has (State (RT.MapR k (RT.SetR EventId, RT.MapR EventId v)) :+: AppIO) sig2 m2, Typeable k) ⇒
             (Maybe (RT.SetR EventId, RT.MapR EventId v) → ReduceC m2 (RT.SetR EventId, RT.MapR EventId v)) →
             k →
             m2 ()
@@ -195,7 +195,7 @@ mkStateGraph evsA (depsA, hdl) =
             get @(RT.MapR k (RT.SetR EventId, RT.MapR EventId v))
               >>= RT.update
                 ( \oldDelFromM →
-                    alloc . W . Just =<< cont . unW =<< fetch oldDelFromM
+                    alloc . W1 . Just =<< cont . unW1 =<< fetch oldDelFromM
                 )
                 (RT.selEq delFromK)
               >>= put
@@ -225,7 +225,7 @@ mkStateGraph evsA (depsA, hdl) =
           newVal ← sendAI newValM
           -- TODO: temporary implementation
           let updateIfNeeded oldUpdateFrom oldValM = do
-                W oldVal ← fetch oldValM
+                W1 oldVal ← fetch oldValM
                 if maybe False (`same` newVal) oldVal
                   then E.empty
                   else do
@@ -235,7 +235,7 @@ mkStateGraph evsA (depsA, hdl) =
                       $ lift
                       $ lift
                       $ markChanged oldUpdateFrom
-                    alloc $ W $ Just newVal
+                    alloc $ W1 $ Just newVal
           fromEmpty ()
             $ updater
               ( \(fromMaybe (RT.empty, RT.empty) → (oldUpdateReads, oldUpdateWrites)) →
@@ -279,7 +279,7 @@ update ∷ (Has (Update k v) sig m) ⇒ k → AppIOC v → m ()
 update k = send . Update k
 {-# INLINE update #-}
 
-hdlQuery ∷ (Has AppIO sig m, InferValT False k, InferValT True v, Typeable k, RT.IsRadixKey k) ⇒ EventId → k → StateGraph k v → m (Maybe v)
+hdlQuery ∷ (Has AppIO sig m, InferValT False k, InferValT True v, RT.IsRadixKey k) ⇒ EventId → k → StateGraph k v → m (Maybe v)
 hdlQuery nowEvId k (StateGraph queriedSG) =
   RT.lookup (RT.selEq k) queriedSG >>= \case
     Nothing → pure Nothing

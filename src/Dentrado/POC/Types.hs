@@ -43,7 +43,13 @@ instance (Show a) ⇒ Show (Reducible a) where
 
 -- | No-op wrapper. Used to simplify Haskell type inference.
 newtype W a = W {unW ∷ a}
-  deriving newtype (Eq, Ord, Show) deriving Functor
+  deriving newtype (Eq, Ord, Show)
+  deriving (Functor)
+
+-- | No-op wrapper. Used to simplify Haskell type inference.
+newtype W1 f a = W1 {unW1 ∷ f a}
+  deriving newtype (Eq, Ord, Show)
+  deriving (Functor)
 
 {-
 In Dentrado, the border between memory and disk data is blurred.
@@ -62,10 +68,10 @@ It features:
 
 `c` stands for the generalized container type: either Res (regular container) or Delay (lazy container, which holds possibly non-evaluated values).
 -}
-data RadixTree c (k ∷ Type) a = RadixTree !(c (W (Maybe a))) !(c (RadixChunk c k a)) -- both element and next is containerized, both can be left unwrapped.
+data RadixTree c (k ∷ Type) a = RadixTree !(c (W1 Maybe a)) !(c (RadixChunk c k a)) -- both element and next is containerized, both can be left unwrapped.
   deriving (Generic)
 
-type RadixChunk c (k ∷ Type) a = W (Reducible (RadixChunk' c k a))
+type RadixChunk c (k ∷ Type) a = W1 Reducible (RadixChunk' c k a)
 data RadixChunk' c (k ∷ Type) a
   = Nil
   | Tip !Chunk !(RadixTree c k a) -- RadixTree is the only possible branch. Still could be containerized, but I'm not sure it's worth it

@@ -3,11 +3,11 @@ module Shared.Model where
 import Data.Constraint (Dict (..))
 import qualified Dentrado.POC.Data.RadixTree as RT
 import Dentrado.POC.Gear (GearTemplate', asmGear, builtinAsmGearTemplate, events')
-import Dentrado.POC.Memory (InferValT, ValT' (..), ValTWrapped' (..), builtin, inferValT, struct, unstruct, builtinValTWrapped)
+import Dentrado.POC.Memory (InferValT, ValT, ValTWrapped' (..), builtin, inferValT, struct, unstruct, builtinValTWrapped)
 import Dentrado.POC.StateGraph (Same)
 import qualified Dentrado.POC.StateGraph as SG
 import Dentrado.POC.TH (moduleId, sFreshI)
-import Dentrado.POC.Types (EventId, W (..))
+import Dentrado.POC.Types (EventId, W1 (..), W (..))
 import RIO
 
 $(moduleId 102)
@@ -21,10 +21,10 @@ data SiteAccessLevel = SalNone | SalUser | SalModerator | SalAdmin
 instance Same SiteAccessLevel where
   same = (==)
 
-valTSiteAccessLevel ∷ ValT' s (W SiteAccessLevel)
+valTSiteAccessLevel ∷ ValT (W SiteAccessLevel)
 valTSiteAccessLevel = $sFreshI $ builtinValTWrapped
 
-instance InferValT s (W SiteAccessLevel) where
+instance InferValT 'True (W SiteAccessLevel) where
   inferValT = valTSiteAccessLevel
 
 type UserId = EventId -- Users/other entities could be represnted as events that created them.
@@ -37,16 +37,13 @@ data Event
     -- UNUSED: | | AdminRevoke !EventId !EventId -- #2: admin, user event
     -- UNUSED: | UserCreateMessage !EventId !Bool -- #3: user, owned?
     -- UNUSED: | UserEditMessage !EventId !EventId !(Maybe (Maybe Text, (Maybe Text, [(Text, Maybe EventId)]))) -- #3: user, message, new content?: update title?, update content?, update-set subpages
-    AdminSetAccessLevel !(W (Maybe UserId)) !UserId !(W SiteAccessLevel) -- #1: Is sent when some admin (or superuser) assignes new SiteAccessLevel to the user.
+    AdminSetAccessLevel !(W1 Maybe UserId) !UserId !(W SiteAccessLevel) -- #1: Is sent when some admin (or superuser) assignes new SiteAccessLevel to the user.
   deriving (Show, Generic)
 
-valTEvent ∷ ValT' s (W Event)
-valTEvent =
-  ValTWrapped
-    ($sFreshI $ builtin $ ValTWrapped' (\_ → Dict) unstruct struct)
-    inferValT
+valTEvent ∷ ValT (W Event)
+valTEvent = $sFreshI builtinValTWrapped 
 
-instance InferValT s (W Event) where
+instance InferValT 'True (W Event) where
   inferValT = valTEvent
 
 events ∷ GearTemplate' () (RT.MapR EventId (W Event))
@@ -63,7 +60,7 @@ status =
       (asmGear events)
       ( SG.StateGraphDepsNil
       , unW >>> \case
-          AdminSetAccessLevel (W adminM) target level → do
+          AdminSetAccessLevel (W1 adminM) target level → do
             hasAccess ← case adminM of
               Nothing → pure True
               Just admin →

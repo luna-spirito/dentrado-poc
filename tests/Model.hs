@@ -8,6 +8,7 @@ import RIO.List (inits)
 import Shared.Model
 import Shared.Util
 import Test.QuickCheck
+import Dentrado.POC.Types (W1(..))
 
 {- | Test input: set of events, modeling the site with the concept of user access level.
 Admin users can change the level of other users, including other admins.
@@ -21,13 +22,13 @@ test1 =
     , CreateUser
     , CreateUser
     , CreateUser
-    , AdminSetAccessLevel (W Nothing) (e 0) $ W SalAdmin -- 0 is now admin
-    , AdminSetAccessLevel (W $ Just $ e 0) (e 1) $ W SalModerator -- 1 is now moderator
-    , AdminSetAccessLevel (W $ Just $ e 1) (e 1) $ W SalAdmin -- denied
-    , AdminSetAccessLevel (W $ Just $ e 1) (e 3) $ W SalModerator -- denied
-    , AdminSetAccessLevel (W $ Just $ e 0) (e 2) $ W SalAdmin -- 2 is now admin
-    , AdminSetAccessLevel (W $ Just $ e 2) (e 1) $ W SalNone -- 1 is now banned
-    , AdminSetAccessLevel (W $ Just $ e 2) (e 4) $ W SalModerator -- 4 is now moderator
+    , AdminSetAccessLevel (W1 Nothing) (e 0) $ W SalAdmin -- 0 is now admin
+    , AdminSetAccessLevel (W1 $ Just $ e 0) (e 1) $ W SalModerator -- 1 is now moderator
+    , AdminSetAccessLevel (W1 $ Just $ e 1) (e 1) $ W SalAdmin -- denied
+    , AdminSetAccessLevel (W1 $ Just $ e 1) (e 3) $ W SalModerator -- denied
+    , AdminSetAccessLevel (W1 $ Just $ e 0) (e 2) $ W SalAdmin -- 2 is now admin
+    , AdminSetAccessLevel (W1 $ Just $ e 2) (e 1) $ W SalNone -- 1 is now banned
+    , AdminSetAccessLevel (W1 $ Just $ e 2) (e 4) $ W SalModerator -- 4 is now moderator
     ]
 
 -- | Test expected result.

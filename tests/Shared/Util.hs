@@ -30,7 +30,7 @@ runAppIO act = do
       <*> pure mempty
       <*> newMVar mempty
       <*> pure (EnvLoad \_ _ → fail "not available")
-      <*> pure (EnvStore \_ _ → fail "not available")
+      <*> pure (EnvStore \_ → fail "not available")
       <*> newMVar RT.empty
       <*> newMVar mempty
       <*> newMVar ([], 0)

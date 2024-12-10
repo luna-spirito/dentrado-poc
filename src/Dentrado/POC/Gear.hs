@@ -12,7 +12,7 @@ import qualified Dentrado.POC.Data.RadixTree as RT
 import Dentrado.POC.Memory (AppIOC, EValT (..), Env (..), Gear (..), GearFn (..), GearTemplate (..), InferValT (..), M (..), Res, RevList (..), ValT, ValT' (..), builtinFunM, funApp', sendAI, tryFromVal, tryLazy, valTMaybe, valTypeableProof)
 import Dentrado.POC.Ser (serGearFn, unstableSerialized)
 import Dentrado.POC.TH (moduleId)
-import Dentrado.POC.Types (EventId (..), W (..))
+import Dentrado.POC.Types (EventId (..), W1 (..))
 import RIO hiding (asks, runReader, toList)
 import qualified RIO.Partial as P
 import Type.Reflection (pattern TypeRep)
@@ -28,7 +28,7 @@ TODO: USE RES FOR GEARS!!!
 Slow operation.
 -}
 gearFromFn ∷
-  (InferValT True ctx, Typeable cache, Typeable out) ⇒
+  (InferValT True ctx, Typeable cache) ⇒
   ValT cache →
   cache →
   GearFn ctx out cache →
@@ -50,7 +50,7 @@ gearFromFn cacheT forkedCache gearFn = do
 -- | Configure new Gear from a GearTemplate' by providing the context.
 confNewGear ∷ (InferValT True ctx {-InferValT True cfg, InferValT True cache, Ser cache,-}, Typeable out) ⇒ GearTemplate' ctx out → ctx → AppIOC (Gear ctx out)
 confNewGear (GearTemplate' cfgT cacheT@(valTypeableProof → Dict) template@(UnsafeGearTemplate initCache conf _fn)) ctx = do
-  cfg ← unM $ funApp' (ValTTuple inferValT (valTMaybe cfgT)) conf (ctx, W Nothing)
+  cfg ← unM $ funApp' (ValTTuple inferValT (valTMaybe cfgT)) conf (ctx, W1 Nothing)
   gearFromFn cacheT initCache $ GearFn cfgT cfg template
 
 -- | Reconfigure the Gear by providing new context. Attempts to transfer the old cache to the new Gear.
@@ -58,7 +58,7 @@ reconfGear ∷ (Typeable ctx, InferValT True ctx, Typeable out) ⇒ Gear ctx out
 reconfGear (UnsafeGear cacheT@(valTypeableProof → Dict) (GearFn cfgT oldCfg template@(UnsafeGearTemplate _ conf _)) oldCacheInd) newCtx = do
   gearsV ← asks envGears
   oldCache ← P.fromJust . fromDynamic . P.fromJust . IMap.lookup oldCacheInd <$> sendAI (readMVar gearsV)
-  newCfg ← unM $ funApp' (ValTTuple inferValT (valTMaybe cfgT)) conf (newCtx, W $ Just oldCfg)
+  newCfg ← unM $ funApp' (ValTTuple inferValT (valTMaybe cfgT)) conf (newCtx, W1 $ Just oldCfg)
   -- TODO: optimization: early return if oldCfg == newCfg.
   gearFromFn cacheT oldCache $ GearFn cfgT newCfg template
 
@@ -84,8 +84,15 @@ runGear (UnsafeGear cacheT@(valTypeableProof → Dict) (GearFn cfgT cfg (UnsafeG
   pure out
 
 -- | Make a GearTemplate out of static Haskell functions.
-builtinGearTemplate' ∷ (Has Fresh sig m) ⇒ ValT cfg → ValT cache → cache → ((ctx, W (Maybe cfg)) → AppIOC cfg) → ((cfg, cache) → AppIOC (out, cache)) → m (GearTemplate' ctx out)
-builtinGearTemplate' cfgT cacheT cache cfgM fnM = do
+builtinGearTemplate' ∷
+  (Has Fresh sig m, Typeable ctx, Typeable out) ⇒
+  ValT cfg →
+  ValT cache →
+  cache →
+  ((ctx, W1 Maybe cfg) → AppIOC cfg) →
+  ((cfg, cache) → AppIOC (out, cache)) →
+  m (GearTemplate' ctx out)
+builtinGearTemplate' cfgT@(valTypeableProof → Dict) cacheT@(valTypeableProof → Dict) cache cfgM fnM = do
   cfg ← builtinFunM cfgM
   fn ← builtinFunM fnM
   pure $ GearTemplate' cfgT cacheT $ UnsafeGearTemplate cache cfg fn
@@ -93,13 +100,18 @@ builtinGearTemplate' cfgT cacheT cache cfgM fnM = do
 {-# INLINEABLE builtinGearTemplate #-}
 
 -- | Make a GearTemplate out of static Haskell functions.
-builtinGearTemplate ∷ (Has Fresh sig m, InferValT True cfg, InferValT True cache) ⇒ cache → ((ctx, W (Maybe cfg)) → AppIOC cfg) → ((cfg, cache) → AppIOC (out, cache)) → m (GearTemplate' ctx out)
+builtinGearTemplate ∷
+  (Has Fresh sig m, InferValT True cfg, InferValT True cache, Typeable cfg, Typeable ctx, Typeable cache, Typeable out) ⇒
+  cache →
+  ((ctx, W1 Maybe cfg) → AppIOC cfg) →
+  ((cfg, cache) → AppIOC (out, cache)) →
+  m (GearTemplate' ctx out)
 builtinGearTemplate = builtinGearTemplate' inferValT inferValT
 
 {- | Abstraction to simplify construction of new Gears.
 Asm allows to create new Gears by composition of parts.
 -}
-data Asm ctx out = ∀ cfg cache. Asm !(ValT cfg) !(ValT cache) !cache !((ctx, W (Maybe cfg)) → AppIOC cfg) !((cfg, cache) → AppIOC (out, cache))
+data Asm ctx out = ∀ cfg cache. Asm !(ValT cfg) !(ValT cache) !cache !((ctx, W1 Maybe cfg) → AppIOC cfg) !((cfg, cache) → AppIOC (out, cache))
 
 instance Functor (Asm ctx) where
   fmap f (Asm cfgT cacheT initial configure fn) = Asm cfgT cacheT initial configure $ fmap (bimap f id) . fn
@@ -113,7 +125,7 @@ instance Applicative (Asm ctx) where
     (ValTTuple cfg1T cfg2T)
     (ValTTuple cache1T cache2T)
     (initial1, initial2)
-    (\(ctx, W cfgM) → (,) <$> configure1 (ctx, W $ fst <$> cfgM) <*> configure2 (ctx, W $ snd <$> cfgM))
+    (\(ctx, W1 cfgM) → (,) <$> configure1 (ctx, W1 $ fst <$> cfgM) <*> configure2 (ctx, W1 $ snd <$> cfgM))
     \((cfg1, cfg2), (cache1, cache2)) →
       (\(f', rcache1) (a', rcache2) → (f' a', (rcache1, rcache2)))
         <$> fn1 (cfg1, cache1)
@@ -122,8 +134,8 @@ instance Applicative (Asm ctx) where
   {-# INLINE (<*>) #-}
 
 -- | `GearTemplate'`` can be converted into `Asm`. This is analogous to "subscribing" to the result of the Gear.
-asmGear ∷ (InferValT True a, InferValT False out) ⇒ GearTemplate' a out → Asm a out
-asmGear template = Asm (ValTGear inferValT $ EValT $ inferValT @False) ValTUnit () {-_Unit-} (\(ctx, W gearM) → confGear template gearM ctx) \(gear, _) → (,()) <$> runGear gear
+asmGear ∷ (InferValT True a, InferValT False out, Typeable a, Typeable out) ⇒ GearTemplate' a out → Asm a out
+asmGear template = Asm (ValTGear inferValT $ EValT $ inferValT @False) ValTUnit () {-_Unit-} (\(ctx, W1 gearM) → confGear template gearM ctx) \(gear, _) → (,()) <$> runGear gear
 {-# INLINEABLE asmGear #-}
 
 -- | Cached computation can be embedded into `Asm`.
@@ -136,7 +148,7 @@ asmCached initial1 (Asm cfgT cacheT initial configure fn) = Asm
   \(cfg, (thisCache, otherCache)) → fn (cfg, otherCache) >>= \(fn', outOtherCache) → fmap (,outOtherCache) <$> fn' thisCache
 
 -- | Construct `GearTemplate'` from constant `Asm`.
-builtinAsmGearTemplate ∷ (Has Fresh sig m, InferValT True ctx, Typeable ctx) ⇒ Asm ctx out → m (GearTemplate' ctx out)
+builtinAsmGearTemplate ∷ (Has Fresh sig m, InferValT True ctx, Typeable ctx, Typeable out) ⇒ Asm ctx out → m (GearTemplate' ctx out)
 builtinAsmGearTemplate (Asm cfgT cacheT initial configure fn) =
   builtinGearTemplate' cfgT cacheT initial configure fn
 
@@ -159,19 +171,20 @@ TODO: POC: Temp
 -}
 events' ∷ ∀ a. (InferValT True a) ⇒ Asm () (RT.MapR EventId a)
 events' =
-  asmCached
-    (0, RT.empty @Res)
-    $ pure \(oldLen, oldRes) → do
-      (UnsafeRevList evs, newLen) ← readMVar =<< asks envEvents
-      newRes ←
-        foldM
-          ( \rt (t, ev) →
-              tryFromVal @a ev & maybe (pure rt) \v →
-                RT.insert (RT.selEq t) v rt
-          )
-          oldRes
-          (take (newLen - oldLen) evs)
-      pure (newRes, (newLen, newRes))
+  let aT = inferValT
+   in asmCached
+        (0, RT.empty @Res)
+        $ pure \(oldLen, oldRes) → do
+          (UnsafeRevList evs, newLen) ← readMVar =<< asks envEvents
+          newRes ←
+            foldM
+              ( \rt (t, ev) →
+                  tryFromVal aT ev & maybe (pure rt) \v →
+                    RT.insert (RT.selEq t) v rt
+              )
+              oldRes
+              (take (newLen - oldLen) evs)
+          pure (newRes, (newLen, newRes))
 
 -- indexes
 
