@@ -3,7 +3,7 @@ module Dentrado.POC.Ser where
 import Control.Algebra
 import Control.Carrier.Empty.Church (EmptyC)
 import Control.Carrier.State.Church (StateC, get, put)
-import Control.Carrier.Writer.Church (WriterC, runWriter, tell)
+import Control.Carrier.Writer.Church (WriterC, runWriter)
 import Control.Effect.Empty (Empty)
 import qualified Control.Effect.Empty as E
 import Control.Effect.Reader (asks)
@@ -28,6 +28,7 @@ import qualified RIO.Partial as P
 import System.Mem.Weak (deRefWeak, mkWeakPtr)
 import qualified Type.Reflection as T
 import Unsafe.Coerce (unsafeCoerce)
+import Control.Effect.Writer
 
 $(moduleId 4)
 
@@ -64,8 +65,9 @@ type DeserM = StateC ByteString (EmptyC AppIOC)
 type SerM' = WriterC (RevList (Obj (Any1 Res'))) SerM
 type DeserM' = ConsumeC (Obj Word64) DeserM
 
-putWord8 ∷ Word8 → SerM' ()
-putWord8 = tell . B.word8
+serWord8 ∷ Has (Writer Builder) sig m => Word8 → m ()
+serWord8 = tell . B.word8
+{-# INLINE serWord8 #-}
 
 getWord8 ∷ DeserM' Word8
 getWord8 = do
@@ -78,10 +80,10 @@ getWord8 = do
 
 serMonadT ∷ MonadT m → SerM' ()
 serMonadT = \case
-  MonadTAppIOC → putWord8 0
-  MonadTReduceC y → putWord8 1 *> serMonadT y
-  MonadTReduceC1 y → putWord8 2 *> serMonadT y
-  MonadTReduceC2 y → putWord8 3 *> serMonadT y
+  MonadTAppIOC → serWord8 0
+  MonadTReduceC y → serWord8 1 *> serMonadT y
+  MonadTReduceC1 y → serWord8 2 *> serMonadT y
+  MonadTReduceC2 y → serWord8 3 *> serMonadT y
 
 deserMonadT ∷ DeserM' (Any1 MonadT)
 deserMonadT =
@@ -99,8 +101,8 @@ deserMonadT =
 
 serContainerT ∷ ContainerT a → SerM' ()
 serContainerT = \case
-  ContainerTRes → putWord8 0
-  ContainerTDelay → putWord8 1
+  ContainerTRes → serWord8 0
+  ContainerTDelay → serWord8 1
 
 deserContainerT ∷ DeserM' (Any1 ContainerT)
 deserContainerT =
@@ -110,25 +112,25 @@ deserContainerT =
 
 serValT ∷ ValT' s a → SerM' ()
 serValT = \case
-  ValTFun a (EValT b) → putWord8 0 *> serValT a *> serValT b
-  ValTUnit → putWord8 1
-  ValTTuple a b → putWord8 2 *> serValT a *> serValT b
-  ValTEither a b → putWord8 3 *> serValT a *> serValT b
-  ValTInt → putWord8 4
-  ValTWord32 → putWord8 5
-  ValTList a → putWord8 6 *> serValT a
-  ValTContainer c v → putWord8 7 *> serContainerT c *> serValT v
-  ValTRadixTree c k v → putWord8 8 *> serContainerT c *> serValT k *> serValT v
-  ValTRadixChunk c k v → putWord8 9 *> serContainerT c *> serValT k *> serValT v
-  ValTGear ctx (EValT out) → putWord8 10 *> serValT ctx *> serValT out
-  ValTVal → putWord8 11
-  -- ValTB x → putWord8 12 *> serResB x
-  ValTWrapped x → putWord8 12 *> serResB x
-  ValTWrapped1 x a → putWord8 13 *> serResB x *> serValT a
-  ValTEventId → putWord8 14
-  ValTByteString → putWord8 15
-  ValTMonad mT vT → putWord8 150 *> serMonadT mT *> serValT vT
-  ValTSerialized → putWord8 151
+  ValTFun a (EValT b) → serWord8 0 *> serValT a *> serValT b
+  ValTUnit → serWord8 1
+  ValTTuple a b → serWord8 2 *> serValT a *> serValT b
+  ValTEither a b → serWord8 3 *> serValT a *> serValT b
+  ValTInt → serWord8 4
+  ValTWord32 → serWord8 5
+  ValTList a → serWord8 6 *> serValT a
+  ValTContainer c v → serWord8 7 *> serContainerT c *> serValT v
+  ValTRadixTree c k v → serWord8 8 *> serContainerT c *> serValT k *> serValT v
+  ValTRadixChunk c k v → serWord8 9 *> serContainerT c *> serValT k *> serValT v
+  ValTGear ctx (EValT out) → serWord8 10 *> serValT ctx *> serValT out
+  ValTVal → serWord8 11
+  -- ValTB x → serWord8 12 *> serResB x
+  ValTWrapped x → serWord8 12 *> serResB x
+  ValTWrapped1 x a → serWord8 13 *> serResB x *> serValT a
+  ValTEventId → serWord8 14
+  ValTByteString → serWord8 15
+  ValTMonad mT vT → serWord8 150 *> serMonadT mT *> serValT vT
+  ValTSerialized → serWord8 151
 
 -- >= 150 RESERVED FOR EVAL
 
@@ -347,8 +349,9 @@ deserRes aT = do
                         oldKnown
                     )
 
-serWord32 ∷ Word32 → SerM' ()
+serWord32 ∷ Has (Writer Builder) sig m => Word32 → m ()
 serWord32 = tell . B.word32BE
+{-# INLINE serWord32 #-}
 
 -- TODO: unsafeTake/unsafeDrop?
 
@@ -364,8 +367,9 @@ deserWord32 = do
     .|. (fromIntegral @_ @Word32 (old `B.unsafeIndex` 2) `unsafeShiftL` 8)
     .|. fromIntegral @_ @Word32 (old `B.unsafeIndex` 3)
 
-serWord64 ∷ Word64 → SerM' ()
+serWord64 ∷ Has (Writer Builder) sig m => Word64 → m ()
 serWord64 = tell . B.word64BE
+{-# INLINE serWord64 #-}
 
 deserWord64 ∷ DeserM' Word64
 deserWord64 = do
@@ -382,7 +386,7 @@ deserWord64 = do
     .|. (fromIntegral (old `B.unsafeIndex` 7))
 
 -- TODO: Varint
-serInt ∷ Int → SerM' ()
+serInt ∷ Has (Writer Builder) sig m => Int → m ()
 serInt = serWord64 . fromIntegral
 
 deserInt ∷ DeserM' Int
@@ -401,9 +405,9 @@ deserByteString = do
 
 serFn ∷ ∀ a b. a :-> b → SerM' ()
 serFn = \case
-  FunBuiltin x → putWord8 0 *> serResB x
-  FunCurry f → putWord8 1 *> serFn f
-  FunCurry1 xT x f → putWord8 2 *> serVal (Val xT x) *> serFn f
+  FunBuiltin x → serWord8 0 *> serResB x
+  FunCurry f → serWord8 1 *> serFn f
+  FunCurry1 xT x f → serWord8 2 *> serVal (Val xT x) *> serFn f
 
 deserFn ∷ ∀ a b. ValT a → EValT b → DeserM' (a :-> b)
 deserFn aT (EValT bT) =
@@ -421,9 +425,9 @@ deserFn aT (EValT bT) =
 
 serDelay ∷ ValT a → Delay a → SerM' ()
 serDelay aT = \case
-  DelayPin a → putWord8 0 *> serRes aT a
+  DelayPin a → serWord8 0 *> serRes aT a
   DelayLazy x → runReduce (unDelayLazy (Proxy @"") x) >>= serDelay aT
-  DelayCache app _memo → putWord8 1 *> serDelayApp app
+  DelayCache app _memo → serWord8 1 *> serDelayApp app
 
 deserDelay ∷ ValT a → DeserM' (Delay a)
 deserDelay aT =
@@ -437,7 +441,7 @@ serDelayApp = void . ser' 0
   ser' ∷ ∀ b. Word8 → DelayApp b → SerM' (EValT b)
   ser' args = \case
     DelayAppUnsafeFun f → do
-      putWord8 args *> serRes ValTVal f
+      serWord8 args *> serRes ValTVal f
       Any1 @_ @c (Val valT _) ← fetch f
       pure $ withUnsafeEq @b @c $ EValT valT
     DelayApp f a →
@@ -479,10 +483,10 @@ deserRT cT kT vT = RadixTree <$> deserContainer cT (valTMaybe vT) <*> deserConta
 
 serRC ∷ ContainerT c → ValT' s k → ValT v → RadixChunk' c k v → SerM' ()
 serRC cT kT vT = \case
-  Nil → putWord8 0
-  Tip chunk rt → putWord8 1 *> serWord32 chunk *> serRT cT kT vT rt
+  Nil → serWord8 0
+  Tip chunk rt → serWord8 1 *> serWord32 chunk *> serRT cT kT vT rt
   Bin chunk sub1 sub2 →
-    putWord8 2
+    serWord8 2
       *> serWord32 chunk
       *> serContainer cT (valTReducible $ ValTRadixChunk cT kT vT) sub1
       *> serContainer cT (valTReducible $ ValTRadixChunk cT kT vT) sub2
@@ -532,8 +536,8 @@ ser = \case
   ValTUnit → pure
   ValTTuple a b → \(a', b') → ser a a' *> ser b b'
   ValTEither a b → \case
-    Left a' → putWord8 0 *> ser a a'
-    Right b' → putWord8 1 *> ser b b'
+    Left a' → serWord8 0 *> ser a a'
+    Right b' → serWord8 1 *> ser b b'
   ValTInt → serInt
   ValTWord32 → serWord32
   ValTList a → \l → serInt (L.length l) *> for_ l (ser a)
