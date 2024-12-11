@@ -62,7 +62,9 @@ instance (Algebra sig m, Member Empty sig) ⇒ Algebra (Consume e :+: sig) (Cons
 type SerM = WriterC Builder AppIOC
 type DeserM = StateC ByteString (EmptyC AppIOC)
 
-type SerM' = WriterC (RevList (Obj (Any1 Res'))) SerM
+data ValRes' = forall a. ValRes' !(Maybe (ValT a)) !(Res' a) {- Nothing = non-serializable builtin -}
+
+type SerM' = WriterC (RevList (Obj ValRes')) SerM
 type DeserM' = ConsumeC (Obj Word64) DeserM
 
 serWord8 ∷ Has (Writer Builder) sig m => Word8 → m ()
@@ -125,8 +127,8 @@ serValT = \case
   ValTGear ctx (EValT out) → serWord8 10 *> serValT ctx *> serValT out
   ValTVal → serWord8 11
   -- ValTB x → serWord8 12 *> serResB x
-  ValTWrapped x → serWord8 12 *> serResB x
-  ValTWrapped1 x a → serWord8 13 *> serResB x *> serValT a
+  ValTWrapped x → serWord8 12 *> serUntrResB x
+  ValTWrapped1 x a → serWord8 13 *> serUntrResB x *> serValT a
   ValTEventId → serWord8 14
   ValTByteString → serWord8 15
   ValTMonad mT vT → serWord8 150 *> serMonadT mT *> serValT vT
@@ -274,8 +276,10 @@ deserVal = do
 Pointer serialization is queued and is not performed instantly, since that would require to
 force serialization of the referenced object.
 -}
-serResB ∷ ResB a → SerM' ()
-serResB = serRes' . ResBuiltin
+
+-- Serialize primitive, untransfreable builtin.
+serUntrResB :: ResB a → SerM' ()
+serUntrResB x = tell @(RevList (Obj ValRes')) [ObjRes $ ValRes' Nothing $ ResBuiltin x]
 
 deserResB' ∷ DeserM' (Dynamic1 ResB)
 deserResB' = do
@@ -293,13 +297,13 @@ deserResB = do
   T.HRefl ← maybeToEmpty $ T.eqTypeRep rep (T.TypeRep @a)
   pure res
 
-serRes' ∷ Res' a → SerM' ()
-serRes' x = tell @(RevList (Obj (Any1 Res'))) [ObjRes $ Any1 x]
+serRes' ∷ ValT a → Res' a → SerM' ()
+serRes' xT x = tell @(RevList (Obj ValRes')) [ObjRes $ ValRes' (Just xT) x]
 
 serRes ∷ ValT a → Res a → SerM' ()
 serRes aT = \case
   ResI a → ser aT a
-  ResNoI a → serRes' a
+  ResNoI a → serRes' aT a
 
 deserRes ∷ ∀ a. ValT a → DeserM' (Res a)
 deserRes aT = do
@@ -405,7 +409,7 @@ deserByteString = do
 
 serFn ∷ ∀ a b. a :-> b → SerM' ()
 serFn = \case
-  FunBuiltin x → serWord8 0 *> serResB x
+  FunBuiltin x → serWord8 0 *> serUntrResB x
   FunCurry f → serWord8 1 *> serFn f
   FunCurry1 xT x f → serWord8 2 *> serVal (Val xT x) *> serFn f
 
@@ -607,7 +611,7 @@ unpad (UnsafePaddedByteString x) = B.dropWhileEnd (== 0) x
 unstableSerialized ∷ SerM' () → AppIOC Serialized
 unstableSerialized act = do
   (val, UnsafeRevList refs) ← runWriter (\a b → pure (a, b)) $ runWriter (\a _ → pure a) act
-  refsI ← for refs \(ObjRes (Any1 r)) → getInd r
+  refsI ← for refs \(ObjRes (ValRes' _ r)) → getInd r
   pure
     $ let unpadded = toStrictBytes $ B.toLazyByteString $ val <> mconcat (B.word64BE <$> refsI)
        in UnsafeSerialized $ pad unpadded
