@@ -30,24 +30,20 @@ instance InferValT 'True (W SiteAccessLevel) where
 type UserId = EventId -- Users/other entities could be represnted as events that created them.
 type LoginId = EventId
 
--- | Model: Event: enum that defines list of events that are being processed to construct a site.
-data Event
-  = CreateUser -- #0: Marker. Is sent when a new user is created.
-  | -- | admin?, user, level
-    -- UNUSED: | | AdminRevoke !EventId !EventId -- #2: admin, user event
-    -- UNUSED: | UserCreateMessage !EventId !Bool -- #3: user, owned?
-    -- UNUSED: | UserEditMessage !EventId !EventId !(Maybe (Maybe Text, (Maybe Text, [(Text, Maybe EventId)]))) -- #3: user, message, new content?: update title?, update content?, update-set subpages
-    AdminSetAccessLevel !(W1 Maybe UserId) !UserId !(W SiteAccessLevel) -- #1: Is sent when some admin (or superuser) assignes new SiteAccessLevel to the user.
-  deriving (Show, Generic)
-
 valTEvent ∷ ValT (W Event)
-valTEvent = $sFreshI builtinValTWrapped 
+valTEvent = $sFreshI builtinValTWrapped
 
 instance InferValT 'True (W Event) where
   inferValT = valTEvent
 
 events ∷ GearTemplate' () (RT.MapR EventId (W Event))
 events = $sFreshI $ builtinAsmGearTemplate $ events' @(W Event)
+
+-- | Model: Event: enum that defines list of events that are being processed to construct a site.
+data Event
+  = CreateUser -- #0: Marker. Is sent when a new user is created.
+  | AdminSetAccessLevel !(W1 Maybe UserId) !UserId !(W SiteAccessLevel) -- #1: Is sent when some admin (or superuser) assignes new SiteAccessLevel to the user.
+  deriving (Show, Generic)
 
 {- | The Gear that processes the test input, returning the StateGraph
 which associates SiteAccessLevel to each UserId throughout all points of time.
