@@ -226,8 +226,8 @@ $ f : cal(L) -> S $
 - Рекурсивный подход к описанию трансформации усложняет обработку примитивных обновлений.
 
 Для преодоления этих ограничений был совершён переход к более гибкой модели явного управления состоянием, реализованной через абстракцию `Gear` («шестерня»).
-Концепция Gear переводит правила из категории «функция от истории» в категорию «автомат Мура».
-В этой модели правило обладает явным типом внутреннего состояния $cal(C)$ и функцией перехода.
+Концепция Gear представляет правила как автоматы с явным внутренним состоянием, а не как чистые функции от истории событий.
+В этой модели правило обладает явным типом внутреннего состояния $cal(C)$ и функцией перехода, работающей в монадическом контексте.
 
 Однако при реализации этой модели возникла фундаментальная проблема динамической конфигурации.
 В реальных системах возникает необходимость смены поведения системы в ходе её работы, а любое изменение кода функции в наивной архитекту требует полного сброса внутреннего состояния и пересчёта всей истории.
@@ -556,38 +556,39 @@ Fadeno использует соответствие Карри — Ховард
 
 
 ```
+// Comments
 
-// Комментарии
+// Unpacks Int, Type^, List, if... from built-in "fadeno" library into current context
+unpack fadeno. Int Type^ List if Eq refl Bool
 
-// Распаковывает Int, Type^, List, if... из встроенной библиотеки "fadeno" в текущий контекст
-unwrap fadeno.
-Int Type^ List if Eq refl
-
-// Задание констант
+// Constants
 x = true
 
-// Помещение анонимной функции в константу
+// Assigning lambda to constant
 add =
-  // Объявление анонимной функции от аргументов "a" и "b"
+  // Lamba of arguments "a" and "b"
   \a b.
-  // Вызов встроенной функции fadeno.int_add с сохранением результата в константу result
+  // Call to the builtin function `fadeno.int_add`, savin the result to constant `result`
   result = fadeno.int_add a b
   in result
 
-// Константам можно явно задавать тип
+// Type annotations for constants, checked
+// If no annotation is provided, it's infered automatically
 /: Int
 y = 4
 
-// Анонимные функции имеют тип `Fun (A) (B) (C) -> Z`
+// Type of functions is `Fun (A) (B) (C) -> Z`
+
+// Function of two Int's that returns Int.
 /: Fun (Int) (Int) -> Int
 constf = \arg1 arg2.
-  arg2 // игнорирует первый аргумент, возвращает второй.
+  arg2 // returns the second argument passed
 
-// Списки
+// Lists
 /: List Int
 list = [1 | 3 | 5 | 4 | -1]
 
-// Записи
+// Records and row types
 /: {( .field1 = Int | .field2 = Fun (Int) (Int) -> Int | .zer = List Int )}
 record =
   { .field1 = 4
@@ -595,9 +596,10 @@ record =
   | .zer = [ 1 | 3 ]
   }
 
+// Accesing fields of records
 accessedField1 = record.field1
 
-// Type Alias
+// Type aliases
 /: Type^ 0
 MyRecord = {( .a = List Int )}
 
@@ -605,31 +607,33 @@ MyRecord = {( .a = List Int )}
 my_record = { .a = [] }
 
 // Type universes
-/: Type^1
+/: Type^ 1
 Type = Type^ 0
 /: Type^ 2
 Kind = Type^ 1
 
-// Полиморфизм
+// Polymorphism
 /: Fun {A} (A) -> A
-id = @A x.
+id = \@A x.
   x
 
-// Доказательство теорем
+// Theorem proving capabilities
 /: Fun {a} {b} {c} (Eq a b) (Eq b c) -> Eq a c
 proof = \ab bc.
   rewrite ab
   in bc
 
-// Зависимые типы
+// Dependent types
 /: Fun (x : Bool) -> if x (Int) (List (List Int))
 cond = \x.
   if x
-  (@x_is_true. rewrite x_is_true in 3)
-  (@x_is_false. rewrite x_is_false in [[3]])
+  (\@x_is_true. rewrite x_is_true in 3)
+  (\@x_is_false. rewrite x_is_false in [[3]])
 
-// Импорт
-other_file = ./other_file
+// Importing other files
+std = ./std
+
+four = std._+_ 2 2
 
 in {}
 ```

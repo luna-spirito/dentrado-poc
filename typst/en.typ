@@ -226,8 +226,8 @@ A more detailed analysis revealed that:
 - The recursive approach to describing transformations complicates the processing of primitive updates.
 
 To overcome these limitations, a transition was made to a more flexible model of explicit state management, implemented through the `Gear` abstraction.
-The Gear concept transforms rules from the category "function of history" to the category "Moore automaton".
-In this model, a rule possesses an explicit internal state type $cal(C)$ and a transition function.
+The Gear concept represents rules as state machines with explicit internal state, rather than pure functions of the event history.
+In this model, a rule possesses an explicit internal state type $cal(C)$ and a transition function operating within a monadic context.
 
 However, implementing this model revealed a fundamental problem of dynamic configuration.
 In real systems, the need arises to change system behavior at runtime, and any change to the function code in a naïve architecture requires a complete reset of the internal state and recomputation of the entire history.
@@ -553,38 +553,39 @@ Future work consists of implementing the functional-reactive DBMS architecture b
 
 
 ```
-
 // Comments
 
-// Unpacks Int, Type^, List, if... from the built-in library "fadeno" into the current context
-unwrap fadeno.
-Int Type^ List if Eq refl
+// Unpacks Int, Type^, List, if... from built-in "fadeno" library into current context
+unpack fadeno. Int Type^ List if Eq refl Bool
 
-// Defining constants
+// Constants
 x = true
 
-// Assigning an anonymous function to a constant
+// Assigning lambda to constant
 add =
-  // Declaring an anonymous function with arguments "a" and "b"
+  // Lamba of arguments "a" and "b"
   \a b.
-  // Calling the built-in function fadeno.int_add, storing the result in constant "result"
+  // Call to the builtin function `fadeno.int_add`, savin the result to constant `result`
   result = fadeno.int_add a b
   in result
 
-// Constants can be explicitly typed
+// Type annotations for constants, checked
+// If no annotation is provided, it's infered automatically
 /: Int
 y = 4
 
-// Anonymous functions have the type `Fun (A) (B) (C) -> Z`
+// Type of functions is `Fun (A) (B) (C) -> Z`
+
+// Function of two Int's that returns Int.
 /: Fun (Int) (Int) -> Int
 constf = \arg1 arg2.
-  arg2 // ignores the first argument, returns the second.
+  arg2 // returns the second argument passed
 
 // Lists
 /: List Int
 list = [1 | 3 | 5 | 4 | -1]
 
-// Records
+// Records and row types
 /: {( .field1 = Int | .field2 = Fun (Int) (Int) -> Int | .zer = List Int )}
 record =
   { .field1 = 4
@@ -592,9 +593,10 @@ record =
   | .zer = [ 1 | 3 ]
   }
 
+// Accesing fields of records
 accessedField1 = record.field1
 
-// Type Alias
+// Type aliases
 /: Type^ 0
 MyRecord = {( .a = List Int )}
 
@@ -602,17 +604,17 @@ MyRecord = {( .a = List Int )}
 my_record = { .a = [] }
 
 // Type universes
-/: Type^1
+/: Type^ 1
 Type = Type^ 0
 /: Type^ 2
 Kind = Type^ 1
 
 // Polymorphism
 /: Fun {A} (A) -> A
-id = @A x.
+id = \@A x.
   x
 
-// Theorem proving
+// Theorem proving capabilities
 /: Fun {a} {b} {c} (Eq a b) (Eq b c) -> Eq a c
 proof = \ab bc.
   rewrite ab
@@ -622,11 +624,13 @@ proof = \ab bc.
 /: Fun (x : Bool) -> if x (Int) (List (List Int))
 cond = \x.
   if x
-  (@x_is_true. rewrite x_is_true in 3)
-  (@x_is_false. rewrite x_is_false in [[3]])
+  (\@x_is_true. rewrite x_is_true in 3)
+  (\@x_is_false. rewrite x_is_false in [[3]])
 
-// Import
-other_file = ./other_file
+// Importing other files
+std = ./std
+
+four = std._+_ 2 2
 
 in {}
 ```
