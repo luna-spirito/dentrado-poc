@@ -12,7 +12,7 @@ import qualified Data.Map.Merge.Strict as Map
 import qualified Dentrado.POC.Data.RadixTree as RT
 import Dentrado.POC.Memory (AppForce (..), AppIO, AppIOC, Env (..), EnvLoad (..), EnvStore (..), InferValT, ReduceC, Res, allocC, sNothing, unAppIOC, wrapB)
 import Dentrado.POC.TH (moduleId, sFreshI)
-import Dentrado.POC.Types (Chunk, RadixTree)
+import Dentrado.POC.Types (Chunk, RadixTree, W1(..))
 import qualified Dentrado.POC.Types as RT
 import Language.Haskell.TH (newDeclarationGroup)
 import RIO hiding (runReader)
@@ -106,7 +106,7 @@ processScriptMap =
     )
     Map.empty
 
-processCommandRadixTree ∷ ∀ sig m v. (Has AppIO sig m, Ser v) ⇒ (MapLikeSel, MapLikeCommand v) → RadixTree Res [Chunk] v → m (RadixTree Res [Chunk] v)
+processCommandRadixTree ∷ ∀ sig m v. (Has AppIO sig m, InferValT True v) ⇒ (MapLikeSel, MapLikeCommand v) → RadixTree Res [Chunk] v → m (RadixTree Res [Chunk] v)
 processCommandRadixTree (k, v) m =
   case k of
     SelEq k2 → hdl $ RT.selEq k2
@@ -128,13 +128,13 @@ unsafeRunAppIO = unsafePerformIO . runReader env . unAppIOC
       (unsafePerformIO $ newIORef 0)
       mempty
       (unsafePerformIO $ newMVar mempty)
-      (EnvLoad \_ → fail "not available")
+      (EnvLoad \_ _ → fail "not available")
       (EnvStore \_ → fail "not available")
       (unsafePerformIO $ newMVar RT.empty)
       (unsafePerformIO $ newMVar mempty)
       (unsafePerformIO $ newMVar ([], 0))
 
-processScriptRadixTree ∷ (Has AppIO sig m, Ser a) ⇒ MapLikeScript a → m (([Maybe a], [Maybe a]), RadixTree Res [Chunk] a)
+processScriptRadixTree ∷ (Has AppIO sig m, InferValT True a) ⇒ MapLikeScript a → m (([Maybe a], [Maybe a]), RadixTree Res [Chunk] a)
 processScriptRadixTree =
   processScript
     processCommandRadixTree
@@ -181,15 +181,15 @@ instance (Arbitrary v) ⇒ Arbitrary (MergeInput v) where
     pure $ MergeInput (fil fst) (fil snd)
   shrink (MergeInput a b) = uncurry MergeInput <$> shrink (a, b)
 
-mergeSubRT ∷ (InferValT k, Typeable k) ⇒ RT.RadixTree Res k Int → RT.RadixTree Res k Int → AppIOC (RT.RadixTree Res k Int)
+mergeSubRT ∷ (InferValT True k, Typeable k) ⇒ RT.RadixTree Res k Int → RT.RadixTree Res k Int → AppIOC (RT.RadixTree Res k Int)
 mergeSubRT =
   $sFreshI
     $ RT.merge
       AppForce
       RT.onOneKeep
-      ($sFreshI $ RT.onOneWitherM AppForce \_ b → allocC $ Just (-b))
-      (RT.OnBoth \_ a _ b → allocC $ Just $ a - b)
-      (Just $ RT.OnSame (\_ _ → pure $ wrapB sNothing) (\_ _ → pure $ wrapB sNothing) (\_ _ → pure $ wrapB RT.sNil) (\_ _ → pure $ wrapB RT.sNil))
+      ($sFreshI $ RT.onOneWitherM AppForce \_ b → allocC $ W1 $ Just (-b))
+      (RT.OnBoth \_ a _ b → allocC $ W1 $ Just $ a - b)
+      (Just $ RT.OnSame (\_ _ → pure sNothing) (\_ _ → pure sNothing) (\_ _ → pure RT.sNil) (\_ _ → pure RT.sNil))
 
 mergeSubMap ∷ (Ord k) ⇒ Map k Int → Map k Int → Map k Int
 mergeSubMap = Map.merge (Map.mapMissing $ const id) (Map.mapMissing \_ a → -a) (Map.zipWithMatched \_ a b → a - b)
@@ -215,7 +215,7 @@ instance (Arbitrary v) ⇒ Arbitrary (RadixTreeRangeInp v) where
     let mkBound = oneof [pure RT.RBUnrestricted, RT.RBRestricted <$> arbitrary <*> (fst <$> elements kvs)]
     RadixTreeRangeInp inp <$> ((,) <$> mkBound <*> mkBound)
 
-inv_ranged_sel_rt ∷ (Ser v) ⇒ RadixTreeRangeInp v → [([Chunk], v)]
+inv_ranged_sel_rt ∷ (InferValT True v) ⇒ RadixTreeRangeInp v → [([Chunk], v)]
 inv_ranged_sel_rt (RadixTreeRangeInp (RadixTreeInp kvs) range) =
   unsafeRunAppIO do
     rt ← RT.fromListM @Res kvs
